@@ -44,6 +44,9 @@ pkgs.testers.runNixOSTest {
     boot.supportedFilesystems = [ "btrfs" ];
     # Each test's filesystem lives in a tmpfs, so it is spent from this.
     virtualisation.memorySize = 6144;
+
+    # No need for networking
+    virtualisation.vlans = [ ];
   };
 
   testScript = ''
