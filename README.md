@@ -1,9 +1,9 @@
-# WARNING WARNING WARNING
+# Warning
 
-- **THIS IS A PROTOTYPE AND NOT EXHAUSTIVELY TESTED OR VALIDATED!**
-- **This tool modifies your filesystem. It might cause data loss or corruption.**
-- **DO NOT USE IT unless you are sure you know what you're doing.**
-- **DO NOT USE IT on data you care about unless you have backups (and backups of backups).**
+- **This code is a prototype and not extensively tested or validated!**
+- **Running this tool modifies your filesystem. It might cause data loss or corruption.**
+- **Do not use it unless you are sure you know what you're doing.**
+- **Do not use it on data you care about unless you have backups.**
 - **This code comes with no warranty or support.**
 - **Use at your own risk.**
 
