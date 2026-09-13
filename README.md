@@ -9,7 +9,7 @@
 
 # Btrealloc - Btrfs extent reallocator to reclaim disk space
 
-Btrfs is a Copy-on-Write filesystem which stores files on disk in extents. For example, a 100MiB file could precisely be stored as 100 1MiB extents. The CoW part of Btrfs means that if a write takes place inside the file, it does not perform it in-place. A 1kB write triggers the allocation of a new extent to store it on disk. The file's metadata would now reflect, most likely, it pointing to the 100 original extents for the majority of its data, and one new extent reflecting this 1kB write. However, this now means that 1kB of the previously full 1MiB extent has become unreachable. This wastes a small amount of space.
+Btrfs is a Copy-on-Write filesystem which, in short, stores files on-disk using *extents*. For example, a 100MiB file could precisely be stored as 100x 1MiB extents without wasting bytes. The COW part of Btrfs means that if a write takes place inside the file, it does not modify these bytes in-place. A 1kB write likely triggers the allocation of a new extent to store it on disk. The file's metadata would now reflect it pointing to the 100 original extents for the majority of its data, and one new extent holding this 1kB write. However, this means that 1kB of the previously full 1MiB extent has now become "unreachable". This wastes a small amount of space.
 
 However with repeated writes, worst-case situations can occur where files hold on to a sliver of a large extent, wasting the rest of its space. This can grow to gigabytes with enough churn. [btdu](https://github.com/CyberShadow/btdu) is a powerful sampling profiler for Btrfs filesystems which can quickly visualize this amount of "unreachable" space.
 
