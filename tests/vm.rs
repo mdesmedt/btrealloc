@@ -116,7 +116,7 @@ fn one_extent_held_by_two_files_needs_both_rewritten() {
     let fs = Fs::new();
     let data = fs.dir("data");
     let (a, b) = (fs.path("data/multi-a"), fs.path("data/multi-b"));
-    support::write_random(&a, FILE_MIB);
+    support::write_random_one_extent(&a, FILE_MIB);
     support::reflink(&a, &b);
     support::punch_hole(&a, MIB, (FILE_MIB - 1) * MIB);
     support::punch_hole(&b, 0, (FILE_MIB - 1) * MIB);
@@ -457,7 +457,7 @@ fn every_holder_of_a_slivered_extent_is_redirected() {
     // One extent, then a sector of it handed to each small file. The big file
     // goes afterwards, leaving the extent held only by the slivers.
     let big = fs.path("data/big");
-    support::write_random(&big, FILE_MIB);
+    support::write_random_one_extent(&big, FILE_MIB);
     let address = support::single_extent(&big);
 
     let holders: Vec<_> = (0..HOLDERS)
@@ -525,7 +525,7 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
     // 128 MiB is btrfs's cap, and a write that sits on it can come back split,
     // so take whichever extent it gave us the most of and slice that one.
     let big = fs.path("data/big");
-    support::write_random(&big, 128);
+    support::write_random_one_extent(&big, 128);
     let biggest = btrealloc::kernel::file_extents(&big)
         .expect("read the big file's extents")
         .into_iter()
@@ -606,7 +606,7 @@ fn holders_shared_between_jobs_all_move() {
         .collect();
     for e in 0..EXTENTS {
         let big = fs.path(&format!("data/big{e}"));
-        support::write_random(&big, 128);
+        support::write_random_one_extent(&big, 128);
         let biggest = btrealloc::kernel::file_extents(&big)
             .expect("read the big file's extents")
             .into_iter()
@@ -748,7 +748,7 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
     let data = fs.dir("data");
 
     let big = fs.path("data/big");
-    support::write_random(&big, 128);
+    support::write_random_one_extent(&big, 128);
     let biggest = btrealloc::kernel::file_extents(&big)
         .expect("read the big file's extents")
         .into_iter()
@@ -822,7 +822,7 @@ fn a_holder_whose_reference_is_shorter_than_the_stretch_moves() {
     let data = fs.dir("data");
 
     let big = fs.path("data/big");
-    support::write_random(&big, FILE_MIB);
+    support::write_random_one_extent(&big, FILE_MIB);
     let address = support::single_extent(&big);
 
     // "long" is reached first in path order, so its two sectors are what the
@@ -1109,7 +1109,7 @@ fn a_holder_ending_mid_block_lets_go() {
     let fs = Fs::new();
     let data = fs.dir("data");
     let (long, short) = (fs.path("data/long"), fs.path("data/short"));
-    support::write_random(&long, 8);
+    support::write_random_one_extent(&long, 8);
     support::reflink(&long, &short);
 
     // A size which is not a whole number of sectors, and shorter than the file

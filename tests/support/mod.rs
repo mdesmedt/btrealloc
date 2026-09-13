@@ -145,6 +145,30 @@ pub fn write_random(path: &Path, mib: u64) {
     sync_fs();
 }
 
+/// `mib` MiB of incompressible data guaranteed to land in a single extent, for
+/// fixtures that need one of a specific minimum size rather than however many
+/// pieces a plain write happens to split into.
+///
+/// `fallocate` reserves the whole range as one on-disk extent before anything
+/// is written. Writing into a never-before-written (prealloc) region needs no
+/// copy-on-write, so the kernel fills the reservation in place instead of
+/// however writeback timing happens to chop up a plain buffered write under
+/// load or emulation.
+pub fn write_random_one_extent(path: &Path, mib: u64) {
+    let mut urandom = File::open("/dev/urandom").expect("open /dev/urandom");
+    let file = File::create(path).expect("create the file");
+    let rc = unsafe { fallocate(file.as_raw_fd(), 0, 0, (mib * MIB) as i64) };
+    assert!(rc == 0, "fallocate: {}", std::io::Error::last_os_error());
+
+    let mut buf = vec![0u8; MIB as usize];
+    for i in 0..mib {
+        urandom.read_exact(&mut buf).expect("read /dev/urandom");
+        file.write_all_at(&buf, i * MIB).expect("write the file");
+    }
+    file.sync_all().expect("sync the file");
+    sync_fs();
+}
+
 /// `mib` MiB that zstd will squeeze, for the compressed-mount case.
 pub fn write_compressible(path: &Path, mib: u64) {
     let mut file = File::create(path).expect("create the file");
