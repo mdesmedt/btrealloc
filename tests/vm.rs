@@ -863,7 +863,7 @@ fn a_long_live_stretch_moves_whole() {
     let data = fs.dir("data");
 
     let movie = fs.path("data/movie.mov");
-    support::write_random(&movie, 200);
+    support::write_random_one_extent(&movie, 200);
     let biggest = btrealloc::kernel::file_extents(&movie)
         .expect("read the movie's extents")
         .into_iter()
@@ -925,7 +925,7 @@ fn a_holder_deep_inside_a_long_stretch_moves() {
     let data = fs.dir("data");
 
     let movie = fs.path("data/movie.mov");
-    support::write_random(&movie, 200);
+    support::write_random_one_extent(&movie, 200);
     let biggest = btrealloc::kernel::file_extents(&movie)
         .expect("read the movie's extents")
         .into_iter()
