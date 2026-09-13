@@ -23,17 +23,19 @@
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.btrealloc;
       });
 
-      devShells = forAll (pkgs: {
-        default = pkgs.mkShell {
-          packages = [
-            pkgs.cargo
-            pkgs.rustc
-            pkgs.rust-analyzer
-            pkgs.clippy
-            pkgs.rustfmt
-          ];
-        };
-      });
+      devShells = forAll (
+        pkgs: with pkgs; {
+          default = mkShell {
+            packages = [
+              cargo
+              rustc
+              rust-analyzer
+              clippy
+              rustfmt
+            ];
+          };
+        }
+      );
 
       checks = forAll (pkgs: {
         # The end to end suite, in a VM of its own. `nix flake check` runs it.
