@@ -49,7 +49,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # aarch64 runners have no /dev/kvm, so Nix's auto-detected
+      # system-features never includes "kvm" and it refuses to even schedule
+      # the build (which unconditionally requires it). Claiming the feature
+      # anyway is safe: the VM test script itself checks for /dev/kvm at
+      # runtime and only passes -enable-kvm when it's actually present,
+      # falling back to software emulation otherwise.
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            extra-system-features = kvm
 
       # NixOS test VMs need /dev/kvm. On x86_64 runners the hardware/hypervisor
       # supports it but the device node isn't world-accessible by default. On
