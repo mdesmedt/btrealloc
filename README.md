@@ -125,7 +125,7 @@ Basic unit tests with Rust cargo:
 cargo test
 ```
 
-Because doing any actual work with `--apply` in this tool requires root access, a more complete test suite runs sandboxed in a NixOS VM. Run `nix flake check` or `./runvm.sh` to run the tests. Currently only works under NixOS.
+Because doing any actual work with `--apply` in this tool requires root access, a more complete test suite runs sandboxed in a NixOS VM. With `nix` available, run `nix flake check` or `./runvm.sh` to run the tests.
 
 # License
 
