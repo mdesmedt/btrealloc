@@ -13,7 +13,7 @@ cargo clippy
 
 ## The VM test suite
 
-`tests/vm.rs` is the end-to-end suite. It needs root (btrfs ioctls, loop mounts) so `cargo test` skips it. Run it in its own VM:
+`tests/vm.rs` is the end-to-end suite. It needs root (btrfs ioctls, loop mounts) so `cargo test` skips it. Run it in its own NixOS VM:
 
 ```sh
 nix run .#checks.x86_64-linux.vm.driver   # also: ./runvm.sh
