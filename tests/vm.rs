@@ -517,9 +517,9 @@ fn every_holder_of_a_slivered_extent_is_redirected() {
 #[test]
 fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
     const HOLDERS: u64 = 8;
-    const SECTORSIZE: u64 = 4096;
 
     let fs = Fs::new();
+    let sectorsize = fs.sectorsize();
     let data = fs.dir("data");
 
     // 128 MiB is btrfs's cap, and a write that sits on it can come back split,
@@ -540,7 +540,7 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
 
     // One sector per holder, spread the width of the extent, each in a directory
     // of its own the way a deduplicator finds them.
-    let step = (biggest.disk_bytes / HOLDERS) & !(SECTORSIZE - 1);
+    let step = (biggest.disk_bytes / HOLDERS) & !(sectorsize - 1);
     let holders: Vec<_> = (0..HOLDERS)
         .map(|i| {
             let dir = fs.dir(&format!("data/d{i}"));
@@ -593,9 +593,9 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
 fn holders_shared_between_jobs_all_move() {
     const EXTENTS: u64 = 3;
     const HOLDERS: u64 = 4;
-    const SECTORSIZE: u64 = 4096;
 
     let fs = Fs::new();
+    let sectorsize = fs.sectorsize();
     let data = fs.dir("data");
 
     // One large extent per round, each sliced by every holder, so each holder
@@ -615,12 +615,12 @@ fn holders_shared_between_jobs_all_move() {
         assert!(biggest.disk_bytes >= 64 * MIB, "fixture: extent too small");
         addresses.push(biggest.disk_address);
 
-        let step = (biggest.disk_bytes / HOLDERS) & !(SECTORSIZE - 1);
+        let step = (biggest.disk_bytes / HOLDERS) & !(sectorsize - 1);
         for (h, path) in holders.iter().enumerate() {
             let src = biggest.file_offset + h as u64 * step;
             // A sector of this extent at a place in the holder no other round
             // has used, so each holder accumulates one reference per extent.
-            let dest_offset = (e + 1) * 64 * 1024 + h as u64 * SECTORSIZE;
+            let dest_offset = (e + 1) * 64 * 1024 + h as u64 * sectorsize;
             if e == 0 {
                 support::sliver(&big, src, path, MIB, dest_offset);
             } else {
@@ -669,9 +669,8 @@ fn holders_shared_between_jobs_all_move() {
 /// file offsets map onto extent offsets, which a deleted big file never shows.
 #[test]
 fn a_holder_deep_inside_a_large_file_moves_too() {
-    const SECTORSIZE: u64 = 4096;
-
     let fs = Fs::with_options(4096, "");
+    let sectorsize = fs.sectorsize();
     let data = fs.dir("data");
 
     // Big enough that btrfs gives it more than one extent, so the one we work
@@ -696,15 +695,15 @@ fn a_holder_deep_inside_a_large_file_moves_too() {
 
     // A deduplicator points one sector of a small file at a sector near the front
     // of that extent, while the movie will keep one near the back.
-    let kept = (size / 2) & !(SECTORSIZE - 1);
-    let shared = (size / 8) & !(SECTORSIZE - 1);
+    let kept = (size / 2) & !(sectorsize - 1);
+    let shared = (size / 8) & !(sectorsize - 1);
     let photo = fs.path("data/photo.jpg");
     support::sliver(&movie, base + shared, &photo, MIB, 8192);
 
     // Now drop everything the movie still held of that extent except one sector,
     // leaving it holding a sliver of an extent it used to own outright.
     support::punch_hole(&movie, base, kept);
-    support::punch_hole(&movie, base + kept + SECTORSIZE, size - kept - SECTORSIZE);
+    support::punch_hole(&movie, base + kept + sectorsize, size - kept - sectorsize);
 
     let before = support::checksums(&data);
     let (scan, worklist) = support::scan_worklist(&data);
@@ -742,9 +741,9 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
     const OFFSETS: [u64; 7] = [
         7557120, 8368128, 66936832, 71802880, 76017664, 87293952, 91471872,
     ];
-    const SECTORSIZE: u64 = 4096;
 
     let fs = Fs::with_options(4096, "");
+    let sectorsize = fs.sectorsize();
     let data = fs.dir("data");
 
     let big = fs.path("data/big");
@@ -756,7 +755,7 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
         .expect("the big file should hold an extent");
     let address = biggest.disk_address;
     assert!(
-        biggest.disk_bytes > *OFFSETS.last().unwrap() + SECTORSIZE,
+        biggest.disk_bytes > *OFFSETS.last().unwrap() + sectorsize,
         "fixture: extent is {} bytes, too small for these offsets",
         biggest.disk_bytes,
     );
@@ -816,9 +815,8 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
 /// one is a part of that stretch rather than the whole of it.
 #[test]
 fn a_holder_whose_reference_is_shorter_than_the_stretch_moves() {
-    const SECTORSIZE: u64 = 4096;
-
     let fs = Fs::new();
+    let sectorsize = fs.sectorsize();
     let data = fs.dir("data");
 
     let big = fs.path("data/big");
@@ -829,8 +827,8 @@ fn a_holder_whose_reference_is_shorter_than_the_stretch_moves() {
     // stretch is cut to; "short" then holds only the first of them.
     let long = fs.path("data/long.jpg");
     let short = fs.path("data/short.jpg");
-    support::sliver_of(&big, 8 * MIB, &long, MIB, 8192, 2 * SECTORSIZE);
-    support::sliver_of(&big, 8 * MIB, &short, MIB, 8192, SECTORSIZE);
+    support::sliver_of(&big, 8 * MIB, &long, MIB, 8192, 2 * sectorsize);
+    support::sliver_of(&big, 8 * MIB, &short, MIB, 8192, sectorsize);
     std::fs::remove_file(&big).expect("remove the big file");
     support::sync_fs();
 
@@ -1104,9 +1102,8 @@ fn random_layouts_release_every_extent() {
 /// counts the job done.
 #[test]
 fn a_holder_ending_mid_block_lets_go() {
-    const SECTORSIZE: u64 = 4096;
-
     let fs = Fs::new();
+    let sectorsize = fs.sectorsize();
     let data = fs.dir("data");
     let (long, short) = (fs.path("data/long"), fs.path("data/short"));
     support::write_random_one_extent(&long, 8);
@@ -1135,8 +1132,8 @@ fn a_holder_ending_mid_block_lets_go() {
         "fixture: the two files should hold one extent between them"
     );
     assert_eq!(
-        ragged % SECTORSIZE,
-        4096 - 1234,
+        ragged % sectorsize,
+        sectorsize - 1234,
         "fixture: the tail is a part sector"
     );
 

@@ -120,6 +120,15 @@ impl Fs {
         std::fs::create_dir_all(&dir).expect("make a directory");
         dir
     }
+
+    /// The sector size mkfs picked for this filesystem, read back rather than
+    /// assumed: it is the page size at mkfs time, which is not 4096 on every
+    /// architecture.
+    pub fn sectorsize(&self) -> u64 {
+        kernel::Filesystem::open(&self.mnt)
+            .expect("open the fixture filesystem")
+            .sectorsize
+    }
 }
 
 impl Drop for Fs {
@@ -562,9 +571,11 @@ pub fn sliver_of(
 /// Another sliver into a file that already has some: [`sliver`] builds the
 /// destination, this one only points one more of its sectors at `src`.
 pub fn sliver_into(src: &Path, src_offset: u64, dest: &Path, dest_offset: u64) {
-    const SECTORSIZE: u64 = 4096;
+    let sectorsize = kernel::Filesystem::open(src)
+        .expect("open the fixture filesystem")
+        .sectorsize;
 
-    let mut sector = vec![0u8; SECTORSIZE as usize];
+    let mut sector = vec![0u8; sectorsize as usize];
     let src_file = File::open(src).expect("open the sliver source");
     src_file
         .read_exact_at(&mut sector, src_offset)
@@ -580,10 +591,10 @@ pub fn sliver_into(src: &Path, src_offset: u64, dest: &Path, dest_offset: u64) {
     dest_file.sync_all().expect("sync the destination");
     sync_fs();
 
-    let deduped = kernel::dedupe(&src_file, src_offset, SECTORSIZE, &dest_file, dest_offset)
+    let deduped = kernel::dedupe(&src_file, src_offset, sectorsize, &dest_file, dest_offset)
         .expect("dedupe the sector");
     assert_eq!(
-        deduped, SECTORSIZE,
+        deduped, sectorsize,
         "the whole sector should have been deduped"
     );
     dest_file.sync_all().expect("sync the deduped destination");
@@ -657,7 +668,9 @@ pub fn write_pattern(path: &Path, len: u64, rng: &mut Rng, compressible: bool) {
 /// the run reports freed has to really be released, and no file may come back
 /// holding different bytes. Rebuilding a failure needs only the seed.
 pub fn random_layout(dir: &Path, rng: &mut Rng) -> Vec<PathBuf> {
-    const SECTORSIZE: u64 = 4096;
+    let sectorsize = kernel::Filesystem::open(dir)
+        .expect("open the fixture filesystem")
+        .sectorsize;
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut next = 0;
@@ -687,15 +700,15 @@ pub fn random_layout(dir: &Path, rng: &mut Rng) -> Vec<PathBuf> {
             Ok(meta) => meta.len(),
             Err(_) => continue,
         };
-        if size < 8 * SECTORSIZE {
+        if size < 8 * sectorsize {
             continue;
         }
         match rng.below(6) {
             // Drop a stretch of a file, which is what leaves an extent partly
             // unreachable in the first place.
             0 | 1 => {
-                let offset = rng.below(size - SECTORSIZE) & !(SECTORSIZE - 1);
-                let len = rng.between(SECTORSIZE, size - offset) & !(SECTORSIZE - 1);
+                let offset = rng.below(size - sectorsize) & !(sectorsize - 1);
+                let len = rng.between(sectorsize, size - offset) & !(sectorsize - 1);
                 if len > 0 {
                     punch_hole(&victim, offset, len);
                 }
@@ -708,22 +721,22 @@ pub fn random_layout(dir: &Path, rng: &mut Rng) -> Vec<PathBuf> {
             // What a block-level deduplicator leaves: one sector of a small file
             // pointed into the middle of a much larger extent.
             3 => {
-                let offset = rng.below(size - SECTORSIZE) & !(SECTORSIZE - 1);
+                let offset = rng.below(size - sectorsize) & !(sectorsize - 1);
                 let path = name(&mut files, &mut next);
-                sliver(&victim, offset, &path, rng.between(1, 2) * MIB, SECTORSIZE);
+                sliver(&victim, offset, &path, rng.between(1, 2) * MIB, sectorsize);
             }
             // A reference of more than one sector, so two holders can hold
             // different lengths of the same stretch.
             4 => {
-                let offset = rng.below(size - 4 * SECTORSIZE) & !(SECTORSIZE - 1);
-                let len = rng.between(1, 4) * SECTORSIZE;
+                let offset = rng.below(size - 4 * sectorsize) & !(sectorsize - 1);
+                let len = rng.between(1, 4) * sectorsize;
                 let path = name(&mut files, &mut next);
-                sliver_of(&victim, offset, &path, 4 * MIB, SECTORSIZE, len);
+                sliver_of(&victim, offset, &path, 4 * MIB, sectorsize, len);
             }
             // A size which is not a whole number of sectors, so the last
             // reference runs past the end of the data.
             _ => {
-                let to = rng.between(size / 2, size - 1) - rng.below(SECTORSIZE - 1);
+                let to = rng.between(size / 2, size - 1) - rng.below(sectorsize - 1);
                 let _ = OpenOptions::new()
                     .write(true)
                     .open(&victim)
