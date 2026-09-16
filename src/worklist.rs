@@ -75,11 +75,6 @@ pub fn create_jobs(scan: &Scan) -> Worklist {
             continue;
         }
 
-        // Check to pass on extents which have unknown refs (outside our path most likely)
-        if extent.unknown_refs {
-            continue;
-        }
-
         // A nodatacow holder can never be rewritten, so the extent will not be freed
         if extent.refs.iter().any(|r| r.nocow) {
             continue;
@@ -98,9 +93,9 @@ pub fn create_jobs(scan: &Scan) -> Worklist {
                     chunks: refs
                         .iter()
                         .map(|r| Chunk {
-                            extent_offset: r.start,
+                            extent_offset: r.extent_offset,
                             file_offset: r.file_offset,
-                            len: r.end - r.start,
+                            len: r.num_bytes,
                         })
                         .collect(),
                 })

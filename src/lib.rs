@@ -1,3 +1,4 @@
+pub mod extent;
 pub mod format;
 pub mod kernel;
 pub mod run;
@@ -41,9 +42,6 @@ pub fn scan(options: &Options) -> io::Result<Scan> {
     } else {
         scan.add_file(path, meta.size());
     }
-
-    // Classify
-    scan.classify();
 
     Ok(scan)
 }

@@ -181,10 +181,14 @@ fn identical_holders_still_share_one_copy() {
     assert_eq!(before, support::checksums(&data), "contents changed");
 }
 
-/// An extent something outside the scanned path also holds. We cannot prove its
-/// dead space is unreachable, so it is reported apart and never worked on.
+/// An extent something outside the scanned path also holds. Rather than
+/// guessing at what that other reference means, the scan resolves it like any
+/// other: this tool works on the whole filesystem, the scanned path just
+/// decides where it starts looking. Punching the same hole on both sides
+/// leaves the extent genuinely part dead, so it lands on the worklist and both
+/// holders — the one outside `data` included — end up rewritten.
 #[test]
-fn an_extent_referenced_outside_the_scan_is_left_alone() {
+fn an_extent_referenced_outside_the_scan_is_reclaimed_too() {
     let fs = Fs::new();
     let data = fs.dir("data");
     fs.dir("outside");
@@ -192,19 +196,30 @@ fn an_extent_referenced_outside_the_scan_is_left_alone() {
     let external = fs.path("data/external");
     support::write_random(&keeper, FILE_MIB);
     support::reflink(&keeper, &external);
-    support::punch_hole(&external, MIB, (FILE_MIB - 1) * MIB);
+    support::punch_hole(&keeper, MIB, (FILE_MIB - 2) * MIB);
+    support::punch_hole(&external, MIB, (FILE_MIB - 2) * MIB);
 
+    let before = support::checksums(fs.root()); // covers both `data` and `outside`
     let (scan, worklist) = support::scan_worklist(&data);
-    assert!(
-        scan.extents.values().any(|extent| extent.unknown_refs),
-        "the extent is held from outside the scan"
+    assert_eq!(
+        scan.totals().unreachable_bytes,
+        support::file_reclaimable(&scan, &external),
+        "the hole both files share should show up as reclaimable"
     );
     assert!(
-        scan.totals().unreachable_shared_bytes > 0,
-        "its dead space is reported as shared"
+        worklist.jobs.iter().any(|job| job.holders.len() == 2),
+        "the extent is on the worklist with both its holders"
     );
-    assert_eq!(scan.totals().unreachable_bytes, 0);
-    assert!(worklist.jobs.is_empty(), "and it is never worked on");
+
+    let (_, report) = support::apply(&data);
+    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+
+    assert_eq!(
+        support::physical_extents(&keeper),
+        support::physical_extents(&external),
+        "the two files should still share one copy"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// nodatacow files are overwritten in place and cannot be deduped, so however

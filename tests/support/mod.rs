@@ -26,9 +26,10 @@ use linux_raw_sys::ioctl::{FICLONE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS};
 use sha2::{Digest, Sha256};
 
 use btrealloc::Options;
+use btrealloc::extent::Extent;
 use btrealloc::kernel;
 use btrealloc::run::Report;
-use btrealloc::scan::{Extent, Scan};
+use btrealloc::scan::Scan;
 use btrealloc::worklist::{self, Worklist};
 
 pub const MIB: u64 = 1 << 20;
@@ -456,7 +457,7 @@ fn assert_released(scan: &Scan, worklist: &Worklist, report: &Report) {
             job.reclaimable_bytes,
         );
         if let Some(extent) = scan.extents.get(&job.disk_address) {
-            let _ = writeln!(trouble, "  live at scan time: {:?}", extent.live_ranges());
+            let _ = writeln!(trouble, "  live at scan time: {:?}", extent.live_ranges);
         }
         let _ = writeln!(
             trouble,
