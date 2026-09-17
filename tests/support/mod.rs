@@ -10,7 +10,7 @@
 
 #![allow(dead_code)] // each test uses a different corner of this
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -29,8 +29,7 @@ use btrealloc::Options;
 use btrealloc::extent::Extent;
 use btrealloc::kernel;
 use btrealloc::run::Report;
-use btrealloc::scan::Scan;
-use btrealloc::worklist::{self, Worklist};
+use btrealloc::scan::{ScanStats, Scanner, Totals};
 
 pub const MIB: u64 = 1 << 20;
 
@@ -360,17 +359,28 @@ pub fn file_reclaimable(scan: &Scan, path: &Path) -> u64 {
     allocated - used
 }
 
-/// Whether the run would rewrite the extent at `address`.
-pub fn on_worklist(worklist: &Worklist, address: u64) -> bool {
-    worklist.jobs.iter().any(|job| job.disk_address == address)
+/// The extents in the scan the run would rewrite, in address order.
+pub fn worklist(scan: &Scan) -> Vec<&Extent> {
+    let mut extents: Vec<&Extent> = scan
+        .extents
+        .values()
+        .filter(|extent| extent.worth_rewriting())
+        .collect();
+    extents.sort_by_key(|extent| extent.disk_address);
+    extents
 }
 
-/// Whether any job on the worklist names `path`, as a holder or otherwise.
-pub fn job_for<'a>(worklist: &'a Worklist, path: &Path) -> Option<&'a worklist::Job> {
+/// Whether the run would rewrite the extent at `address`.
+pub fn on_worklist(worklist: &[&Extent], address: u64) -> bool {
+    worklist.iter().any(|extent| extent.disk_address == address)
+}
+
+/// The extent on the worklist that `path` holds, if any.
+pub fn job_for<'a>(worklist: &[&'a Extent], path: &Path) -> Option<&'a Extent> {
     worklist
-        .jobs
         .iter()
-        .find(|job| job.holders.iter().any(|h| **h.path == *path))
+        .copied()
+        .find(|extent| extent.refs.iter().any(|r| **r.path == *path))
 }
 
 fn options(path: &Path, apply: bool, dryrun: bool) -> Options {
@@ -385,29 +395,46 @@ fn options(path: &Path, apply: bool, dryrun: bool) -> Options {
     }
 }
 
-/// Scans `dir` and returns what the scan found.
-pub fn scan(dir: &Path) -> Scan {
-    btrealloc::scan(&options(dir, false, false)).expect("scan the fixture")
+/// Every extent under a path, kept in memory at once so a test can look at the
+/// whole picture before and after a run.
+pub struct Scan {
+    pub extents: HashMap<u64, Extent>,
+    pub stats: ScanStats,
 }
 
-/// Scans `dir` and selects the extents worth rewriting.
-pub fn scan_worklist(dir: &Path) -> (Scan, Worklist) {
-    let scan = scan(dir);
-    let worklist = worklist::create_jobs(&scan);
-    (scan, worklist)
+impl Scan {
+    /// Allocated and used bytes over all extents, and the same split by extent
+    /// size class.
+    pub fn totals(&self) -> &Totals {
+        &self.stats.totals
+    }
+}
+
+/// Walks `dir` with the tool's own scanner and keeps every extent it hands
+/// over, where the tool would drop each one once dealt with.
+pub fn scan(dir: &Path) -> Scan {
+    let fs = kernel::Filesystem::open(dir).expect("open the fixture's filesystem");
+    let mut scanner = Scanner::new(&fs, dir).expect("scan the fixture");
+    let mut extents = HashMap::new();
+    while scanner.scan(&mut |extent: Extent| {
+        extents.insert(extent.disk_address, extent);
+    }) {}
+    Scan {
+        extents,
+        stats: scanner.stats,
+    }
 }
 
 /// Scans, rewrites, and syncs, then returns the scan it worked from and what it
 /// did. Assert on the report; the same lines were printed as it went.
 pub fn apply(dir: &Path) -> (Scan, Report) {
     let options = options(dir, true, false);
-    let scan = btrealloc::scan(&options).expect("scan the fixture");
-    // The same worklist the run builds for itself, kept so the check below
-    // knows which holders each rewritten extent had.
-    let worklist = worklist::create_jobs(&scan);
-    let report = btrealloc::run(&options, &scan);
+    // Scanned beforehand, so the check below knows which holders each
+    // rewritten extent had.
+    let scan = scan(dir);
+    let (_, report) = btrealloc::run(&options).expect("run over the fixture");
     sync_fs();
-    assert_released(&scan, &worklist, &report);
+    assert_released(&scan, &report);
     (scan, report)
 }
 
@@ -418,20 +445,21 @@ pub fn apply(dir: &Path) -> (Scan, Report) {
 /// The run then counts the job done and its bytes freed, and nothing downstream
 /// notices: the extent stays allocated with a live reference into it. Checking
 /// it here makes every apply in the suite a test for that.
-fn assert_released(scan: &Scan, worklist: &Worklist, report: &Report) {
+fn assert_released(scan: &Scan, report: &Report) {
     use std::fmt::Write;
 
     let mut trouble = String::new();
-    for job in &worklist.jobs {
-        if !report.rewritten.contains(&job.disk_address) {
+    for extent in worklist(scan) {
+        if !report.rewritten.contains(&extent.disk_address) {
             continue;
         }
+        let holders = extent.holders();
         let mut stuck: Vec<(&Rc<PathBuf>, Vec<String>)> = Vec::new();
-        for holder in &job.holders {
-            let left: Vec<String> = kernel::file_extents(&holder.path)
+        for holder in &holders {
+            let left: Vec<String> = kernel::file_extents(holder.path)
                 .expect("re-read a holder's extents")
                 .iter()
-                .filter(|e| e.disk_address == job.disk_address)
+                .filter(|e| e.disk_address == extent.disk_address)
                 .map(|e| {
                     format!(
                         "file offset {}, extent offset {}, {} bytes",
@@ -440,7 +468,7 @@ fn assert_released(scan: &Scan, worklist: &Worklist, report: &Report) {
                 })
                 .collect();
             if !left.is_empty() {
-                stuck.push((&holder.path, left));
+                stuck.push((holder.path, left));
             }
         }
         if stuck.is_empty() {
@@ -450,21 +478,19 @@ fn assert_released(scan: &Scan, worklist: &Worklist, report: &Report) {
         let _ = writeln!(
             trouble,
             "extent {:#x}: {} on disk, {} uncompressed, {} to copy, {} to free",
-            job.disk_address,
-            job.disk_bytes,
-            job.uncompressed_bytes,
-            job.uncompressed_bytes,
-            job.reclaimable_bytes,
+            extent.disk_address,
+            extent.disk_bytes,
+            extent.uncompressed_bytes,
+            extent.live_uncompressed_bytes(),
+            extent.disk_free_bytes(),
         );
-        if let Some(extent) = scan.extents.get(&job.disk_address) {
-            let _ = writeln!(trouble, "  live at scan time: {:?}", extent.live_ranges);
-        }
+        let _ = writeln!(trouble, "  live at scan time: {:?}", extent.live_ranges);
         let _ = writeln!(
             trouble,
             "  copies the rewrite makes: {:?}",
-            copy_ranges(job)
+            copy_ranges(extent)
         );
-        for holder in &job.holders {
+        for holder in &holders {
             let size = std::fs::metadata(&**holder.path).map(|m| m.len());
             let _ = writeln!(
                 trouble,
@@ -472,11 +498,11 @@ fn assert_released(scan: &Scan, worklist: &Worklist, report: &Report) {
                 holder.path.display(),
                 size,
             );
-            for chunk in &holder.chunks {
+            for r in &holder.refs {
                 let _ = writeln!(
                     trouble,
                     "    chunk: extent offset {}, file offset {}, {} bytes",
-                    chunk.extent_offset, chunk.file_offset, chunk.len,
+                    r.extent_offset, r.file_offset, r.num_bytes,
                 );
             }
         }
@@ -494,16 +520,16 @@ fn assert_released(scan: &Scan, worklist: &Worklist, report: &Report) {
 }
 
 /// The stretches the rewrite copies, worked out the way `run` does it: the
-/// holders' chunks merged. Worked out here rather than exported from the tool,
+/// references merged. Worked out here rather than exported from the tool,
 /// so that the two drifting apart shows up as a difference rather than as
 /// agreement.
-fn copy_ranges(job: &worklist::Job) -> Vec<(u64, u64)> {
-    let mut chunks: Vec<&worklist::Chunk> = job.holders.iter().flat_map(|h| &h.chunks).collect();
-    chunks.sort_by_key(|chunk| chunk.extent_offset);
+fn copy_ranges(extent: &Extent) -> Vec<(u64, u64)> {
+    let mut refs: Vec<_> = extent.refs.iter().collect();
+    refs.sort_by_key(|r| r.extent_offset);
 
     let mut merged: Vec<(u64, u64)> = Vec::new();
-    for chunk in chunks {
-        let (start, end) = (chunk.extent_offset, chunk.extent_offset + chunk.len);
+    for r in refs {
+        let (start, end) = (r.extent_offset, r.extent_offset + r.num_bytes);
         match merged.last_mut() {
             Some(last) if start <= last.1 => last.1 = last.1.max(end),
             _ => merged.push((start, end)),
@@ -516,8 +542,8 @@ fn copy_ranges(job: &worklist::Job) -> Vec<(u64, u64)> {
 /// as it was.
 pub fn dryrun(dir: &Path) -> (Scan, Report) {
     let options = options(dir, false, true);
-    let scan = btrealloc::scan(&options).expect("scan the fixture");
-    let report = btrealloc::run(&options, &scan);
+    let scan = scan(dir);
+    let (_, report) = btrealloc::run(&options).expect("run over the fixture");
     (scan, report)
 }
 

@@ -7,37 +7,45 @@ use std::rc::Rc;
 use sha2::{Digest, Sha256};
 
 use crate::Options;
+use crate::extent::{Extent, ExtentRef, Holder};
 use crate::format::{hex, human};
 use crate::kernel::{self, Filesystem};
-use crate::worklist::{Chunk, Holder, Job, Worklist};
 
-/// Process the worklist, one extent at a time.
+/// Processes extents one at a time, as the scan hands them over, and keeps
+/// the account of what it did.
 ///
 /// `fs` is here for its sector size: a holder ending mid-sector needs
 /// [`redirect_tail`], and where that boundary falls is the filesystem's to say.
-pub fn run(worklist: &Worklist, options: &Options, fs: &Filesystem) -> Report {
-    let jobs = &worklist.jobs;
-    let mut report = Report::default();
+pub struct Runner {
+    options: Options,
+    fs: Rc<Filesystem>,
+    report: Report,
+}
 
-    println!();
-    if options.apply {
-        println!(
-            "rewriting {} extents: copying {} to free {}",
-            jobs.len(),
-            human(worklist.uncompressed_bytes),
-            human(worklist.reclaimable_bytes),
-        );
-        if options.verify {
-            println!("verifying: every file is hashed before and after it is rewritten");
+impl Runner {
+    pub fn new(options: Options, fs: Rc<Filesystem>) -> Runner {
+        if options.apply {
+            println!("rewriting extents as they are found");
+            if options.verify {
+                println!("verifying: every file is hashed before and after it is rewritten");
+            }
+        } else {
+            println!("dry run: nothing will be written");
         }
-    } else {
-        println!("dry run: nothing will be written");
+        Runner {
+            options,
+            fs,
+            report: Report::default(),
+        }
     }
 
-    for job in jobs {
+    /// Reallocates one extent, or on a dry run says what doing so would do.
+    pub fn process(&mut self, extent: &Extent) {
+        let (options, report) = (&self.options, &mut self.report);
+        let holders = extent.holders();
         if options.apply {
             // Reallocate the extent for real
-            let result = realloc_extent(job, options, fs);
+            let result = realloc_extent(extent, &holders, options, self.fs.as_ref());
             // Check for failure
             if let Err(failure) = result {
                 // Print errors and move to the next extent
@@ -49,28 +57,28 @@ pub fn run(worklist: &Worklist, options: &Options, fs: &Filesystem) -> Report {
                     eprintln!("skipped {}: {}", failure.path.display(), failure.error);
                     report.skipped.push(entry);
                 }
-                continue;
+                return;
             }
         }
 
-        println!("{}", describe(job, options));
+        println!("{}", describe(extent, &holders, options));
 
-        report.copied_bytes += job.uncompressed_bytes;
-        report.freed_bytes += job.reclaimable_bytes;
-        report.rewritten.push(job.disk_address);
+        report.copied_bytes += extent.live_uncompressed_bytes();
+        report.freed_bytes += extent.disk_free_bytes();
+        report.rewritten.push(extent.disk_address);
 
         if options.verbose {
             println!(
                 "    extent {:#x}, {} on disk",
-                job.disk_address,
-                human(job.disk_bytes),
+                extent.disk_address,
+                human(extent.disk_bytes),
             );
-            for holder in &job.holders {
-                for chunk in &holder.chunks {
+            for holder in &holders {
+                for r in &holder.refs {
                     println!(
                         "    {} at offset {} in {}",
-                        human(chunk.len),
-                        chunk.file_offset,
+                        human(r.num_bytes),
+                        r.file_offset,
                         holder.path.display(),
                     );
                 }
@@ -78,56 +86,65 @@ pub fn run(worklist: &Worklist, options: &Options, fs: &Filesystem) -> Report {
         }
     }
 
-    let extents = report.rewritten.len();
-    if options.apply {
-        println!(
-            "copied {} to free {} from {extents} extents",
-            human(report.copied_bytes),
-            human(report.freed_bytes),
-        );
-    } else {
-        println!(
-            "would copy {} to free {} from {extents} extents",
-            human(report.copied_bytes),
-            human(report.freed_bytes),
-        );
+    /// Prints the summary of the whole run and returns its account.
+    pub fn finish(self) -> Report {
+        let report = self.report;
+        let extents = report.rewritten.len();
+        println!();
+        if self.options.apply {
+            println!(
+                "copied {} to free {} from {extents} extents",
+                human(report.copied_bytes),
+                human(report.freed_bytes),
+            );
+        } else {
+            println!(
+                "would copy {} to free {} from {extents} extents",
+                human(report.copied_bytes),
+                human(report.freed_bytes),
+            );
+        }
+        if !report.skipped.is_empty() {
+            println!("{} extents could not be rewritten", report.skipped.len());
+        }
+        if !report.corrupted.is_empty() {
+            println!(
+                "{} files no longer hold the contents they did",
+                report.corrupted.len()
+            );
+        }
+        report
     }
-    if !report.skipped.is_empty() {
-        println!("{} extents could not be rewritten", report.skipped.len());
-    }
-    if !report.corrupted.is_empty() {
-        println!(
-            "{} files no longer hold the contents they did",
-            report.corrupted.len()
-        );
-    }
-    report
 }
 
 /// Copies an extent's live ranges into temporary files, then points the live ranges from
 /// every file holding that extent at the copy. No original inode is ever replaced. Each
 /// keeps its identity, owner, times and xattrs, and only its extent references change.
-fn realloc_extent(job: &Job, options: &Options, fs: &Filesystem) -> Result<(), Failure> {
-    let liveranges = read_liveranges(job, fs)?;
+fn realloc_extent(
+    extent: &Extent,
+    holders: &[Holder],
+    options: &Options,
+    fs: &Filesystem,
+) -> Result<(), Failure> {
+    let liveranges = read_liveranges(extent, fs)?;
 
     // What every holder looked like beforehand for checking after we reallocate.
-    let before: Vec<HolderBefore> = job
-        .holders
+    let before: Vec<HolderBefore> = holders
         .iter()
         .map(|holder| HolderBefore::read(holder, options))
         .collect::<Result<_, _>>()?;
 
     // Iterate over live ranges
     for liverange in &liveranges {
-        // Copy the live range into a temporary file
-        let temp = stage(job, liverange)?;
+        // Copy the live range into a temporary file, next to the first holder
+        let temp = stage(holders[0].path, liverange)?;
         // Then point every holder at the newly allocated data
-        for (holder, before) in job.holders.iter().zip(&before) {
+        for (holder, before) in holders.iter().zip(&before) {
             redirect_chunks(holder, &temp, liverange, before.filesize)?;
         }
     }
 
-    for (holder, before) in job.holders.iter().zip(&before) {
+    for (holder, before) in holders.iter().zip(&before) {
         finish_holder(holder, before, fs)?;
     }
     Ok(())
@@ -154,18 +171,15 @@ struct LiveRange {
 /// A stretch keeps its own copy rather than being packed in with the others:
 /// stretches held by different files have different lifetimes, and putting them
 /// in one extent would rebuild the part-dead extent this is meant to take apart.
-fn read_liveranges(job: &Job, fs: &Filesystem) -> Result<Vec<LiveRange>, Failure> {
-    let mut chunks: Vec<(&Rc<PathBuf>, &Chunk)> = job
-        .holders
-        .iter()
-        .flat_map(|holder| holder.chunks.iter().map(move |chunk| (&holder.path, chunk)))
-        .collect();
-    chunks.sort_unstable_by_key(|(_, chunk)| chunk.extent_offset);
+fn read_liveranges(extent: &Extent, fs: &Filesystem) -> Result<Vec<LiveRange>, Failure> {
+    let mut refs: Vec<&ExtentRef> = extent.refs.iter().collect();
+    refs.sort_unstable_by_key(|r| r.extent_offset);
 
     let mut copies = Vec::new();
-    for (start, end) in live_ranges(&chunks) {
+    for range in &extent.live_ranges {
+        let (start, end) = (range.start, range.end);
         let mut bytes = vec![0u8; (end - start) as usize];
-        let end = fill(&chunks, start, end, &mut bytes)?;
+        let end = fill(&refs, start, end, &mut bytes)?;
         // Holders are pointed at whole sectors, so a part sector at the end of a
         // stretch cut short by a file's end is one nothing can ever reference.
         // Dropping it here keeps it from ever being written out; the holder it
@@ -255,12 +269,12 @@ impl HolderBefore {
     /// Reads a holder's contents and metadata, and refuses one a rewrite cannot
     /// touch at all.
     ///
-    /// Taken once for the whole job rather than per stretch: the checks in
+    /// Taken once for the whole extent rather than per stretch: the checks in
     /// [`finish`] need something from before anything moved, and a stretch is
     /// staged at a time, so there is no one place downstream that still sees the
     /// file untouched.
     fn read(holder: &Holder, options: &Options) -> Result<HolderBefore, Failure> {
-        let path = &holder.path;
+        let path = holder.path;
         let file = File::open(&**path).map_err(|e| Failure::new(path, e))?;
         if kernel::is_nocow(&file).map_err(|e| Failure::new(path, e))? {
             return Err(Failure::other(path, "nodatacow"));
@@ -279,19 +293,6 @@ impl HolderBefore {
     }
 }
 
-/// Every stretch of the extent some file still references, merged, in order.
-fn live_ranges(chunks: &[(&Rc<PathBuf>, &Chunk)]) -> Vec<(u64, u64)> {
-    let mut merged: Vec<(u64, u64)> = Vec::new();
-    for (_, chunk) in chunks {
-        let (start, end) = (chunk.extent_offset, chunk.extent_offset + chunk.len);
-        match merged.last_mut() {
-            Some(last) if start <= last.1 => last.1 = last.1.max(end),
-            _ => merged.push((start, end)),
-        }
-    }
-    merged
-}
-
 /// Writes one stretch out to a temporary of its own, ready to be deduped from
 /// and dropped again.
 ///
@@ -299,42 +300,37 @@ fn live_ranges(chunks: &[(&Rc<PathBuf>, &Chunk)]) -> Vec<(u64, u64)> {
 /// dedupe between two inodes that disagree about checksums. A datacow file in a
 /// nodatacow directory is the one shape that reaches this, and it is worth
 /// naming rather than leaving as a bare EINVAL.
-fn stage(job: &Job, range: &LiveRange) -> Result<File, Failure> {
-    let temp =
-        kernel::temp_file(parent_dir(job.path())).map_err(|e| Failure::new(job.path(), e))?;
-    if kernel::is_nocow(&temp).map_err(|e| Failure::new(job.path(), e))? {
+fn stage(path: &Rc<PathBuf>, range: &LiveRange) -> Result<File, Failure> {
+    let temp = kernel::temp_file(parent_dir(path)).map_err(|e| Failure::new(path, e))?;
+    if kernel::is_nocow(&temp).map_err(|e| Failure::new(path, e))? {
         return Err(Failure::other(
-            job.path(),
+            path,
             "temporary file inherited nodatacow from its directory",
         ));
     }
     temp.write_all_at(&range.bytes, 0)
-        .map_err(|e| Failure::new(job.path(), e))?;
+        .map_err(|e| Failure::new(path, e))?;
     Ok(temp)
 }
 
 /// Reads `[start, end)` of the extent into `buf`, taking each part from a file
 /// that holds it. Returns how far it got: a holder's last extent can run past
 /// the end of its data, so there may be less to read than the stretch claims.
-fn fill(
-    chunks: &[(&Rc<PathBuf>, &Chunk)],
-    start: u64,
-    end: u64,
-    buf: &mut [u8],
-) -> Result<u64, Failure> {
+fn fill(refs: &[&ExtentRef], start: u64, end: u64, buf: &mut [u8]) -> Result<u64, Failure> {
     let mut at = start;
-    for (path, chunk) in chunks {
+    for r in refs {
         if at >= end {
             break;
         }
-        if chunk.extent_offset > at || chunk.extent_offset + chunk.len <= at {
+        if r.extent_offset > at || r.extent_offset + r.num_bytes <= at {
             continue;
         }
+        let path = &r.path;
         let file = File::open(path.as_path()).map_err(|e| Failure::new(path, e))?;
         let size = file.metadata().map_err(|e| Failure::new(path, e))?.len();
-        let file_offset = chunk.file_offset + (at - chunk.extent_offset);
+        let file_offset = r.file_offset + (at - r.extent_offset);
         let to = end
-            .min(chunk.extent_offset + chunk.len)
+            .min(r.extent_offset + r.num_bytes)
             .min(at + size.saturating_sub(file_offset));
         if to <= at {
             continue;
@@ -410,7 +406,7 @@ fn redirect_chunks(
     liverange: &LiveRange,
     size: u64,
 ) -> Result<(), Failure> {
-    let path = &holder.path;
+    let path = holder.path;
     // FIDEDUPERANGE replaces this file's extents, so it has to be open for
     // writing as well as reading.
     let file = OpenOptions::new()
@@ -419,19 +415,19 @@ fn redirect_chunks(
         .open(&**path)
         .map_err(|e| Failure::new(path, e))?;
 
-    for chunk in &holder.chunks {
-        // Clamp the end of the byte range to the file size. The final chunk can
-        // extend past it.
-        let end = (chunk.file_offset + chunk.len).min(size);
-        if end <= chunk.file_offset {
+    for r in &holder.refs {
+        // Clamp the end of the byte range to the file size. The final reference
+        // can extend past it.
+        let end = (r.file_offset + r.num_bytes).min(size);
+        if end <= r.file_offset {
             // The file size has changed between the scan and now? Skip this
-            // chunk for safety.
+            // reference for safety.
             continue;
         }
-        let mut at = chunk.extent_offset.max(liverange.start);
-        let to = (chunk.extent_offset + chunk.len).min(liverange.end);
+        let mut at = r.extent_offset.max(liverange.start);
+        let to = (r.extent_offset + r.num_bytes).min(liverange.end);
         while at < to {
-            let cursor = chunk.file_offset + (at - chunk.extent_offset);
+            let cursor = r.file_offset + (at - r.extent_offset);
             if cursor >= end {
                 break;
             }
@@ -458,7 +454,7 @@ fn redirect_chunks(
 /// Processes each holder of an extent, performing any checks requested and
 /// optionally processing the final sector of the file with [`redirect_tail`].
 fn finish_holder(holder: &Holder, before: &HolderBefore, fs: &Filesystem) -> Result<(), Failure> {
-    let path = &holder.path;
+    let path = holder.path;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -468,9 +464,9 @@ fn finish_holder(holder: &Holder, before: &HolderBefore, fs: &Filesystem) -> Res
     // Check if this extent overlaps the last sector of the file, and if so, redirect it to a copy of that sector.
     let tail_start = before.filesize / fs.sectorsize * fs.sectorsize;
     let holds_tail = holder
-        .chunks
+        .refs
         .iter()
-        .any(|chunk| chunk.file_offset <= tail_start && tail_start < chunk.file_offset + chunk.len);
+        .any(|r| r.file_offset <= tail_start && tail_start < r.file_offset + r.num_bytes);
     if !before.filesize.is_multiple_of(fs.sectorsize) && holds_tail {
         redirect_tail(path, &file, tail_start, before.filesize, fs)?;
     }
@@ -532,63 +528,29 @@ pub struct Report {
 
 /// The head line for one extent: the file it is named after, what its rewrite
 /// copies, and what it frees.
-fn describe(job: &Job, options: &Options) -> String {
-    let shared_with = match job.holders.len() - 1 {
+fn describe(extent: &Extent, holders: &[Holder], options: &Options) -> String {
+    let shared_with = match holders.len() - 1 {
         0 => String::new(),
         1 => " (shared with 1 other file)".to_string(),
         n => format!(" (shared with {n} other files)"),
     };
     format!(
         "{}: {} {}, {} {}{shared_with}",
-        job.path().display(),
+        holders[0].path.display(),
         if options.apply { "copied" } else { "copying" },
-        human(job.uncompressed_bytes),
+        human(extent.live_uncompressed_bytes()),
         if options.apply {
             "freed part of"
         } else {
             "frees part of"
         },
-        human(job.reclaimable_bytes),
+        human(extent.disk_free_bytes()),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn chunk(extent_offset: u64, len: u64) -> Chunk {
-        Chunk {
-            extent_offset,
-            file_offset: 0,
-            len,
-        }
-    }
-
-    fn ranges(chunks: &[Chunk]) -> Vec<(u64, u64)> {
-        let path = Rc::new(PathBuf::from("f"));
-        let pairs: Vec<(&Rc<PathBuf>, &Chunk)> = chunks.iter().map(|c| (&path, c)).collect();
-        live_ranges(&pairs)
-    }
-
-    #[test]
-    fn separate_stretches_stay_separate() {
-        assert_eq!(
-            ranges(&[chunk(0, 4096), chunk(1 << 20, 4096)]),
-            vec![(0, 4096), (1 << 20, (1 << 20) + 4096)],
-        );
-    }
-
-    #[test]
-    fn overlapping_and_touching_stretches_merge() {
-        assert_eq!(
-            ranges(&[chunk(0, 8192), chunk(4096, 8192)]),
-            vec![(0, 12288)]
-        );
-        assert_eq!(
-            ranges(&[chunk(0, 4096), chunk(4096, 4096)]),
-            vec![(0, 8192)]
-        );
-    }
 
     /// Larger than the read buffer, so a checksum that stopped at one bufferful
     /// would not match.

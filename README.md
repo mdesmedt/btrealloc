@@ -62,8 +62,8 @@ Reallocating the extents with `btrealloc --apply`:
 
 ```
 sudo btrealloc /mnt/drive/stuff/ --apply
-...
-rewriting 6058 extents: copying 18.85 GiB to free 44.07 GiB
+Scanning: /mnt/drive/stuff/
+rewriting extents as they are found
 ...
 copied 18.85 GiB to free 44.07 GiB from 6058 extents
 ```

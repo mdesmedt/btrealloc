@@ -5,6 +5,14 @@ use std::rc::Rc;
 
 use crate::kernel::Filesystem;
 
+// Hard-coded tunables for now
+
+/// Minimum amount of bytes to reclaim in an extent.
+const MIN_RECLAIM_BYTES: u64 = 65536;
+
+/// Move at most this many bytes to free one. We currently choose to skip copying 100MB to reclaim 1MB.
+const MAX_COPY_RATIO: u64 = 4;
+
 /// One reference from a file into a physical extent.
 pub struct ExtentRef {
     pub path: Rc<PathBuf>,
@@ -28,6 +36,8 @@ pub struct ExtentRef {
 
 /// One extent and every reference to it, wherever on the filesystem they are.
 pub struct Extent {
+    /// Physical address of the extent, which is its identity.
+    pub disk_address: u64,
     /// Bytes on disk
     pub disk_bytes: u64,
     /// Bytes after decompression
@@ -42,9 +52,15 @@ pub struct Extent {
 }
 
 impl Extent {
-    fn new(disk_bytes: u64, uncompressed_bytes: u64, refs: Vec<ExtentRef>) -> Extent {
+    fn new(
+        disk_address: u64,
+        disk_bytes: u64,
+        uncompressed_bytes: u64,
+        refs: Vec<ExtentRef>,
+    ) -> Extent {
         let live_ranges = live_ranges(&refs);
         Extent {
+            disk_address,
             disk_bytes,
             uncompressed_bytes,
             refs,
@@ -75,7 +91,12 @@ impl Extent {
             },
         };
 
-        Ok(Some(Extent::new(disk_bytes, uncompressed_bytes, refs)))
+        Ok(Some(Extent::new(
+            disk_address,
+            disk_bytes,
+            uncompressed_bytes,
+            refs,
+        )))
     }
 
     /// Uncompressed bytes of this extent still referenced, counted once
@@ -108,23 +129,50 @@ impl Extent {
     /// reference count past the sort; a deduplicator can spread one extent over
     /// thousands of files, where searching the groups built so far does not
     /// finish.
-    pub fn holders(&self) -> Vec<(&Rc<PathBuf>, Vec<&ExtentRef>)> {
+    pub fn holders(&self) -> Vec<Holder<'_>> {
         let mut refs: Vec<&ExtentRef> = self.refs.iter().collect();
         refs.sort_unstable_by(|a, b| (&*a.path, a.file_offset).cmp(&(&*b.path, b.file_offset)));
 
-        let mut holders: Vec<(&Rc<PathBuf>, Vec<&ExtentRef>)> = Vec::new();
+        let mut holders: Vec<Holder> = Vec::new();
         for r in refs {
             match holders.last_mut() {
                 // Refs for the same file can come from different `file_extents`
                 // calls (the scan's own walk, and a backref resolution elsewhere),
                 // so they are not always the same `Rc`: compare the paths, not
                 // their pointers.
-                Some((path, group)) if path.as_path() == r.path.as_path() => group.push(r),
-                _ => holders.push((&r.path, vec![r])),
+                Some(holder) if holder.path.as_path() == r.path.as_path() => holder.refs.push(r),
+                _ => holders.push(Holder {
+                    path: &r.path,
+                    refs: vec![r],
+                }),
             }
         }
         holders
     }
+
+    /// Whether reallocating this extent is worth what it costs.
+    pub fn worth_rewriting(&self) -> bool {
+        let free_bytes = self.disk_free_bytes();
+
+        // Check if the extent has at least MIN_RECLAIM_BYTES reclaimable bytes
+        if free_bytes < MIN_RECLAIM_BYTES {
+            return false;
+        }
+
+        // Check that we're not going to copy much to reclaim little
+        if free_bytes * MAX_COPY_RATIO < self.live_uncompressed_bytes() {
+            return false;
+        }
+
+        // A nodatacow holder can never be rewritten, so the extent will not be freed
+        !self.refs.iter().any(|r| r.nocow)
+    }
+}
+
+/// One file holding an extent, and its references into it in file order.
+pub struct Holder<'a> {
+    pub path: &'a Rc<PathBuf>,
+    pub refs: Vec<&'a ExtentRef>,
 }
 
 /// Every stretch of the extent some reference still covers, merged, in order.
@@ -168,7 +216,7 @@ mod tests {
             .iter()
             .map(|&(off, len)| extent_ref(&path, off, len))
             .collect();
-        Extent::new(1024, 1024, refs)
+        Extent::new(0, 1024, 1024, refs)
     }
 
     #[test]
@@ -184,6 +232,19 @@ mod tests {
     #[test]
     fn a_reference_inside_another_is_absorbed() {
         assert_eq!(extent(&[(0, 900), (100, 50)]).disk_used_bytes(), 900);
+    }
+
+    #[test]
+    fn separate_stretches_stay_separate() {
+        assert_eq!(
+            extent(&[(0, 100), (900, 124)]).live_ranges,
+            vec![0..100, 900..1024]
+        );
+    }
+
+    #[test]
+    fn touching_stretches_merge() {
+        assert_eq!(extent(&[(0, 512), (512, 512)]).live_ranges, vec![0..1024]);
     }
 
     #[test]

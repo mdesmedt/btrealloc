@@ -44,7 +44,8 @@ fn a_bookend_extent_is_reclaimed() {
     support::bookend(&file, FILE_MIB);
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let reclaimable = support::file_reclaimable(&scan, &file);
     assert!(
         reclaimable >= 16 * MIB,
@@ -79,14 +80,13 @@ fn three_live_pieces_are_copied() {
     let live = (1 + 10 + 8) * MIB;
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let chunks: Vec<u64> = worklist
-        .jobs
         .iter()
-        .flat_map(|job| &job.holders)
-        .filter(|holder| **holder.path == *file)
-        .flat_map(|holder| &holder.chunks)
-        .map(|chunk| chunk.len)
+        .flat_map(|extent| &extent.refs)
+        .filter(|r| **r.path == *file)
+        .map(|r| r.num_bytes)
         .collect();
     // Three surviving pieces are at least three chunks: a split extent divides
     // them further, it never merges two of them into one.
@@ -132,10 +132,11 @@ fn one_extent_held_by_two_files_needs_both_rewritten() {
     );
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let job = support::job_for(&worklist, &a).expect("the shared extent is worth rewriting");
     assert_eq!(job.disk_address, extent);
-    assert_eq!(job.holders.len(), 2, "both files hold the extent");
+    assert_eq!(job.holders().len(), 2, "both files hold the extent");
 
     let (_, report) = support::apply(&data);
     assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
@@ -162,7 +163,7 @@ fn identical_holders_still_share_one_copy() {
     support::punch_hole(&b, MIB, (FILE_MIB - 1) * MIB);
 
     let before = support::checksums(&data);
-    let (scan, _) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
     let allocated_before = scan.totals().allocated_bytes;
 
     let (_, report) = support::apply(&data);
@@ -200,14 +201,15 @@ fn an_extent_referenced_outside_the_scan_is_reclaimed_too() {
     support::punch_hole(&external, MIB, (FILE_MIB - 2) * MIB);
 
     let before = support::checksums(fs.root()); // covers both `data` and `outside`
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert_eq!(
         scan.totals().unreachable_bytes,
         support::file_reclaimable(&scan, &external),
         "the hole both files share should show up as reclaimable"
     );
     assert!(
-        worklist.jobs.iter().any(|job| job.holders.len() == 2),
+        worklist.iter().any(|extent| extent.holders().len() == 2),
         "the extent is on the worklist with both its holders"
     );
 
@@ -234,14 +236,15 @@ fn a_nodatacow_file_never_reaches_the_worklist() {
     support::write_random(&file, FILE_MIB);
     support::punch_hole(&file, MIB, (FILE_MIB - 2) * MIB);
 
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         scan.extents
             .values()
             .all(|extent| extent.refs.iter().all(|r| r.nocow)),
         "the scan should see the file as nodatacow"
     );
-    assert!(worklist.jobs.is_empty(), "so it is never worked on");
+    assert!(worklist.is_empty(), "so it is never worked on");
 }
 
 /// A datacow file in a nodatacow directory. The temporary copy inherits the
@@ -259,7 +262,8 @@ fn a_nodatacow_directory_is_skipped_by_name() {
     support::set_nocow(&dir);
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::job_for(&worklist, &file).is_some(),
         "the waste is real, so the job is made"
@@ -276,7 +280,8 @@ fn a_nodatacow_directory_is_skipped_by_name() {
     );
 
     assert_eq!(before, support::checksums(&data), "contents changed");
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::job_for(&worklist, &file).is_some(),
         "it is still on the worklist, and always will be"
@@ -293,12 +298,13 @@ fn waste_below_the_floor_is_reported_but_not_worked() {
     support::write_random(&file, 1);
     support::punch_hole(&file, 64 * 1024, 8 * 1024);
 
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::file_reclaimable(&scan, &file) > 0,
         "the hole is dead space and is reported"
     );
-    assert!(worklist.jobs.is_empty(), "but it is not worth an operation");
+    assert!(worklist.is_empty(), "but it is not worth an operation");
 }
 
 /// A big extent with a little dead space: the copy costs far more than it
@@ -311,7 +317,8 @@ fn an_extent_too_full_to_be_worth_copying_is_left_alone() {
     support::write_random(&file, FILE_MIB);
     support::punch_hole(&file, (FILE_MIB / 2) * MIB, 8 * MIB);
 
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extents = support::extents_of(&scan, &file);
     // Whatever the write was cut into, an extent which would cost more than
     // four bytes moved for every byte it returns is a bad trade, and the ratio
@@ -350,9 +357,10 @@ fn a_clean_file_has_no_waste() {
     let file = fs.path("data/clean");
     support::write_random(&file, 8);
 
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert_eq!(support::file_reclaimable(&scan, &file), 0);
-    assert!(worklist.jobs.is_empty());
+    assert!(worklist.is_empty());
 }
 
 /// The temporary copy is made in each file's own directory, so a run has to
@@ -488,7 +496,8 @@ fn every_holder_of_a_slivered_extent_is_redirected() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -568,7 +577,8 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -647,7 +657,8 @@ fn holders_shared_between_jobs_all_move() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     for address in &addresses {
         let extent = scan
             .extents
@@ -721,7 +732,8 @@ fn a_holder_deep_inside_a_large_file_moves_too() {
     support::punch_hole(&movie, base + kept + sectorsize, size - kept - sectorsize);
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -796,7 +808,8 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -848,7 +861,7 @@ fn a_holder_whose_reference_is_shorter_than_the_stretch_moves() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, _) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
     let extent = scan
         .extents
         .get(&address)
@@ -899,7 +912,8 @@ fn a_long_live_stretch_moves_whole() {
     support::punch_hole(&movie, base + start + LIVE, size - start - LIVE);
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -964,7 +978,8 @@ fn a_holder_deep_inside_a_long_stretch_moves() {
     support::punch_hole(&movie, base + start + LIVE, size - start - LIVE);
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -1024,7 +1039,8 @@ fn a_holder_with_a_short_last_block_moves() {
     support::punch_hole(&file, MIB, (FILE_MIB - 4) * MIB);
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::job_for(&worklist, &file).is_some(),
         "the file should be worth rewriting"
@@ -1153,7 +1169,8 @@ fn a_holder_ending_mid_block_lets_go() {
     );
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::on_worklist(&worklist, extent),
         "the hole is most of it"
