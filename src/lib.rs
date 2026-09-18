@@ -28,14 +28,13 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
     let mut scanner = Scanner::new(options.clone(), fs.clone())?;
     let mut runner = (options.dryrun || options.apply).then(|| Runner::new(options.clone(), fs));
 
-    // Loop the scanner
-    while scanner.scan(&mut |extent| {
+    for extent in &mut scanner {
         if let Some(runner) = runner.as_mut()
             && extent.worth_rewriting()
         {
             runner.process(&extent);
         }
-    }) {}
+    }
 
     let report = runner.map(Runner::finish).unwrap_or_default();
     Ok((scanner.stats, report))

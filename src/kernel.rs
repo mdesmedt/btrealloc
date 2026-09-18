@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::ffi::{OsStr, c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::iter::Peekable;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -9,6 +10,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::rc::Rc;
+use std::vec;
 
 use linux_raw_sys::btrfs::{
     BTRFS_EXTENT_DATA_KEY, BTRFS_EXTENT_DATA_REF_KEY, BTRFS_EXTENT_FLAG_DATA,
@@ -27,7 +29,7 @@ use linux_raw_sys::ioctl::{
     FIDEDUPERANGE, FS_IOC_GETFLAGS,
 };
 
-use crate::extent::ExtentRef;
+use crate::extent::{Extent, ExtentRef};
 
 /// The tree search buffer. Big enough that a search which comes back with room
 /// to spare for the largest item btrfs can store is known to have reached the
@@ -360,12 +362,7 @@ impl Filesystem {
 
     /// Resolves every extent `refs` point into, `refs` being everything one
     /// file references, to every reference the whole filesystem holds to it,
-    /// down to the file and byte range each one is at. Each extent is handed to
-    /// `each` as soon as it is resolved, by address: `Ok(None)` means there is
-    /// nothing safe to say about it. It was freed while we scanned, or at least
-    /// one reference belongs to an inode we cannot resolve to a path on this
-    /// handle (most often a snapshot's, in a different subvolume tree than the
-    /// one opened).
+    /// down to the file and byte range each one is at.
     ///
     /// The extent tree keeps an extent's references next to the extent, in
     /// address order, and a file's extents mostly sit close together on disk.
@@ -375,13 +372,10 @@ impl Filesystem {
     /// only the stretch of each that can hold a reference; where it names no
     /// file, the kernel's backreference walk finds them.
     ///
-    /// An `Err` is a search that failed outright, and ends the file: the
-    /// extents handed over before it stand.
-    pub fn resolve_extents(
-        &self,
-        mut refs: Vec<ExtentRef>,
-        mut each: impl FnMut(u64, io::Result<Option<Vec<ExtentRef>>>),
-    ) -> io::Result<()> {
+    /// Nothing is looked up until the extents are asked for, and then only a
+    /// stretch at a time: an extent can be dealt with, rewritten even, before
+    /// the next stretch is read.
+    pub fn resolve_extents(self: &Rc<Self>, mut refs: Vec<ExtentRef>) -> Resolver {
         // One group per extent, in address order.
         refs.sort_unstable_by_key(|r| (r.disk_address, r.file_offset));
         let mut groups: Vec<Vec<ExtentRef>> = Vec::new();
@@ -392,28 +386,11 @@ impl Filesystem {
             }
         }
 
-        let mut groups = groups.into_iter().peekable();
-        while let Some(group) = groups.next() {
-            // Extents close enough together to read with one search.
-            let mut window = vec![group];
-            while let Some(next) = groups.peek()
-                && window.len() < MAX_WINDOW_EXTENTS
-            {
-                let last = &window[window.len() - 1][0];
-                let end = last.disk_address.saturating_add(last.disk_bytes);
-                if next[0].disk_address > end.saturating_add(MAX_WINDOW_GAP) {
-                    break;
-                }
-                window.extend(groups.next());
-            }
-
-            let backrefs = self.backrefs(&window)?;
-            for (group, backrefs) in window.into_iter().zip(backrefs) {
-                let disk_address = group[0].disk_address;
-                each(disk_address, self.resolve(group, backrefs));
-            }
+        Resolver {
+            fs: Rc::clone(self),
+            groups: groups.into_iter().peekable(),
+            window: Vec::new().into_iter(),
         }
-        Ok(())
     }
 
     /// Reads who holds each extent in `window` from the extent tree: every
@@ -693,6 +670,94 @@ impl Filesystem {
             .get(offset..)
             .ok_or_else(|| io::Error::other("path offset runs past its buffer"))?;
         Ok(Some(subvol_root.join(cstr_bytes(name))))
+    }
+}
+
+/// One extent of a file, as [`Filesystem::resolve_extents`] resolves it.
+pub enum Resolved {
+    /// The extent, with every reference to it, wherever on the filesystem.
+    Extent(Extent),
+    /// Nothing safe can be said about the extent at this address: it was freed
+    /// while we scanned, at least one reference belongs to an inode we cannot
+    /// resolve to a path on this handle (most often a snapshot's, in a
+    /// different subvolume tree than the one opened), or looking it up failed
+    /// with `error`.
+    LeftAlone {
+        disk_address: u64,
+        error: Option<io::Error>,
+    },
+}
+
+/// The extents of one file, resolved a stretch of addresses at a time as they
+/// are asked for. See [`Filesystem::resolve_extents`].
+///
+/// An `Err` is a search over the extent tree that failed outright. It ends the
+/// file: the extents handed over before it stand.
+pub struct Resolver {
+    fs: Rc<Filesystem>,
+    /// The file's references not looked up yet, one group per extent, in
+    /// address order.
+    groups: Peekable<vec::IntoIter<Vec<ExtentRef>>>,
+    /// The stretch looked up last, with what the extent tree says about each
+    /// extent in it, less the extents already handed over.
+    window: vec::IntoIter<(Vec<ExtentRef>, Backrefs)>,
+}
+
+impl Resolver {
+    /// The next extents close enough together on disk to look up with one
+    /// search, or nothing once every extent is.
+    fn next_window(&mut self) -> Option<Vec<Vec<ExtentRef>>> {
+        let mut window = vec![self.groups.next()?];
+        while let Some(next) = self.groups.peek()
+            && window.len() < MAX_WINDOW_EXTENTS
+        {
+            let last = &window[window.len() - 1][0];
+            let end = last.disk_address.saturating_add(last.disk_bytes);
+            if next[0].disk_address > end.saturating_add(MAX_WINDOW_GAP) {
+                break;
+            }
+            window.extend(self.groups.next());
+        }
+        Some(window)
+    }
+}
+
+impl Iterator for Resolver {
+    type Item = io::Result<Resolved>;
+
+    fn next(&mut self) -> Option<io::Result<Resolved>> {
+        loop {
+            if let Some((group, backrefs)) = self.window.next() {
+                let disk_address = group[0].disk_address;
+                return Some(Ok(match self.fs.resolve(group, backrefs) {
+                    Ok(Some(refs)) => Resolved::Extent(Extent::from_refs(refs)),
+                    Ok(None) => Resolved::LeftAlone {
+                        disk_address,
+                        error: None,
+                    },
+                    Err(error) => Resolved::LeftAlone {
+                        disk_address,
+                        error: Some(error),
+                    },
+                }));
+            }
+
+            let window = self.next_window()?;
+            match self.fs.backrefs(&window) {
+                Ok(backrefs) => {
+                    self.window = window
+                        .into_iter()
+                        .zip(backrefs)
+                        .collect::<Vec<_>>()
+                        .into_iter();
+                }
+                Err(e) => {
+                    // Nothing more is looked up for this file.
+                    self.groups = Vec::new().into_iter().peekable();
+                    return Some(Err(e));
+                }
+            }
+        }
     }
 }
 

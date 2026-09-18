@@ -472,10 +472,10 @@ pub fn scan(dir: &Path) -> Scan {
     let fs = kernel::Filesystem::open(dir).expect("open the fixture's filesystem");
     let mut scanner =
         Scanner::new(options(dir, false, false), Rc::new(fs)).expect("scan the fixture");
-    let mut extents = HashMap::new();
-    while scanner.scan(&mut |extent: Extent| {
-        extents.insert(extent.disk_address, extent);
-    }) {}
+    let extents = scanner
+        .by_ref()
+        .map(|extent| (extent.disk_address, extent))
+        .collect();
     Scan {
         extents,
         stats: scanner.stats,
