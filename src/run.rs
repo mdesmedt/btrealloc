@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -407,13 +407,10 @@ fn redirect_chunks(
     size: u64,
 ) -> Result<(), Failure> {
     let path = holder.path;
-    // FIDEDUPERANGE replaces this file's extents, so it has to be open for
-    // writing as well as reading.
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&**path)
-        .map_err(|e| Failure::new(path, e))?;
+    // Read-only is enough: the kernel lets CAP_SYS_ADMIN dedupe into a file it
+    // has not opened for writing. Opening for writing would fail on a running
+    // executable, and tell inotify watchers the file was written.
+    let file = File::open(&**path).map_err(|e| Failure::new(path, e))?;
 
     for r in &holder.refs {
         // Clamp the end of the byte range to the file size. The final reference
@@ -455,11 +452,8 @@ fn redirect_chunks(
 /// optionally processing the final sector of the file with [`redirect_tail`].
 fn finish_holder(holder: &Holder, before: &HolderBefore, fs: &Filesystem) -> Result<(), Failure> {
     let path = holder.path;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&**path)
-        .map_err(|e| Failure::new(path, e))?;
+    // Read-only, as in [`redirect_chunks`].
+    let file = File::open(&**path).map_err(|e| Failure::new(path, e))?;
 
     // Check if this extent overlaps the last sector of the file, and if so, redirect it to a copy of that sector.
     let tail_start = before.filesize / fs.sectorsize * fs.sectorsize;
