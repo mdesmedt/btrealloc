@@ -232,13 +232,16 @@ impl Scanner {
 
         self.stats.files += 1;
         self.stats.file_bytes += size;
-        for r in refs {
-            let disk_address = r.disk_address;
-            if self.handled.contains(&disk_address) {
-                continue;
-            }
-            match Extent::discover(self.fs.as_ref(), r) {
-                Ok(Some(extent)) => {
+        let refs = refs
+            .into_iter()
+            .filter(|r| !self.handled.contains(&r.disk_address))
+            .collect();
+
+        let result = self
+            .fs
+            .resolve_extents(refs, |disk_address, found| match found {
+                Ok(Some(refs)) => {
+                    let extent = Extent::from_refs(refs);
                     if extent.refs.len() > 1 {
                         self.handled.insert(disk_address);
                     }
@@ -249,7 +252,7 @@ impl Scanner {
                 Ok(None) => {
                     eprintln!(
                         "extent {disk_address:#x}: shared with a snapshot or otherwise \
-                         unresolvable, leaving it alone"
+                     unresolvable, leaving it alone"
                     );
                     self.handled.insert(disk_address);
                     self.stats.skipped += 1;
@@ -259,7 +262,9 @@ impl Scanner {
                     self.handled.insert(disk_address);
                     self.stats.skipped += 1;
                 }
-            }
+            });
+        if let Err(e) = result {
+            eprintln!("skipping the rest of {}: {e}", path.display());
         }
     }
 }

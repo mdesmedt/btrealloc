@@ -129,6 +129,62 @@ impl Fs {
             .expect("open the fixture filesystem")
             .sectorsize
     }
+
+    /// The subvolume at `rel`, made new.
+    pub fn subvolume(&self, rel: &str) -> PathBuf {
+        let path = self.path(rel);
+        must("btrfs", &["subvolume", "create", path.to_str().unwrap()]);
+        path
+    }
+
+    /// Snapshots the subvolume at `from` as `to`, then deletes `from` and waits
+    /// for the deletion to be cleaned up.
+    ///
+    /// Every tree block the two still shared is left to the snapshot, and the
+    /// cleaner rewrites the references in it to name the block rather than the
+    /// subvolume: the data extents those leaves point at come out with shared
+    /// data backreferences, as on any filesystem with snapshot history.
+    pub fn snapshot_and_delete(&self, from: &str, to: &str) -> PathBuf {
+        let (from, to) = (self.path(from), self.path(to));
+        sync_fs();
+        must(
+            "btrfs",
+            &[
+                "subvolume",
+                "snapshot",
+                from.to_str().unwrap(),
+                to.to_str().unwrap(),
+            ],
+        );
+        must("btrfs", &["subvolume", "delete", from.to_str().unwrap()]);
+        must("btrfs", &["subvolume", "sync", self.mnt.to_str().unwrap()]);
+        sync_fs();
+        to
+    }
+
+    /// How many shared data backreferences the extent tree holds, read from
+    /// the device with `btrfs inspect-internal dump-tree`.
+    pub fn shared_data_backrefs(&self) -> usize {
+        sync_fs();
+        let source = Command::new("findmnt")
+            .args(["-no", "SOURCE", self.mnt.to_str().unwrap()])
+            .output()
+            .expect("run findmnt");
+        let device = String::from_utf8_lossy(&source.stdout).trim().to_string();
+        let dump = Command::new("btrfs")
+            .args(["inspect-internal", "dump-tree", "-t", "extent", &device])
+            .output()
+            .expect("run btrfs inspect-internal dump-tree");
+        assert!(
+            dump.status.success(),
+            "dump-tree failed: {}",
+            String::from_utf8_lossy(&dump.stderr)
+        );
+        String::from_utf8_lossy(&dump.stdout)
+            .lines()
+            .filter(|line| line.contains("shared data backref"))
+            .count()
+    }
 }
 
 impl Drop for Fs {
@@ -414,7 +470,8 @@ impl Scan {
 /// over, where the tool would drop each one once dealt with.
 pub fn scan(dir: &Path) -> Scan {
     let fs = kernel::Filesystem::open(dir).expect("open the fixture's filesystem");
-    let mut scanner = Scanner::new(&fs, dir).expect("scan the fixture");
+    let mut scanner =
+        Scanner::new(options(dir, false, false), Rc::new(fs)).expect("scan the fixture");
     let mut extents = HashMap::new();
     while scanner.scan(&mut |extent: Extent| {
         extents.insert(extent.disk_address, extent);

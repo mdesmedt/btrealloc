@@ -149,6 +149,78 @@ fn one_extent_held_by_two_files_needs_both_rewritten() {
     assert_eq!(before, support::checksums(&data), "contents changed");
 }
 
+/// Extents the extent tree records against the tree block holding their
+/// references rather than against the files, as snapshot history leaves them.
+/// The extent tree cannot say who holds those, so the scan either trusts a
+/// reference count of one or asks the kernel's backreference walk. Either way,
+/// a file holding an extent alone and two files sharing one must come back
+/// whole and be rewritten.
+#[test]
+fn extents_behind_shared_backreferences_are_reclaimed() {
+    let fs = Fs::new();
+    fs.subvolume("original");
+    // A snapshot copies its root tree block outright, so a subvolume whose
+    // whole tree fits in that block shares nothing. Enough files to spread it
+    // over leaves below the root make those leaves the shared ones.
+    let filler = fs.dir("original/filler");
+    for i in 0..4000 {
+        std::fs::write(filler.join(format!("file-{i:05}")), b"").expect("write a filler file");
+    }
+    fs.dir("original/data");
+    // One reference in all: only the first MiB is left.
+    let alone = fs.path("original/data/alone");
+    support::write_random_one_extent(&alone, FILE_MIB);
+    support::punch_hole(&alone, MIB, (FILE_MIB - 1) * MIB);
+    // Four references, two files each keeping both ends.
+    let (a, b) = (
+        fs.path("original/data/shared-a"),
+        fs.path("original/data/shared-b"),
+    );
+    support::write_random_one_extent(&a, FILE_MIB);
+    support::reflink(&a, &b);
+    support::punch_hole(&a, MIB, (FILE_MIB - 2) * MIB);
+    support::punch_hole(&b, MIB, (FILE_MIB - 2) * MIB);
+
+    fs.snapshot_and_delete("original", "snapshot");
+    let data = fs.path("snapshot/data");
+    let alone = fs.path("snapshot/data/alone");
+    let (a, b) = (
+        fs.path("snapshot/data/shared-a"),
+        fs.path("snapshot/data/shared-b"),
+    );
+    assert!(
+        fs.shared_data_backrefs() > 0,
+        "fixture: the snapshot should be left with shared data backreferences"
+    );
+
+    let before = support::checksums(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
+    assert!(
+        support::job_for(&worklist, &alone).is_some(),
+        "the file holding its extent alone is worth rewriting"
+    );
+    let job = support::job_for(&worklist, &a).expect("the shared extent is worth rewriting");
+    assert_eq!(job.holders().len(), 2, "both files hold the extent");
+    assert_eq!(job.refs.len(), 4, "each file holds both ends of it");
+
+    let (_, report) = support::apply(&data);
+    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+    let after = support::scan(&data);
+    for file in [&alone, &a, &b] {
+        let (allocated, used) = support::file_totals(&after, file);
+        assert_eq!(allocated, used, "{} still wastes space", file.display());
+    }
+    assert_eq!(
+        support::physical_extents(&a),
+        support::physical_extents(&b),
+        "the two files should still share one copy"
+    );
+    assert_eq!(before, support::checksums(&data), "contents changed");
+}
+
 /// Two files over the same bytes of one extent. The rewrite copies those bytes
 /// once and points both at the one copy: a private copy each would cost more
 /// than the extent it drops returns.

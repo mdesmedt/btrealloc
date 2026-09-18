@@ -1,9 +1,6 @@
-use std::io;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
-
-use crate::kernel::Filesystem;
 
 // Hard-coded tunables for now
 
@@ -16,6 +13,8 @@ const MAX_COPY_RATIO: u64 = 4;
 /// One reference from a file into a physical extent.
 pub struct ExtentRef {
     pub path: Rc<PathBuf>,
+    /// Inode number of the holding file, in its subvolume.
+    pub inode: u64,
     /// Physical address of the extent this reference points into, i.e. its identity.
     pub disk_address: u64,
     /// Full on-disk size of the extent, however much of it is referenced.
@@ -68,35 +67,23 @@ impl Extent {
         }
     }
 
-    /// Fully discovers the extent `first` is one reference into: asks the
-    /// filesystem how many references it really has, and if there is more than
-    /// the one already in hand, resolves every one of them before this returns.
-    ///
-    /// `Ok(None)` means there is nothing safe to say about the extent: either it
-    /// was freed while we scanned, or one of its references belongs to an inode
-    /// we cannot resolve to a path (most often a snapshot's, in a different
-    /// subvolume than the one being scanned). Either way the caller leaves the
-    /// whole extent alone rather than acting on a partial picture of it.
-    pub fn discover(fs: &Filesystem, first: ExtentRef) -> io::Result<Option<Extent>> {
-        let disk_address = first.disk_address;
-        let disk_bytes = first.disk_bytes;
-        let uncompressed_bytes = first.uncompressed_bytes;
-
-        let refs = match fs.extent_refs(disk_address, disk_bytes)? {
-            None => return Ok(None),
-            Some(count) if count <= 1 => vec![first],
-            Some(_) => match fs.all_refs(disk_address)? {
-                Some(refs) if !refs.is_empty() => refs,
-                _ => return Ok(None),
-            },
-        };
-
-        Ok(Some(Extent::new(
-            disk_address,
-            disk_bytes,
-            uncompressed_bytes,
-            refs,
-        )))
+    /// The extent `refs` point into, from every reference to it there is, as
+    /// [`Filesystem::resolve_extents`](crate::kernel::Filesystem::resolve_extents)
+    /// finds them. `refs` must not be empty.
+    pub fn from_refs(refs: Vec<ExtentRef>) -> Extent {
+        let first = &refs[0];
+        let (disk_address, disk_bytes, uncompressed_bytes) = (
+            first.disk_address,
+            first.disk_bytes,
+            first.uncompressed_bytes,
+        );
+        // Check that all refs match
+        for r in &refs[1..] {
+            debug_assert_eq!(r.disk_address, disk_address);
+            debug_assert_eq!(r.disk_bytes, disk_bytes);
+            debug_assert_eq!(r.uncompressed_bytes, uncompressed_bytes);
+        }
+        Extent::new(disk_address, disk_bytes, uncompressed_bytes, refs)
     }
 
     /// Uncompressed bytes of this extent still referenced, counted once
@@ -200,6 +187,7 @@ mod tests {
     fn extent_ref(path: &Rc<PathBuf>, start: u64, len: u64) -> ExtentRef {
         ExtentRef {
             path: Rc::clone(path),
+            inode: 257,
             disk_address: 0,
             disk_bytes: 1024,
             uncompressed_bytes: 1024,
