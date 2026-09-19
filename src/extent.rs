@@ -31,6 +31,10 @@ pub struct ExtentRef {
     /// The holding file is nodatacow, which rules out rewriting it: dedupe
     /// does not work on those, and overwrites go in place anyway.
     pub nocow: bool,
+    /// The generation of the tree leaf this reference was read from. A leaf no
+    /// newer than the subvolume's last snapshot may be shared with another
+    /// tree, which reaches the extent through it too.
+    pub leaf_generation: u64,
 }
 
 /// One extent and every reference to it, wherever on the filesystem they are.
@@ -195,6 +199,7 @@ mod tests {
             extent_offset: start,
             num_bytes: len,
             nocow: false,
+            leaf_generation: 0,
         }
     }
 

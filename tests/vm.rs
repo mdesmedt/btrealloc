@@ -27,6 +27,9 @@
 
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
 use support::{Fs, MIB};
 
 /// The size of the files these shapes are built from. btrfs caps one extent at
@@ -159,13 +162,7 @@ fn one_extent_held_by_two_files_needs_both_rewritten() {
 fn extents_behind_shared_backreferences_are_reclaimed() {
     let fs = Fs::new();
     fs.subvolume("original");
-    // A snapshot copies its root tree block outright, so a subvolume whose
-    // whole tree fits in that block shares nothing. Enough files to spread it
-    // over leaves below the root make those leaves the shared ones.
-    let filler = fs.dir("original/filler");
-    for i in 0..4000 {
-        std::fs::write(filler.join(format!("file-{i:05}")), b"").expect("write a filler file");
-    }
+    fs.filler("original/filler");
     fs.dir("original/data");
     // One reference in all: only the first MiB is left.
     let alone = fs.path("original/data/alone");
@@ -219,6 +216,181 @@ fn extents_behind_shared_backreferences_are_reclaimed() {
         "the two files should still share one copy"
     );
     assert_eq!(before, support::checksums(&data), "contents changed");
+}
+
+// Snapshots kept alongside the subvolume being scanned.
+//
+// A rewrite only moves the references in the subvolume it runs in. An extent a
+// snapshot also holds stays allocated for as long as the snapshot does, so
+// rewriting it costs a copy and frees nothing: it is to be left alone.
+//
+// How the extent tree records that a snapshot holds an extent depends on
+// whether the leaf holding the file's extent items has been written to since
+// the snapshot, and each shape takes its own path through the resolution. One
+// test for each.
+
+/// A file of one extent with only its first and last MiB left: worth rewriting
+/// wherever it is found alone.
+fn wasteful_file(path: &Path) {
+    support::write_random_one_extent(path, FILE_MIB);
+    support::punch_hole(path, MIB, (FILE_MIB - 2) * MIB);
+}
+
+/// Runs over `dir`, which holds `file`, and checks that the extent at `extent`
+/// is neither handed over by the scan nor touched by the rewrite.
+fn assert_left_alone(dir: &Path, file: &Path, extent: u64) {
+    let before = support::checksums(dir);
+    let scan = support::scan(dir);
+    assert!(
+        !scan.extents.contains_key(&extent),
+        "the scan handed over an extent a snapshot also holds"
+    );
+
+    let (_, report) = support::apply(dir);
+    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(
+        !report.rewritten.contains(&extent),
+        "rewrote an extent a snapshot also holds"
+    );
+    assert!(
+        support::physical_extents(file).contains(&extent),
+        "{} no longer references the extent its snapshot holds",
+        file.display()
+    );
+    assert_eq!(before, support::checksums(dir), "contents changed");
+}
+
+/// The snapshot shares the leaf holding the file's extent items, and neither
+/// side has written to it since. The extent tree records one reference, from
+/// the live subvolume, with nothing to say a second tree reaches it.
+///
+/// Data written after the snapshot is the live subvolume's alone, and must
+/// still be reclaimed: a snapshot is no reason to leave everything alone.
+#[test]
+fn an_extent_a_snapshot_reaches_through_an_untouched_leaf_is_left_alone() {
+    // Without noatime, reading a file for its checksum writes its inode, and
+    // with it the leaf this test needs untouched.
+    let fs = Fs::with_options(2048, "noatime");
+    fs.subvolume("live");
+    fs.dir("live/old");
+    let old = fs.path("live/old/file");
+    wasteful_file(&old);
+    fs.filler("live/filler");
+    // Made before the snapshot, after the filler: what goes in it later lands
+    // in leaves at the far end of the tree from the old file's.
+    fs.dir("live/new");
+    fs.snapshot("live", "snapshot");
+
+    let new = fs.path("live/new/file");
+    wasteful_file(&new);
+    support::sync_fs();
+
+    let extent = support::single_extent(&old);
+    assert_eq!(
+        support::single_extent(&fs.path("snapshot/old/file")),
+        extent,
+        "fixture: the snapshot should hold the old file's extent"
+    );
+    assert_eq!(
+        fs.shared_data_backrefs(),
+        0,
+        "fixture: no leaf should have been written since the snapshot"
+    );
+    let new_extent = support::single_extent(&new);
+
+    let live = fs.path("live");
+    let scan = support::scan(&live);
+    assert!(
+        support::on_worklist(&support::worklist(&scan), new_extent),
+        "data written since the snapshot is worth rewriting"
+    );
+    assert_left_alone(&live, &old, extent);
+    assert!(
+        !support::physical_extents(&new).contains(&new_extent),
+        "data written since the snapshot was not rewritten"
+    );
+
+    // Scanned from the snapshot's side, the extent is just as shared.
+    let snapshot = fs.path("snapshot");
+    let before = support::checksums(&snapshot);
+    let (_, report) = support::apply(&snapshot);
+    assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(before, support::checksums(&snapshot), "contents changed");
+}
+
+/// The live subvolume has written to the leaf holding the file's extent items
+/// since the snapshot, which gave it a copy of its own. The snapshot's is left
+/// reaching the extent through a shared data backreference, which only the
+/// kernel's backreference walk can follow.
+#[test]
+fn an_extent_a_snapshot_reaches_through_a_changed_leaf_is_left_alone() {
+    let fs = Fs::new();
+    fs.subvolume("live");
+    fs.dir("live/data");
+    let file = fs.path("live/data/file");
+    wasteful_file(&file);
+    fs.filler("live/filler");
+    fs.snapshot("live", "snapshot");
+
+    // Writing the file's inode writes the leaf it shares with its extent items.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+        .expect("change the file's mode");
+    support::sync_fs();
+
+    let extent = support::single_extent(&file);
+    assert_eq!(
+        support::single_extent(&fs.path("snapshot/data/file")),
+        extent,
+        "fixture: the snapshot should hold the file's extent"
+    );
+    assert!(
+        fs.shared_data_backrefs() > 0,
+        "fixture: the snapshot should be left with shared data backreferences"
+    );
+
+    assert_left_alone(&fs.path("live/data"), &file, extent);
+}
+
+/// The subvolume holds the extent through a shared data backreference already,
+/// its only one, as snapshot history leaves them (see
+/// `extents_behind_shared_backreferences_are_reclaimed`). A snapshot taken
+/// since reaches it through that same leaf, which leaves the extent tree
+/// exactly as it was: one reference, naming the leaf rather than a tree.
+#[test]
+fn an_extent_behind_a_shared_backreference_a_snapshot_also_reaches_is_left_alone() {
+    let fs = Fs::new();
+    fs.subvolume("original");
+    fs.filler("original/filler");
+    fs.dir("original/data");
+    // Only the first MiB left, so the file holds the extent through one
+    // reference: the count the extent tree gives is then one too.
+    let original = fs.path("original/data/file");
+    support::write_random_one_extent(&original, FILE_MIB);
+    support::punch_hole(&original, MIB, (FILE_MIB - 1) * MIB);
+    fs.snapshot_and_delete("original", "live");
+    let shared = fs.shared_data_backrefs();
+    assert!(
+        shared > 0,
+        "fixture: the history should leave shared data backreferences"
+    );
+
+    fs.snapshot("live", "snapshot");
+    let file = fs.path("live/data/file");
+    let extent = support::single_extent(&file);
+    assert_eq!(
+        support::single_extent(&fs.path("snapshot/data/file")),
+        extent,
+        "fixture: the snapshot should hold the file's extent"
+    );
+    assert_eq!(
+        fs.shared_data_backrefs(),
+        shared,
+        "fixture: the snapshot should not have changed the extent tree"
+    );
+
+    assert_left_alone(&fs.path("live/data"), &file, extent);
 }
 
 /// Two files over the same bytes of one extent. The rewrite copies those bytes

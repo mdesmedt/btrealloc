@@ -137,6 +137,34 @@ impl Fs {
         path
     }
 
+    /// Enough empty files in a new directory at `rel` to spread a subvolume's
+    /// tree over leaves below its root. A snapshot copies the root block
+    /// outright, so only a tree deeper than that has leaves to share.
+    pub fn filler(&self, rel: &str) {
+        let dir = self.dir(rel);
+        for i in 0..4000 {
+            std::fs::write(dir.join(format!("file-{i:05}")), b"").expect("write a filler file");
+        }
+    }
+
+    /// A read-only snapshot of the subvolume at `from`, as `to`, kept alongside it.
+    pub fn snapshot(&self, from: &str, to: &str) -> PathBuf {
+        let (from, to) = (self.path(from), self.path(to));
+        sync_fs();
+        must(
+            "btrfs",
+            &[
+                "subvolume",
+                "snapshot",
+                "-r",
+                from.to_str().unwrap(),
+                to.to_str().unwrap(),
+            ],
+        );
+        sync_fs();
+        to
+    }
+
     /// Snapshots the subvolume at `from` as `to`, then deletes `from` and waits
     /// for the deletion to be cleaned up.
     ///

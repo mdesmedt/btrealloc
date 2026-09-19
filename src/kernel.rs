@@ -16,9 +16,10 @@ use linux_raw_sys::btrfs::{
     BTRFS_EXTENT_DATA_KEY, BTRFS_EXTENT_DATA_REF_KEY, BTRFS_EXTENT_FLAG_DATA,
     BTRFS_EXTENT_ITEM_KEY, BTRFS_EXTENT_OWNER_REF_KEY, BTRFS_EXTENT_TREE_OBJECTID,
     BTRFS_FILE_EXTENT_INLINE, BTRFS_FIRST_FREE_OBJECTID, BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET,
-    BTRFS_SHARED_DATA_REF_KEY, btrfs_extent_data_ref, btrfs_extent_item, btrfs_extent_owner_ref,
-    btrfs_file_extent_item, btrfs_ioctl_ino_lookup_args, btrfs_ioctl_ino_path_args,
-    btrfs_ioctl_logical_ino_args, btrfs_ioctl_search_header, btrfs_ioctl_search_key,
+    BTRFS_ROOT_ITEM_KEY, BTRFS_ROOT_TREE_OBJECTID, BTRFS_SHARED_DATA_REF_KEY,
+    btrfs_extent_data_ref, btrfs_extent_item, btrfs_extent_owner_ref, btrfs_file_extent_item,
+    btrfs_ioctl_ino_lookup_args, btrfs_ioctl_ino_path_args, btrfs_ioctl_logical_ino_args,
+    btrfs_ioctl_search_header, btrfs_ioctl_search_key, btrfs_root_item,
 };
 use linux_raw_sys::general::{
     __IncompleteArrayField, BTRFS_SUPER_MAGIC, FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_TMPFILE,
@@ -390,6 +391,7 @@ impl Filesystem {
             fs: Rc::clone(self),
             groups: groups.into_iter().peekable(),
             window: Vec::new().into_iter(),
+            last_snapshot: u64::MAX,
         }
     }
 
@@ -427,22 +429,59 @@ impl Filesystem {
     }
 
     /// Every reference to one extent, given the references to it one file
-    /// holds (`local`) and what the extent tree says about it.
+    /// holds (`local`), what the extent tree says about it, and the generation
+    /// of the subvolume's last snapshot.
+    ///
+    /// The extent tree records a reference once, against the tree block holding
+    /// it. A block another tree shares since a snapshot is recorded as though
+    /// only this subvolume held it, until one side writes to it. The extent tree
+    /// alone is trusted only where every reference was read from a leaf written
+    /// since the last snapshot, which no other tree can share. For the rest, the
+    /// kernel's backreference walk follows the shared blocks to every tree
+    /// reaching the extent.
     fn resolve(
         &self,
         local: Vec<ExtentRef>,
         backrefs: Backrefs,
+        last_snapshot: u64,
     ) -> io::Result<Option<Vec<ExtentRef>>> {
+        let may_be_shared =
+            |refs: &[ExtentRef]| refs.iter().any(|r| r.leaf_generation <= last_snapshot);
+        let disk_address = local[0].disk_address;
+        let unshared = !may_be_shared(&local);
         let data_refs = match backrefs {
             Backrefs::Gone => return Ok(None),
-            // One reference in all, and it is the one in hand. Which tree block
-            // records it makes no difference to that. A snapshot still sharing
-            // that block would see it too, and keep the extent after a rewrite;
-            // that costs a copy, never data.
-            Backrefs::Opaque { total: 1 } if local.len() == 1 => return Ok(Some(local)),
-            Backrefs::Opaque { .. } => self.logical_ino(local[0].disk_address)?,
-            Backrefs::Files(data_refs) => data_refs,
+            // One reference in all, it is the one in hand, and no other tree
+            // reaches the leaf holding it.
+            Backrefs::Opaque { total: 1 } if local.len() == 1 && unshared => {
+                return Ok(Some(local));
+            }
+            Backrefs::Files(data_refs) if unshared => data_refs,
+            _ => return self.collect(local, &self.logical_ino(disk_address)?),
         };
+
+        // The other files' references can sit in shared leaves too, and that
+        // only shows once they are read.
+        let own = local.len();
+        let Some(mut refs) = self.collect(local, &data_refs)? else {
+            return Ok(None);
+        };
+        if !may_be_shared(&refs[own..]) {
+            return Ok(Some(refs));
+        }
+        refs.truncate(own);
+        self.collect(refs, &self.logical_ino(disk_address)?)
+    }
+
+    /// Every reference to one extent, given the references to it one file
+    /// holds (`local`) and every file extent item that points into it, by
+    /// subvolume and inode. `None` if any of those is in another subvolume, or
+    /// the two do not add up.
+    fn collect(
+        &self,
+        local: Vec<ExtentRef>,
+        data_refs: &[DataRef],
+    ) -> io::Result<Option<Vec<ExtentRef>>> {
         if data_refs.iter().any(|r| r.root != self.root_id) {
             return Ok(None);
         }
@@ -542,6 +581,25 @@ impl Filesystem {
                 }
             },
         )
+    }
+
+    /// The generation in which this subvolume was last snapshotted, or was
+    /// last made from a snapshot, from its root item. A tree block no newer than
+    /// this may be shared with another tree; one written since cannot be.
+    fn last_snapshot(&self) -> io::Result<u64> {
+        const AT: usize = std::mem::offset_of!(btrfs_root_item, last_snapshot);
+        let mut args = self.searchargs.borrow_mut();
+        args.key.tree_id = BTRFS_ROOT_TREE_OBJECTID as u64;
+        args.set_range(
+            (self.root_id, BTRFS_ROOT_ITEM_KEY, 0),
+            (self.root_id, BTRFS_ROOT_ITEM_KEY, u64::MAX),
+        );
+        let mut found = None;
+        args.search_all(self.file.as_raw_fd(), |_, item| {
+            found = read_struct::<u64>(item, AT);
+            Ok(())
+        })?;
+        found.ok_or_else(|| io::Error::other("the subvolume has no root item to read"))
     }
 
     /// Every file extent item referencing the extent at `disk_address`, found
@@ -701,6 +759,9 @@ pub struct Resolver {
     /// The stretch looked up last, with what the extent tree says about each
     /// extent in it, less the extents already handed over.
     window: vec::IntoIter<(Vec<ExtentRef>, Backrefs)>,
+    /// The subvolume's last snapshot, as it stood when that stretch was looked
+    /// up: read again for every stretch, so one taken mid-run is not missed.
+    last_snapshot: u64,
 }
 
 impl Resolver {
@@ -729,22 +790,30 @@ impl Iterator for Resolver {
         loop {
             if let Some((group, backrefs)) = self.window.next() {
                 let disk_address = group[0].disk_address;
-                return Some(Ok(match self.fs.resolve(group, backrefs) {
-                    Ok(Some(refs)) => Resolved::Extent(Extent::from_refs(refs)),
-                    Ok(None) => Resolved::LeftAlone {
-                        disk_address,
-                        error: None,
+                return Some(Ok(
+                    match self.fs.resolve(group, backrefs, self.last_snapshot) {
+                        Ok(Some(refs)) => Resolved::Extent(Extent::from_refs(refs)),
+                        Ok(None) => Resolved::LeftAlone {
+                            disk_address,
+                            error: None,
+                        },
+                        Err(error) => Resolved::LeftAlone {
+                            disk_address,
+                            error: Some(error),
+                        },
                     },
-                    Err(error) => Resolved::LeftAlone {
-                        disk_address,
-                        error: Some(error),
-                    },
-                }));
+                ));
             }
 
             let window = self.next_window()?;
-            match self.fs.backrefs(&window) {
-                Ok(backrefs) => {
+            let looked_up = self.fs.last_snapshot().and_then(|last_snapshot| {
+                self.fs
+                    .backrefs(&window)
+                    .map(|backrefs| (last_snapshot, backrefs))
+            });
+            match looked_up {
+                Ok((last_snapshot, backrefs)) => {
+                    self.last_snapshot = last_snapshot;
                     self.window = window
                         .into_iter()
                         .zip(backrefs)
@@ -905,6 +974,8 @@ fn search_extent_refs(
             extent_offset: fe.offset,
             num_bytes: fe.num_bytes,
             nocow,
+            // The search reports the generation of the leaf each item is in.
+            leaf_generation: header.transid,
         });
         Ok(())
     })
