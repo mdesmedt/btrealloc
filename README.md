@@ -84,7 +84,7 @@ unreachable shared: 6.70 GiB
 
 # How it works
 
-## Scanning phase
+## Scanning
 
 - The tool recursively scans a given path. Either an entire Btrfs volume or a subdirectory.
 - For each file found, it retrieves the extents it references to hold the file's data
@@ -94,28 +94,30 @@ unreachable shared: 6.70 GiB
   - Reclaimable: How many bytes in the extent are no longer being referenced by any files under the path
   - Reclaimable "shared": The same measure as above, but the extent is also referenced by files outside of our path so we cannot conclusively prove this space is unreachable.
 
-## Selection phase
+## Selection
 
-- A selection pass is done, it skips extents:
+- For each selection found during the scanning process it applies a set of criteria before applying:
   - With small amounts of reclaimable space (currently <64kb)
   - Which require a large copy to free up a relatively small amount of space
   - Shared extents, which are referenced outside of the scanned path
 
-## Apply phase
+## Applying
 
-- All remaining extents are now processed one at a time. For every extent:
-  - Create an anonymous temp file with `O_TMPFILE`
-  - Iterate over all referenced ranges in the extent, and write them to the temp file. This gives the filesystem a chance to reallocate extents more economically.
+- Extents which are selected to be applied are now processed to attempt to reclaim unreachable space. The process:
+  - Iterate over all referenced ranges in the extent, finding "live ranges" of referenced bytes
+  - For each live range an anonymous temp file is created with `O_TMPFILE` and it is copied there
   - For each file which holds the original extent, call `FIDEDUPERANGE` to point its chunks from the old extent into the new extents. This operation is what actually modifies the file. The kernel guarantees that:
     - The operation is atomic
     - The bytes in the source range and the destination range are identical
   - Release the anonymous temp file
+  - If all goes well, the original extents (with unreachable bytes) are now no longer referenced and can be garbage-collected
 
 ## Effects on the filesystem
 
 - As this process completes, the previously underutilized extents can now be garbage collected by the kernel.
 - Disk utilization might temporarily be higher while the above work happens but it should go down when enough underutilized extents are freed.
 - The files touched should only have had their extents reallocated. Their contents and metadata should remain untouched.
+- Extents shared with snapshots or other subvolumes will not be freed unless those snapshots are freed or subvolumes are also processed
 
 # Test infrastructure
 
