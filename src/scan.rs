@@ -1,117 +1,14 @@
-use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::fs::ReadDir;
+use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use crate::Options;
+use crate::extent::Extent;
 use crate::format::human;
-use crate::kernel::{self, Filesystem};
-
-/// One reference from a file into an extent.
-pub struct Ref {
-    pub path: Rc<PathBuf>,
-    pub file_offset: u64,
-    pub start: u64,
-    pub end: u64,
-    pub nocow: bool,
-}
-
-/// One extent and every reference to it under the scanned path.
-pub struct Extent {
-    /// Bytes on disk
-    pub disk_bytes: u64,
-    /// Bytes after decompression
-    pub uncompressed_bytes: u64,
-    /// The references to each holder of this extent
-    pub refs: Vec<Ref>,
-    /// The filesystem references this more times than we found in our path
-    pub unknown_refs: bool,
-    /// [`Extent::live_ranges`] memoised. Every caller below asks for it, most
-    /// of them more than once, and computing it sorts the whole reference list.
-    live: OnceCell<Vec<(u64, u64)>>,
-}
-
-impl Extent {
-    pub fn new(disk_bytes: u64, uncompressed_bytes: u64) -> Extent {
-        Extent {
-            disk_bytes,
-            uncompressed_bytes,
-            refs: Vec::new(),
-            unknown_refs: false,
-            live: OnceCell::new(),
-        }
-    }
-
-    /// Adds a reference, dropping the memoised live ranges it invalidates.
-    pub fn add_ref(&mut self, r: Ref) {
-        self.live.take();
-        self.refs.push(r);
-    }
-
-    /// The live (actively referenced) ranges of this extent, merged, in order.
-    pub fn live_ranges(&self) -> &[(u64, u64)] {
-        self.live.get_or_init(|| {
-            let mut refs: Vec<(u64, u64)> = self.refs.iter().map(|r| (r.start, r.end)).collect();
-            refs.sort_unstable();
-
-            let mut merged: Vec<(u64, u64)> = Vec::new();
-            for (start, end) in refs {
-                match merged.last_mut() {
-                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
-                    _ => merged.push((start, end)),
-                }
-            }
-            merged
-        })
-    }
-
-    /// Uncompressed bytes of this extent still referenced, counted once
-    /// however many files reference them.
-    pub fn live_uncompressed_bytes(&self) -> u64 {
-        self.live_ranges()
-            .iter()
-            .map(|&(start, end)| end - start)
-            .sum()
-    }
-
-    /// On-disk bytes of this extent actively referenced by files.
-    pub fn disk_used_bytes(&self) -> u64 {
-        // Scale on-disk over uncompressed, so compressed extents are counted in
-        // on-disk bytes.
-        if self.uncompressed_bytes == 0 {
-            return 0;
-        }
-        (self.live_uncompressed_bytes().min(self.uncompressed_bytes) as u128
-            * self.disk_bytes as u128
-            / self.uncompressed_bytes as u128) as u64
-    }
-
-    /// On-disk bytes of this extent nothing under the scanned path uses.
-    pub fn disk_free_bytes(&self) -> u64 {
-        self.disk_bytes - self.disk_used_bytes()
-    }
-
-    /// Returns the files holding this extent, in path order, each file's
-    /// references in file order.
-    ///
-    /// Sorting first and grouping runs of equal paths keeps this linear in the
-    /// reference count past the sort; a deduplicator can spread one extent over
-    /// thousands of files, where searching the groups built so far does not
-    /// finish.
-    pub fn holders(&self) -> Vec<(&Rc<PathBuf>, Vec<&Ref>)> {
-        let mut refs: Vec<&Ref> = self.refs.iter().collect();
-        refs.sort_unstable_by(|a, b| (&*a.path, a.file_offset).cmp(&(&*b.path, b.file_offset)));
-
-        let mut holders: Vec<(&Rc<PathBuf>, Vec<&Ref>)> = Vec::new();
-        for r in refs {
-            match holders.last_mut() {
-                Some((path, group)) if Rc::ptr_eq(path, &r.path) => group.push(r),
-                _ => holders.push((&r.path, vec![r])),
-            }
-        }
-        holders
-    }
-}
+use crate::kernel::{self, Filesystem, Resolved, Resolver};
 
 /// Extents of one size class, the class being a power of two: everything from
 /// that size up to the next one.
@@ -121,7 +18,6 @@ pub struct Bucket {
     pub allocated_bytes: u64,
     pub used_bytes: u64,
     pub unreachable_bytes: u64,
-    pub unreachable_shared_bytes: u64,
 }
 
 impl Bucket {
@@ -130,7 +26,6 @@ impl Bucket {
         allocated_bytes: 0,
         used_bytes: 0,
         unreachable_bytes: 0,
-        unreachable_shared_bytes: 0,
     };
 }
 
@@ -139,209 +34,265 @@ pub struct Totals {
     pub allocated_bytes: u64,
     pub used_bytes: u64,
     pub unreachable_bytes: u64,
-    pub unreachable_shared_bytes: u64,
     pub buckets: [Bucket; 64],
 }
 
-pub struct Scan {
-    pub files: u64,
-    pub file_bytes: u64,
-    pub extents: HashMap<u64, Extent>,
-    /// The filesystem being scanned, kept for what the run after it needs to
-    /// ask: how many references an extent really has, and the sector size.
-    pub fs: Filesystem,
+impl Totals {
+    pub const ZERO: Totals = Totals {
+        allocated_bytes: 0,
+        used_bytes: 0,
+        unreachable_bytes: 0,
+        buckets: [Bucket::ZERO; 64],
+    };
+
+    /// Counts one extent into the totals and into its size class.
+    pub fn add(&mut self, extent: &Extent) {
+        let used_bytes = extent.disk_used_bytes();
+        let free_bytes = extent.disk_free_bytes();
+
+        self.allocated_bytes += extent.disk_bytes;
+        self.used_bytes += used_bytes;
+        self.unreachable_bytes += free_bytes;
+
+        let bucket = &mut self.buckets[extent.disk_bytes.max(1).ilog2() as usize];
+        bucket.count += 1;
+        bucket.allocated_bytes += extent.disk_bytes;
+        bucket.used_bytes += used_bytes;
+        bucket.unreachable_bytes += free_bytes;
+    }
 }
 
-impl Scan {
-    pub fn new(fs: Filesystem) -> Scan {
-        Scan {
-            files: 0,
-            file_bytes: 0,
-            extents: HashMap::new(),
-            fs,
-        }
-    }
+/// What the walk has seen so far, counted as it goes: every extent is counted
+/// once, when it is discovered, and nothing about it is kept afterwards.
+pub struct ScanStats {
+    pub files: u64,
+    pub file_bytes: u64,
+    pub extents: u64,
+    /// Extents left alone: freed while we scanned, or shared with an inode
+    /// outside this subvolume.
+    pub skipped: u64,
+    pub totals: Totals,
+}
 
-    /// Adds a single file to the scan, looking up the extents it holds.
-    pub fn add_file(&mut self, path: &Path, size: u64) {
-        let path = Rc::new(path.to_path_buf());
-        let extents = match kernel::file_extents(&path) {
-            Ok(extents) => extents,
-            Err(e) => {
-                eprintln!("skipping {}: {e}", path.display());
-                return;
-            }
-        };
-
-        self.files += 1;
-        self.file_bytes += size;
-        for extent in extents {
-            self.extents
-                .entry(extent.disk_address)
-                .or_insert_with(|| Extent::new(extent.disk_bytes, extent.uncompressed_bytes))
-                .add_ref(Ref {
-                    path: Rc::clone(&path),
-                    file_offset: extent.file_offset,
-                    start: extent.extent_offset,
-                    end: extent.extent_offset + extent.num_bytes,
-                    nocow: extent.nocow,
-                });
-        }
-    }
-
-    /// Walks `dir`, staying on the filesystem identified by `dev`: entries on a
-    /// different device are skipped.
-    pub fn walk(&mut self, dir: &Path, dev: u64, seen: &mut HashSet<(u64, u64)>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                eprintln!("skipping {}: {e}", dir.display());
-                return;
-            }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata() else { continue };
-
-            if meta.dev() != dev {
-                continue;
-            }
-            if meta.is_dir() {
-                self.walk(&path, dev, seen);
-            } else if meta.is_file() && seen.insert((meta.dev(), meta.ino())) {
-                self.add_file(&path, meta.size());
-            }
-        }
-    }
-
-    /// Ask the filesystem how many references each extent really has, so we
-    /// know which ones a rewrite here would actually free.
-    pub fn classify(&mut self) {
-        for (&disk_address, extent) in &mut self.extents {
-            let refs = match self.fs.extent_refs(disk_address, extent.disk_bytes) {
-                Ok(Some(refs)) => refs,
-                // Freed while we scanned, or the lookup failed: cannot confirm.
-                Ok(None) => u64::MAX,
-                Err(e) => {
-                    eprintln!("extent {disk_address}: {e}");
-                    u64::MAX
-                }
-            };
-            extent.unknown_refs = refs > extent.refs.len() as u64;
-        }
-    }
-
-    /// Allocated and used bytes over all extents, and the same split by extent
-    /// size class. Space in an extent the filesystem references more times than
-    /// we found is reclaimable too, but only once those other references go.
-    pub fn totals(&self) -> Totals {
-        let mut totals = Totals {
-            allocated_bytes: 0,
-            used_bytes: 0,
-            unreachable_bytes: 0,
-            unreachable_shared_bytes: 0,
-            buckets: [Bucket::ZERO; 64],
-        };
-
-        for extent in self.extents.values() {
-            let used_bytes = extent.disk_used_bytes();
-            let free_bytes = extent.disk_free_bytes();
-
-            totals.allocated_bytes += extent.disk_bytes;
-            totals.used_bytes += used_bytes;
-
-            let bucket = &mut totals.buckets[extent.disk_bytes.max(1).ilog2() as usize];
-            bucket.count += 1;
-            bucket.allocated_bytes += extent.disk_bytes;
-            bucket.used_bytes += used_bytes;
-
-            if extent.unknown_refs {
-                totals.unreachable_shared_bytes += free_bytes;
-                bucket.unreachable_shared_bytes += free_bytes;
-            } else {
-                totals.unreachable_bytes += free_bytes;
-                bucket.unreachable_bytes += free_bytes;
-            }
-        }
-        totals
-    }
+impl ScanStats {
+    const ZERO: ScanStats = ScanStats {
+        files: 0,
+        file_bytes: 0,
+        extents: 0,
+        skipped: 0,
+        totals: Totals::ZERO,
+    };
 
     /// Prints what the scan found: the totals, then the same split by extent size class.
     pub fn report(&self) {
-        let totals = self.totals();
+        let totals = &self.totals;
         println!("files:              {}", self.files);
         println!("file size:          {}", human(self.file_bytes));
-        println!("extents:            {}", self.extents.len());
+        println!("extents:            {}", self.extents);
         println!("allocated:          {}", human(totals.allocated_bytes));
         println!("used:               {}", human(totals.used_bytes));
         println!("unreachable:        {}", human(totals.unreachable_bytes));
-        println!(
-            "unreachable shared: {}",
-            human(totals.unreachable_shared_bytes)
-        );
+        if self.skipped != 0 {
+            println!("left alone:         {} extents", self.skipped);
+        }
 
         println!();
         println!("extent size rounded down to a power of two:");
         println!(
-            "{:>12}  {:>10}  {:>12}  {:>12}  {:>12}  {:>12}",
-            "size", "count", "allocated", "used", "unreachable", "shared"
+            "{:>12}  {:>10}  {:>12}  {:>12}  {:>12}",
+            "size", "count", "allocated", "used", "unreachable"
         );
         for (log2, bucket) in totals.buckets.iter().enumerate() {
             if bucket.count == 0 {
                 continue;
             }
             println!(
-                "{:>12}  {:>10}  {:>12}  {:>12}  {:>12}  {:>12}",
+                "{:>12}  {:>10}  {:>12}  {:>12}  {:>12}",
                 human(1 << log2),
                 bucket.count,
                 human(bucket.allocated_bytes),
                 human(bucket.used_bytes),
                 human(bucket.unreachable_bytes),
-                human(bucket.unreachable_shared_bytes),
             );
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Walks a tree depth-first, yielding each extent it discovers, fully resolved,
+/// and then forgetting it.
+///
+/// The walk is lazy: nothing is read ahead of the extent asked for beyond the
+/// stretch of the current file it was looked up with, so whatever is done with
+/// one extent, rewriting it included, is done before the walk goes on.
+///
+/// Memory stays small however big the tree: what is kept is the directories
+/// still to read, the one being read, the file being resolved, the addresses of
+/// shared extents already handed out, and the inodes of hardlinked files
+/// already read.
+pub struct Scanner {
+    /// Options
+    options: Options,
+    /// Handle to the filesystem for looking up extents and their references.
+    fs: Rc<Filesystem>,
+    /// The device being walked: entries on any other are skipped.
+    dev: u64,
+    /// Directories not read yet, taken from the end, so the walk is depth-first
+    /// and this stays about as long as the tree is deep.
+    queue: Vec<PathBuf>,
+    /// The directory being read.
+    dir: Option<ReadDir>,
+    /// The path to scan, when it is a single file rather than a directory.
+    root_file: Option<(PathBuf, u64)>,
+    /// The file whose extents are being resolved.
+    file: Option<(Rc<PathBuf>, Resolver)>,
+    /// Extents already dealt with that another file could lead us back to:
+    /// those with more than one reference, and those left alone. An extent
+    /// with a single reference can only be reached through the one file
+    /// holding it, so it is never recorded here.
+    handled: HashSet<u64>,
+    /// Hardlinked files already read, by (device, inode). A file with a
+    /// single link can only be reached once, so it is never recorded here.
+    hardlinks: HashSet<(u64, u64)>,
+    pub stats: ScanStats,
+}
 
-    fn extent(refs: &[(u64, u64)]) -> Extent {
-        let path = Rc::new(PathBuf::from("f"));
-        let mut extent = Extent::new(1024, 1024);
-        for &(off, len) in refs {
-            extent.add_ref(Ref {
-                path: Rc::clone(&path),
-                file_offset: 0,
-                start: off,
-                end: off + len,
-                nocow: false,
-            });
+impl Scanner {
+    pub fn new(options: Options, fs: Rc<Filesystem>) -> io::Result<Scanner> {
+        let path = &options.path;
+        let meta = std::fs::metadata(path)?;
+        let (queue, root_file) = if meta.is_dir() {
+            (vec![path.to_path_buf()], None)
+        } else {
+            (Vec::new(), Some((path.to_path_buf(), meta.size())))
+        };
+        Ok(Scanner {
+            options,
+            fs,
+            dev: meta.dev(),
+            queue,
+            dir: None,
+            root_file,
+            file: None,
+            handled: HashSet::new(),
+            hardlinks: HashSet::new(),
+            stats: ScanStats::ZERO,
+        })
+    }
+
+    /// The next file to scan, with its size: the next regular file in the
+    /// directory being read, or in the next directory with one. Directories met
+    /// along the way are queued. `None` once the walk is complete.
+    fn next_file(&mut self) -> Option<(PathBuf, u64)> {
+        if let Some(file) = self.root_file.take() {
+            return Some(file);
         }
-        extent
+        loop {
+            if let Some(dir) = &mut self.dir {
+                for entry in dir.flatten() {
+                    let path = entry.path();
+                    let Ok(meta) = entry.metadata() else { continue };
+
+                    if meta.dev() != self.dev {
+                        continue;
+                    }
+                    if meta.is_dir() {
+                        self.queue.push(path);
+                    } else if meta.is_file()
+                        && (meta.nlink() <= 1 || self.hardlinks.insert((meta.dev(), meta.ino())))
+                    {
+                        return Some((path, meta.size()));
+                    }
+                }
+                self.dir = None;
+            }
+
+            let dir = self.queue.pop()?;
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => self.dir = Some(entries),
+                Err(e) => eprintln!("skipping {}: {e}", dir.display()),
+            }
+        }
     }
 
-    #[test]
-    fn disjoint_references_add_up() {
-        assert_eq!(extent(&[(0, 100), (900, 124)]).disk_used_bytes(), 224);
+    /// Starts resolving the extents of a file, all but those already handled.
+    fn open_file(&mut self, path: PathBuf, size: u64) {
+        let refs = match kernel::file_extents(&path) {
+            Ok(refs) => refs,
+            Err(e) => {
+                eprintln!("skipping {}: {e}", path.display());
+                return;
+            }
+        };
+
+        if self.options.verbose {
+            println!(
+                "{}: {} bytes {} refs",
+                path.display(),
+                human(size),
+                refs.len()
+            );
+        }
+
+        self.stats.files += 1;
+        self.stats.file_bytes += size;
+        let refs = refs
+            .into_iter()
+            .filter(|r| !self.handled.contains(&r.disk_address))
+            .collect();
+        self.file = Some((Rc::new(path), self.fs.resolve_extents(refs)));
     }
 
-    #[test]
-    fn overlapping_references_count_once() {
-        assert_eq!(extent(&[(0, 600), (400, 400)]).disk_used_bytes(), 800);
+    /// The next extent of the file being resolved, if there is one left.
+    /// Extents left alone are counted and passed over.
+    fn next_in_file(&mut self) -> Option<Extent> {
+        let (path, resolver) = self.file.as_mut()?;
+        for resolved in resolver {
+            match resolved {
+                Ok(Resolved::Extent(extent)) => {
+                    if extent.refs.len() > 1 {
+                        self.handled.insert(extent.disk_address);
+                    }
+                    self.stats.extents += 1;
+                    self.stats.totals.add(&extent);
+                    return Some(extent);
+                }
+                Ok(Resolved::LeftAlone {
+                    disk_address,
+                    error,
+                }) => {
+                    match error {
+                        Some(e) => eprintln!("extent {disk_address:#x}: {e}"),
+                        None => eprintln!(
+                            "extent {disk_address:#x}: shared with a snapshot or otherwise \
+                             unresolvable, leaving it alone"
+                        ),
+                    }
+                    self.handled.insert(disk_address);
+                    self.stats.skipped += 1;
+                }
+                Err(e) => {
+                    eprintln!("skipping the rest of {}: {e}", path.display());
+                    break;
+                }
+            }
+        }
+        self.file = None;
+        None
     }
+}
 
-    #[test]
-    fn a_reference_inside_another_is_absorbed() {
-        assert_eq!(extent(&[(0, 900), (100, 50)]).disk_used_bytes(), 900);
-    }
+impl Iterator for Scanner {
+    type Item = Extent;
 
-    #[test]
-    fn identical_references_are_one_range() {
-        let e = extent(&[(256, 256), (256, 256)]);
-        assert_eq!(e.disk_used_bytes(), 256);
-        assert_eq!(e.disk_bytes - e.disk_used_bytes(), 768);
+    /// The next extent the walk discovers, with every reference to it,
+    /// wherever on the filesystem that reference is.
+    fn next(&mut self) -> Option<Extent> {
+        loop {
+            if let Some(extent) = self.next_in_file() {
+                return Some(extent);
+            }
+            let (path, size) = self.next_file()?;
+            self.open_file(path, size);
+        }
     }
 }

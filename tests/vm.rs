@@ -27,6 +27,9 @@
 
 mod support;
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
 use support::{Fs, MIB};
 
 /// The size of the files these shapes are built from. btrfs caps one extent at
@@ -44,7 +47,8 @@ fn a_bookend_extent_is_reclaimed() {
     support::bookend(&file, FILE_MIB);
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let reclaimable = support::file_reclaimable(&scan, &file);
     assert!(
         reclaimable >= 16 * MIB,
@@ -79,14 +83,13 @@ fn three_live_pieces_are_copied() {
     let live = (1 + 10 + 8) * MIB;
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let chunks: Vec<u64> = worklist
-        .jobs
         .iter()
-        .flat_map(|job| &job.holders)
-        .filter(|holder| **holder.path == *file)
-        .flat_map(|holder| &holder.chunks)
-        .map(|chunk| chunk.len)
+        .flat_map(|extent| &extent.refs)
+        .filter(|r| **r.path == *file)
+        .map(|r| r.num_bytes)
         .collect();
     // Three surviving pieces are at least three chunks: a split extent divides
     // them further, it never merges two of them into one.
@@ -132,10 +135,11 @@ fn one_extent_held_by_two_files_needs_both_rewritten() {
     );
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let job = support::job_for(&worklist, &a).expect("the shared extent is worth rewriting");
     assert_eq!(job.disk_address, extent);
-    assert_eq!(job.holders.len(), 2, "both files hold the extent");
+    assert_eq!(job.holders().len(), 2, "both files hold the extent");
 
     let (_, report) = support::apply(&data);
     assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
@@ -146,6 +150,247 @@ fn one_extent_held_by_two_files_needs_both_rewritten() {
         assert_eq!(allocated, used, "{} still wastes space", file.display());
     }
     assert_eq!(before, support::checksums(&data), "contents changed");
+}
+
+/// Extents the extent tree records against the tree block holding their
+/// references rather than against the files, as snapshot history leaves them.
+/// The extent tree cannot say who holds those, so the scan either trusts a
+/// reference count of one or asks the kernel's backreference walk. Either way,
+/// a file holding an extent alone and two files sharing one must come back
+/// whole and be rewritten.
+#[test]
+fn extents_behind_shared_backreferences_are_reclaimed() {
+    let fs = Fs::new();
+    fs.subvolume("original");
+    fs.filler("original/filler");
+    fs.dir("original/data");
+    // One reference in all: only the first MiB is left.
+    let alone = fs.path("original/data/alone");
+    support::write_random_one_extent(&alone, FILE_MIB);
+    support::punch_hole(&alone, MIB, (FILE_MIB - 1) * MIB);
+    // Four references, two files each keeping both ends.
+    let (a, b) = (
+        fs.path("original/data/shared-a"),
+        fs.path("original/data/shared-b"),
+    );
+    support::write_random_one_extent(&a, FILE_MIB);
+    support::reflink(&a, &b);
+    support::punch_hole(&a, MIB, (FILE_MIB - 2) * MIB);
+    support::punch_hole(&b, MIB, (FILE_MIB - 2) * MIB);
+
+    fs.snapshot_and_delete("original", "snapshot");
+    let data = fs.path("snapshot/data");
+    let alone = fs.path("snapshot/data/alone");
+    let (a, b) = (
+        fs.path("snapshot/data/shared-a"),
+        fs.path("snapshot/data/shared-b"),
+    );
+    assert!(
+        fs.shared_data_backrefs() > 0,
+        "fixture: the snapshot should be left with shared data backreferences"
+    );
+
+    let before = support::checksums(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
+    assert!(
+        support::job_for(&worklist, &alone).is_some(),
+        "the file holding its extent alone is worth rewriting"
+    );
+    let job = support::job_for(&worklist, &a).expect("the shared extent is worth rewriting");
+    assert_eq!(job.holders().len(), 2, "both files hold the extent");
+    assert_eq!(job.refs.len(), 4, "each file holds both ends of it");
+
+    let (_, report) = support::apply(&data);
+    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+    let after = support::scan(&data);
+    for file in [&alone, &a, &b] {
+        let (allocated, used) = support::file_totals(&after, file);
+        assert_eq!(allocated, used, "{} still wastes space", file.display());
+    }
+    assert_eq!(
+        support::physical_extents(&a),
+        support::physical_extents(&b),
+        "the two files should still share one copy"
+    );
+    assert_eq!(before, support::checksums(&data), "contents changed");
+}
+
+// Snapshots kept alongside the subvolume being scanned.
+//
+// A rewrite only moves the references in the subvolume it runs in. An extent a
+// snapshot also holds stays allocated for as long as the snapshot does, so
+// rewriting it costs a copy and frees nothing: it is to be left alone.
+//
+// How the extent tree records that a snapshot holds an extent depends on
+// whether the leaf holding the file's extent items has been written to since
+// the snapshot, and each shape takes its own path through the resolution. One
+// test for each.
+
+/// A file of one extent with only its first and last MiB left: worth rewriting
+/// wherever it is found alone.
+fn wasteful_file(path: &Path) {
+    support::write_random_one_extent(path, FILE_MIB);
+    support::punch_hole(path, MIB, (FILE_MIB - 2) * MIB);
+}
+
+/// Runs over `dir`, which holds `file`, and checks that the extent at `extent`
+/// is neither handed over by the scan nor touched by the rewrite.
+fn assert_left_alone(dir: &Path, file: &Path, extent: u64) {
+    let before = support::checksums(dir);
+    let scan = support::scan(dir);
+    assert!(
+        !scan.extents.contains_key(&extent),
+        "the scan handed over an extent a snapshot also holds"
+    );
+
+    let (_, report) = support::apply(dir);
+    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(
+        !report.rewritten.contains(&extent),
+        "rewrote an extent a snapshot also holds"
+    );
+    assert!(
+        support::physical_extents(file).contains(&extent),
+        "{} no longer references the extent its snapshot holds",
+        file.display()
+    );
+    assert_eq!(before, support::checksums(dir), "contents changed");
+}
+
+/// The snapshot shares the leaf holding the file's extent items, and neither
+/// side has written to it since. The extent tree records one reference, from
+/// the live subvolume, with nothing to say a second tree reaches it.
+///
+/// Data written after the snapshot is the live subvolume's alone, and must
+/// still be reclaimed: a snapshot is no reason to leave everything alone.
+#[test]
+fn an_extent_a_snapshot_reaches_through_an_untouched_leaf_is_left_alone() {
+    // Without noatime, reading a file for its checksum writes its inode, and
+    // with it the leaf this test needs untouched.
+    let fs = Fs::with_options(2048, "noatime");
+    fs.subvolume("live");
+    fs.dir("live/old");
+    let old = fs.path("live/old/file");
+    wasteful_file(&old);
+    fs.filler("live/filler");
+    // Made before the snapshot, after the filler: what goes in it later lands
+    // in leaves at the far end of the tree from the old file's.
+    fs.dir("live/new");
+    fs.snapshot("live", "snapshot");
+
+    let new = fs.path("live/new/file");
+    wasteful_file(&new);
+    support::sync_fs();
+
+    let extent = support::single_extent(&old);
+    assert_eq!(
+        support::single_extent(&fs.path("snapshot/old/file")),
+        extent,
+        "fixture: the snapshot should hold the old file's extent"
+    );
+    assert_eq!(
+        fs.shared_data_backrefs(),
+        0,
+        "fixture: no leaf should have been written since the snapshot"
+    );
+    let new_extent = support::single_extent(&new);
+
+    let live = fs.path("live");
+    let scan = support::scan(&live);
+    assert!(
+        support::on_worklist(&support::worklist(&scan), new_extent),
+        "data written since the snapshot is worth rewriting"
+    );
+    assert_left_alone(&live, &old, extent);
+    assert!(
+        !support::physical_extents(&new).contains(&new_extent),
+        "data written since the snapshot was not rewritten"
+    );
+
+    // Scanned from the snapshot's side, the extent is just as shared.
+    let snapshot = fs.path("snapshot");
+    let before = support::checksums(&snapshot);
+    let (_, report) = support::apply(&snapshot);
+    assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(before, support::checksums(&snapshot), "contents changed");
+}
+
+/// The live subvolume has written to the leaf holding the file's extent items
+/// since the snapshot, which gave it a copy of its own. The snapshot's is left
+/// reaching the extent through a shared data backreference, which only the
+/// kernel's backreference walk can follow.
+#[test]
+fn an_extent_a_snapshot_reaches_through_a_changed_leaf_is_left_alone() {
+    let fs = Fs::new();
+    fs.subvolume("live");
+    fs.dir("live/data");
+    let file = fs.path("live/data/file");
+    wasteful_file(&file);
+    fs.filler("live/filler");
+    fs.snapshot("live", "snapshot");
+
+    // Writing the file's inode writes the leaf it shares with its extent items.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+        .expect("change the file's mode");
+    support::sync_fs();
+
+    let extent = support::single_extent(&file);
+    assert_eq!(
+        support::single_extent(&fs.path("snapshot/data/file")),
+        extent,
+        "fixture: the snapshot should hold the file's extent"
+    );
+    assert!(
+        fs.shared_data_backrefs() > 0,
+        "fixture: the snapshot should be left with shared data backreferences"
+    );
+
+    assert_left_alone(&fs.path("live/data"), &file, extent);
+}
+
+/// The subvolume holds the extent through a shared data backreference already,
+/// its only one, as snapshot history leaves them (see
+/// `extents_behind_shared_backreferences_are_reclaimed`). A snapshot taken
+/// since reaches it through that same leaf, which leaves the extent tree
+/// exactly as it was: one reference, naming the leaf rather than a tree.
+#[test]
+fn an_extent_behind_a_shared_backreference_a_snapshot_also_reaches_is_left_alone() {
+    let fs = Fs::new();
+    fs.subvolume("original");
+    fs.filler("original/filler");
+    fs.dir("original/data");
+    // Only the first MiB left, so the file holds the extent through one
+    // reference: the count the extent tree gives is then one too.
+    let original = fs.path("original/data/file");
+    support::write_random_one_extent(&original, FILE_MIB);
+    support::punch_hole(&original, MIB, (FILE_MIB - 1) * MIB);
+    fs.snapshot_and_delete("original", "live");
+    let shared = fs.shared_data_backrefs();
+    assert!(
+        shared > 0,
+        "fixture: the history should leave shared data backreferences"
+    );
+
+    fs.snapshot("live", "snapshot");
+    let file = fs.path("live/data/file");
+    let extent = support::single_extent(&file);
+    assert_eq!(
+        support::single_extent(&fs.path("snapshot/data/file")),
+        extent,
+        "fixture: the snapshot should hold the file's extent"
+    );
+    assert_eq!(
+        fs.shared_data_backrefs(),
+        shared,
+        "fixture: the snapshot should not have changed the extent tree"
+    );
+
+    assert_left_alone(&fs.path("live/data"), &file, extent);
 }
 
 /// Two files over the same bytes of one extent. The rewrite copies those bytes
@@ -162,7 +407,7 @@ fn identical_holders_still_share_one_copy() {
     support::punch_hole(&b, MIB, (FILE_MIB - 1) * MIB);
 
     let before = support::checksums(&data);
-    let (scan, _) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
     let allocated_before = scan.totals().allocated_bytes;
 
     let (_, report) = support::apply(&data);
@@ -181,10 +426,14 @@ fn identical_holders_still_share_one_copy() {
     assert_eq!(before, support::checksums(&data), "contents changed");
 }
 
-/// An extent something outside the scanned path also holds. We cannot prove its
-/// dead space is unreachable, so it is reported apart and never worked on.
+/// An extent something outside the scanned path also holds. Rather than
+/// guessing at what that other reference means, the scan resolves it like any
+/// other: this tool works on the whole filesystem, the scanned path just
+/// decides where it starts looking. Punching the same hole on both sides
+/// leaves the extent genuinely part dead, so it lands on the worklist and both
+/// holders — the one outside `data` included — end up rewritten.
 #[test]
-fn an_extent_referenced_outside_the_scan_is_left_alone() {
+fn an_extent_referenced_outside_the_scan_is_reclaimed_too() {
     let fs = Fs::new();
     let data = fs.dir("data");
     fs.dir("outside");
@@ -192,19 +441,31 @@ fn an_extent_referenced_outside_the_scan_is_left_alone() {
     let external = fs.path("data/external");
     support::write_random(&keeper, FILE_MIB);
     support::reflink(&keeper, &external);
-    support::punch_hole(&external, MIB, (FILE_MIB - 1) * MIB);
+    support::punch_hole(&keeper, MIB, (FILE_MIB - 2) * MIB);
+    support::punch_hole(&external, MIB, (FILE_MIB - 2) * MIB);
 
-    let (scan, worklist) = support::scan_worklist(&data);
-    assert!(
-        scan.extents.values().any(|extent| extent.unknown_refs),
-        "the extent is held from outside the scan"
+    let before = support::checksums(fs.root()); // covers both `data` and `outside`
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
+    assert_eq!(
+        scan.totals().unreachable_bytes,
+        support::file_reclaimable(&scan, &external),
+        "the hole both files share should show up as reclaimable"
     );
     assert!(
-        scan.totals().unreachable_shared_bytes > 0,
-        "its dead space is reported as shared"
+        worklist.iter().any(|extent| extent.holders().len() == 2),
+        "the extent is on the worklist with both its holders"
     );
-    assert_eq!(scan.totals().unreachable_bytes, 0);
-    assert!(worklist.jobs.is_empty(), "and it is never worked on");
+
+    let (_, report) = support::apply(&data);
+    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+
+    assert_eq!(
+        support::physical_extents(&keeper),
+        support::physical_extents(&external),
+        "the two files should still share one copy"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// nodatacow files are overwritten in place and cannot be deduped, so however
@@ -219,14 +480,15 @@ fn a_nodatacow_file_never_reaches_the_worklist() {
     support::write_random(&file, FILE_MIB);
     support::punch_hole(&file, MIB, (FILE_MIB - 2) * MIB);
 
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         scan.extents
             .values()
             .all(|extent| extent.refs.iter().all(|r| r.nocow)),
         "the scan should see the file as nodatacow"
     );
-    assert!(worklist.jobs.is_empty(), "so it is never worked on");
+    assert!(worklist.is_empty(), "so it is never worked on");
 }
 
 /// A datacow file in a nodatacow directory. The temporary copy inherits the
@@ -244,7 +506,8 @@ fn a_nodatacow_directory_is_skipped_by_name() {
     support::set_nocow(&dir);
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::job_for(&worklist, &file).is_some(),
         "the waste is real, so the job is made"
@@ -261,7 +524,8 @@ fn a_nodatacow_directory_is_skipped_by_name() {
     );
 
     assert_eq!(before, support::checksums(&data), "contents changed");
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::job_for(&worklist, &file).is_some(),
         "it is still on the worklist, and always will be"
@@ -278,12 +542,13 @@ fn waste_below_the_floor_is_reported_but_not_worked() {
     support::write_random(&file, 1);
     support::punch_hole(&file, 64 * 1024, 8 * 1024);
 
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::file_reclaimable(&scan, &file) > 0,
         "the hole is dead space and is reported"
     );
-    assert!(worklist.jobs.is_empty(), "but it is not worth an operation");
+    assert!(worklist.is_empty(), "but it is not worth an operation");
 }
 
 /// A big extent with a little dead space: the copy costs far more than it
@@ -296,7 +561,8 @@ fn an_extent_too_full_to_be_worth_copying_is_left_alone() {
     support::write_random(&file, FILE_MIB);
     support::punch_hole(&file, (FILE_MIB / 2) * MIB, 8 * MIB);
 
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extents = support::extents_of(&scan, &file);
     // Whatever the write was cut into, an extent which would cost more than
     // four bytes moved for every byte it returns is a bad trade, and the ratio
@@ -335,9 +601,10 @@ fn a_clean_file_has_no_waste() {
     let file = fs.path("data/clean");
     support::write_random(&file, 8);
 
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert_eq!(support::file_reclaimable(&scan, &file), 0);
-    assert!(worklist.jobs.is_empty());
+    assert!(worklist.is_empty());
 }
 
 /// The temporary copy is made in each file's own directory, so a run has to
@@ -473,7 +740,8 @@ fn every_holder_of_a_slivered_extent_is_redirected() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -553,7 +821,8 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -632,7 +901,8 @@ fn holders_shared_between_jobs_all_move() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     for address in &addresses {
         let extent = scan
             .extents
@@ -706,7 +976,8 @@ fn a_holder_deep_inside_a_large_file_moves_too() {
     support::punch_hole(&movie, base + kept + sectorsize, size - kept - sectorsize);
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -781,7 +1052,8 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -833,7 +1105,7 @@ fn a_holder_whose_reference_is_shorter_than_the_stretch_moves() {
     support::sync_fs();
 
     let before = support::checksums(&data);
-    let (scan, _) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
     let extent = scan
         .extents
         .get(&address)
@@ -884,7 +1156,8 @@ fn a_long_live_stretch_moves_whole() {
     support::punch_hole(&movie, base + start + LIVE, size - start - LIVE);
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -949,7 +1222,8 @@ fn a_holder_deep_inside_a_long_stretch_moves() {
     support::punch_hole(&movie, base + start + LIVE, size - start - LIVE);
 
     let before = support::checksums(&data);
-    let (scan, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     let extent = scan
         .extents
         .get(&address)
@@ -1009,7 +1283,8 @@ fn a_holder_with_a_short_last_block_moves() {
     support::punch_hole(&file, MIB, (FILE_MIB - 4) * MIB);
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::job_for(&worklist, &file).is_some(),
         "the file should be worth rewriting"
@@ -1138,7 +1413,8 @@ fn a_holder_ending_mid_block_lets_go() {
     );
 
     let before = support::checksums(&data);
-    let (_, worklist) = support::scan_worklist(&data);
+    let scan = support::scan(&data);
+    let worklist = support::worklist(&scan);
     assert!(
         support::on_worklist(&worklist, extent),
         "the hole is most of it"

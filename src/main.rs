@@ -58,17 +58,18 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Scan phase
+    // Scan, and rewrite along the way if asked to
 
     println!("Scanning: {}", options.path.display());
-    let scan = match btrealloc::scan(&options) {
-        Ok(scan) => scan,
+    let (stats, report) = match btrealloc::run(&options) {
+        Ok(result) => result,
         Err(e) => {
             eprintln!("{}: {e}", options.path.display());
             return ExitCode::FAILURE;
         }
     };
-    scan.report();
+    println!();
+    stats.report();
 
     if !options.dryrun && !options.apply {
         println!();
@@ -78,9 +79,6 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Run phase
-
-    let report = btrealloc::run(&options, &scan);
     if report.corrupted.is_empty() {
         ExitCode::SUCCESS
     } else {

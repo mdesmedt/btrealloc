@@ -1,18 +1,18 @@
+pub mod extent;
 pub mod format;
 pub mod kernel;
 pub mod run;
 pub mod scan;
-pub mod worklist;
 
-use std::collections::HashSet;
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use kernel::Filesystem;
-use run::Report;
-use scan::Scan;
+use run::{Report, Runner};
+use scan::{ScanStats, Scanner};
 
+#[derive(Clone)]
 pub struct Options {
     pub path: PathBuf,
     pub dryrun: bool,
@@ -21,42 +21,21 @@ pub struct Options {
     pub verbose: bool,
 }
 
-/// Produces the Scan results for a given path.
-///
-/// Nothing is printed here: what the scan found is a result, returned whole, and
-/// whoever asked for it decides how to show it.
-pub fn scan(options: &Options) -> io::Result<Scan> {
-    let path = &options.path;
+/// Main entry point. Scans the filesystem and performs the reallocation operation.
+pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
+    // Open a handle anywhere on the filesystem for fetching extent metadata
+    let fs = Rc::new(Filesystem::open(&options.path)?);
+    let mut scanner = Scanner::new(options.clone(), fs.clone())?;
+    let mut runner = (options.dryrun || options.apply).then(|| Runner::new(options.clone(), fs));
 
-    // Read metadata
-    let meta = std::fs::metadata(path)?;
-
-    // Open a handle anywhere on the filesystem for fetching extent metadata later
-    let fs = Filesystem::open(path)?;
-
-    // Scan
-    let mut scan = Scan::new(fs);
-    if meta.is_dir() {
-        scan.walk(path, meta.dev(), &mut HashSet::new());
-    } else {
-        scan.add_file(path, meta.size());
+    for extent in &mut scanner {
+        if let Some(runner) = runner.as_mut()
+            && extent.worth_rewriting()
+        {
+            runner.process(&extent);
+        }
     }
 
-    // Classify
-    scan.classify();
-
-    Ok(scan)
-}
-
-/// Creates the worklist and processes it, if --dryrun or --apply is specified.
-/// Returns what the run did, which is empty when it was asked to do nothing.
-pub fn run(options: &Options, scan: &Scan) -> Report {
-    if options.dryrun || options.apply {
-        // Create the jobs from the scan results
-        let jobs = worklist::create_jobs(scan);
-        // Process each extent
-        run::run(&jobs, options, &scan.fs)
-    } else {
-        Report::default()
-    }
+    let report = runner.map(Runner::finish).unwrap_or_default();
+    Ok((scanner.stats, report))
 }
