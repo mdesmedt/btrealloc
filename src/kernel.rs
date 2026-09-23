@@ -651,6 +651,7 @@ impl Filesystem {
             // out is the item's own file offset, so each file's items are
             // counted and bounded by the first and last of them.
             let elem_cnt = buf[1] as u32 as usize;
+            #[allow(clippy::chunks_exact_to_as_chunks)]
             let mut triples: Vec<(u64, u64, u64)> = buf[2..]
                 .chunks_exact(3)
                 .take(elem_cnt / 3)
