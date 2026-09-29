@@ -31,7 +31,9 @@ use linux_raw_sys::btrfs::{
     btrfs_file_extent_item, btrfs_ioctl_ino_lookup_args, btrfs_ioctl_search_header,
     btrfs_ioctl_search_key,
 };
-use linux_raw_sys::general::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FS_NOCOW_FL, statfs};
+use linux_raw_sys::general::{
+    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FS_NOCOW_FL, RLIMIT_NOFILE, rlimit, statfs,
+};
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_TREE_SEARCH_V2, FICLONE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS,
 };
@@ -50,6 +52,8 @@ unsafe extern "C" {
     fn fallocate(fd: c_int, mode: c_int, offset: i64, len: i64) -> c_int;
     fn fstatfs(fd: c_int, buf: *mut statfs) -> c_int;
     fn sync();
+    fn getrlimit(resource: c_int, rlim: *mut rlimit) -> c_int;
+    fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_int;
 }
 
 /// Runs a command, or fails the test with everything it said.
@@ -196,9 +200,13 @@ impl Fs {
 
     /// Deletes the subvolume at `rel`, and waits for the deletion to be cleaned
     /// up.
+    ///
+    /// The cleaner otherwise sleeps until the next periodic commit, 30 seconds
+    /// away by default. A filesystem sync wakes it, where a plain `sync` does not.
     pub fn delete_subvolume(&self, rel: &str) {
         let path = self.path(rel);
         must("btrfs", &["subvolume", "delete", path.to_str().unwrap()]);
+        must("btrfs", &["filesystem", "sync", self.mnt.to_str().unwrap()]);
         must("btrfs", &["subvolume", "sync", self.mnt.to_str().unwrap()]);
         sync_fs();
     }
@@ -449,18 +457,45 @@ pub fn sync_fs() {
     unsafe { sync() };
 }
 
-/// The soft limit on files this process may have open, from `/proc`.
-pub fn open_files_limit() -> u64 {
-    let limits = std::fs::read_to_string("/proc/self/limits").expect("read /proc/self/limits");
-    let line = limits
-        .lines()
-        .find(|line| line.starts_with("Max open files"))
-        .expect("/proc/self/limits names the open files limit");
-    line["Max open files".len()..]
-        .split_whitespace()
-        .next()
-        .and_then(|soft| soft.parse().ok())
-        .expect("the soft open files limit is a number")
+/// Lowers the soft limit on files this process may have open to `soft`, until
+/// this is dropped and the limit it replaced comes back.
+pub struct OpenFilesLimit {
+    previous: rlimit,
+}
+
+impl OpenFilesLimit {
+    pub fn lower_to(soft: u64) -> OpenFilesLimit {
+        let mut previous = rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = unsafe { getrlimit(RLIMIT_NOFILE as c_int, &mut previous) };
+        assert!(rc == 0, "getrlimit: {}", std::io::Error::last_os_error());
+        let lowered = rlimit {
+            rlim_cur: soft.min(previous.rlim_cur),
+            rlim_max: previous.rlim_max,
+        };
+        let rc = unsafe { setrlimit(RLIMIT_NOFILE as c_int, &lowered) };
+        assert!(rc == 0, "setrlimit: {}", std::io::Error::last_os_error());
+        OpenFilesLimit { previous }
+    }
+
+    /// The soft limit now in force.
+    pub fn soft(&self) -> u64 {
+        let mut current = rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = unsafe { getrlimit(RLIMIT_NOFILE as c_int, &mut current) };
+        assert!(rc == 0, "getrlimit: {}", std::io::Error::last_os_error());
+        current.rlim_cur
+    }
+}
+
+impl Drop for OpenFilesLimit {
+    fn drop(&mut self) {
+        unsafe { setrlimit(RLIMIT_NOFILE as c_int, &self.previous) };
+    }
 }
 
 /// The SHA-256 of every file under `dir`, by path. Replaces the shell suite's

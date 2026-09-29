@@ -481,13 +481,14 @@ fn an_extent_held_by_many_read_only_snapshots_is_reclaimed() {
 /// One extent held by more snapshots than the process may have files open.
 /// Holding a descriptor for every subvolume looked up would run out of them
 /// before the last holder was found.
+///
+/// The limit is lowered for the test first. At the usual 1024 the snapshots it
+/// takes to exceed it make this the slowest test in the suite by far, most of
+/// it spent checksumming them.
 #[test]
 fn an_extent_held_by_more_snapshots_than_open_files_allow_is_reclaimed() {
-    let limit = support::open_files_limit();
-    assert!(
-        limit <= 4096,
-        "fixture: a soft RLIMIT_NOFILE of {limit} takes too many snapshots to exceed"
-    );
+    let lowered = support::OpenFilesLimit::lower_to(64);
+    let limit = lowered.soft();
 
     let fs = Fs::new();
     fs.subvolume("live");
