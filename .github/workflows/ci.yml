@@ -35,11 +35,11 @@ jobs:
         run: nix develop --command cargo test
 
   # The VM suite run straight on the runner, as root, with no VM around it.
-  # Trialled alongside vm-tests: aarch64 runners have no /dev/kvm, so there the
-  # VM crawls under software emulation. This tests the runner's own kernel
-  # rather than NixOS's.
-  bare-tests:
-    name: bare tests (${{ matrix.system }})
+  # aarch64 runners have no /dev/kvm, so a VM there crawls under software
+  # emulation, and this is the only end to end run it gets. On x86_64 it tests
+  # the runner's own kernel alongside the VM's NixOS one.
+  native-tests:
+    name: native tests (${{ matrix.system }})
     strategy:
       fail-fast: false
       matrix:
@@ -82,47 +82,24 @@ jobs:
             cargo test --release --test vm -- --test-threads=1
           '
 
+  # x86_64 only: aarch64 runners have no /dev/kvm, and native-tests covers them.
   vm-tests:
-    name: VM tests (${{ matrix.system }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - system: x86_64-linux
-            runner: ubuntu-24.04
-          - system: aarch64-linux
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    name: VM tests (x86_64-linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      # aarch64 runners have no /dev/kvm, so Nix's auto-detected
-      # system-features never includes "kvm" and it refuses to even schedule
-      # the build (which unconditionally requires it). Claiming the feature
-      # anyway is safe: the VM test script itself checks for /dev/kvm at
-      # runtime and only passes -enable-kvm when it's actually present,
-      # falling back to software emulation otherwise.
       - uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            extra-system-features = kvm
 
-      # NixOS test VMs need /dev/kvm. On x86_64 runners the hardware/hypervisor
-      # supports it but the device node isn't world-accessible by default. On
-      # aarch64 runners the device doesn't exist at all (no nested
-      # virtualization support), so the VM falls back to unaccelerated
-      # (TCG) emulation instead, which is much slower but still works.
-      - name: Enable KVM (if available)
+      # NixOS test VMs need /dev/kvm. The runner has it, but the device node
+      # isn't world-accessible by default.
+      - name: Enable KVM
         run: |
-          if [ -e /dev/kvm ]; then
-            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-            sudo udevadm control --reload-rules
-            sudo udevadm trigger --name-match=kvm
-          else
-            echo "No /dev/kvm on this runner; VM test will run without acceleration."
-          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
       # Run the VM
       - name: nix flake check
