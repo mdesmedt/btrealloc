@@ -1,9 +1,10 @@
 use std::io;
 use std::rc::Rc;
 
+use crate::Options;
 use crate::extent::{Extent, LeftAlone};
 use crate::format::human;
-use crate::kernel::{ExtentWalk, Filesystem, Resolved};
+use crate::kernel::{self, ExtentWalk, Filesystem, Resolved};
 
 /// Extents of one size class, the class being a power of two: everything from
 /// that size up to the next one.
@@ -94,9 +95,6 @@ impl LeftAloneStats {
 /// once, when it is discovered, and nothing about it is kept afterwards.
 pub struct ScanStats {
     pub extents: u64,
-    /// Extents left alone: they changed while they were being read, or
-    /// looking them up failed.
-    pub skipped: u64,
     pub totals: Totals,
     /// Extents with unreachable space that were not rewritten, by reason.
     pub left_alone: LeftAloneStats,
@@ -105,7 +103,6 @@ pub struct ScanStats {
 impl ScanStats {
     const ZERO: ScanStats = ScanStats {
         extents: 0,
-        skipped: 0,
         totals: Totals::ZERO,
         left_alone: LeftAloneStats::ZERO,
     };
@@ -173,19 +170,51 @@ impl ScanStats {
 /// Every data extent on the filesystem, fully resolved, counted into the stats
 /// as it is handed over and then forgotten. See [`ExtentWalk`].
 pub struct Scanner {
+    fs: Rc<Filesystem>,
     walk: ExtentWalk,
+    options: Options,
     pub stats: ScanStats,
     /// Why the walk ended early, if it did.
     pub error: Option<io::Error>,
 }
 
 impl Scanner {
-    pub fn new(fs: &Rc<Filesystem>) -> io::Result<Scanner> {
+    pub fn new(fs: &Rc<Filesystem>, options: &Options) -> io::Result<Scanner> {
         Ok(Scanner {
+            fs: Rc::clone(fs),
             walk: fs.walk()?,
+            options: options.clone(),
             stats: ScanStats::ZERO,
             error: None,
         })
+    }
+
+    /// `extent` resolved again, as it is now rather than as the walk read it,
+    /// for acting on: an earlier rewrite can have changed who holds it since.
+    /// `None` if it cannot be, and then it is counted as left alone.
+    pub fn resolve_again(&mut self, extent: &Extent) -> Option<Extent> {
+        match self.fs.resolve_again(extent) {
+            Ok(extent) => Some(extent),
+            Err(error) => {
+                self.leave_unresolved(extent.disk_address, &error, Some(extent));
+                None
+            }
+        }
+    }
+
+    /// Counts an extent whose holders could not be resolved, and says why,
+    /// unless it merely changed under us: on a filesystem in use that is
+    /// routine, and the table at the end counts it.
+    fn leave_unresolved(&mut self, disk_address: u64, error: &io::Error, extent: Option<&Extent>) {
+        let reason = if kernel::is_changed(error) {
+            LeftAlone::Changed
+        } else {
+            LeftAlone::Unresolved
+        };
+        if self.options.verbose || reason == LeftAlone::Unresolved {
+            eprintln!("extent {disk_address:#x}: {error}, leaving it alone");
+        }
+        self.stats.left_alone.add(reason, extent);
     }
 }
 
@@ -207,9 +236,7 @@ impl Iterator for Scanner {
                     disk_address,
                     error,
                 }) => {
-                    eprintln!("extent {disk_address:#x}: {error}, leaving it alone");
-                    self.stats.skipped += 1;
-                    self.stats.left_alone.add(LeftAlone::Unresolved, None);
+                    self.leave_unresolved(disk_address, &error, None);
                 }
                 Err(e) => {
                     self.error = Some(e);

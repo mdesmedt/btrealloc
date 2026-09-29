@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, c_int, c_long, c_ulong, c_void};
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::mem::size_of;
@@ -683,7 +684,7 @@ impl Filesystem {
     /// changed who holds another the walk has already read, most of all where
     /// a snapshot shares the leaf both are in. The backreference walk takes
     /// what is queued into account.
-    pub fn reresolve(&self, extent: &Extent) -> io::Result<Extent> {
+    pub fn resolve_again(&self, extent: &Extent) -> io::Result<Extent> {
         let data_refs = self.logical_ino(extent.disk_address)?;
         let refs = self.collect(extent.disk_address, extent.disk_bytes, &data_refs)?;
         Ok(Extent::from_refs(refs))
@@ -715,11 +716,11 @@ impl Filesystem {
             let found = refs.len();
             self.data_ref_extents(data_ref, disk_address, disk_bytes, &mut refs)?;
             if (refs.len() - found) as u64 != data_ref.count {
-                return Err(io::Error::other("changed while it was being read"));
+                return Err(changed("changed while it was being read"));
             }
         }
         if refs.is_empty() {
-            return Err(io::Error::other("no longer referenced"));
+            return Err(changed("no longer referenced"));
         }
         Ok(refs)
     }
@@ -829,7 +830,12 @@ impl Filesystem {
                 )
             };
             if rc < 0 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                // The kernel finds no extent at the address: it was freed.
+                if error.kind() == io::ErrorKind::NotFound {
+                    return Err(changed("no longer referenced"));
+                }
+                return Err(error);
             }
 
             // `bytes_left` and `bytes_missing`, then `elem_cnt` and
@@ -1048,6 +1054,30 @@ impl Filesystem {
         }
         Ok(file)
     }
+}
+
+/// Why an extent could not be resolved, when the reason is that it changed
+/// under us: freed, or its references moved, between reading it and looking
+/// up who holds it. On a filesystem in use this is routine, unlike a lookup
+/// that failed.
+#[derive(Debug)]
+struct Changed(&'static str);
+
+impl fmt::Display for Changed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Changed {}
+
+fn changed(why: &'static str) -> io::Error {
+    io::Error::other(Changed(why))
+}
+
+/// Whether `error` says only that the extent changed under us.
+pub fn is_changed(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|e| e.is::<Changed>())
 }
 
 /// One extent, as [`ExtentWalk`] resolves it.

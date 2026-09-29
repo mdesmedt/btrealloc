@@ -779,7 +779,8 @@ impl Scan {
 pub fn scan(fs: &Fs) -> Scan {
     let filesystem =
         Rc::new(kernel::Filesystem::open(fs.root()).expect("open the fixture's filesystem"));
-    let mut scanner = Scanner::new(&filesystem).expect("start the walk");
+    let mut scanner =
+        Scanner::new(&filesystem, &options(fs.root(), false, false)).expect("start the walk");
     let extents = scanner
         .by_ref()
         .map(|extent| (extent.disk_address, extent))

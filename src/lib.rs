@@ -8,7 +8,6 @@ use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use extent::LeftAlone;
 use kernel::Filesystem;
 use run::{Report, Runner};
 use scan::{ScanStats, Scanner};
@@ -30,7 +29,7 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
             "mounted read-only: --apply needs the filesystem mounted read-write",
         ));
     }
-    let mut scanner = Scanner::new(&fs)?;
+    let mut scanner = Scanner::new(&fs, options)?;
     let mut runner = (options.dryrun || options.apply).then(|| Runner::new(options.clone(), &fs));
 
     while let Some(extent) = scanner.next() {
@@ -45,26 +44,18 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
         let Some(runner) = runner.as_mut() else {
             continue;
         };
-        // Acted on as it is now, not as the walk read it: an earlier rewrite
-        // can have changed who holds it since. Counted as it is now too.
-        match fs.reresolve(&extent) {
-            Ok(extent) if extent.disk_free_bytes() == 0 => {}
-            Ok(extent) => {
-                let reason = extent
-                    .not_worth_rewriting()
-                    .or_else(|| runner.process(&extent));
-                if let Some(reason) = reason {
-                    scanner.stats.left_alone.add(reason, Some(&extent));
-                }
-            }
-            Err(e) => {
-                eprintln!("extent {:#x}: {e}, leaving it alone", extent.disk_address);
-                scanner.stats.skipped += 1;
-                scanner
-                    .stats
-                    .left_alone
-                    .add(LeftAlone::Unresolved, Some(&extent));
-            }
+        // Resolve the extent again before processing
+        let Some(extent) = scanner.resolve_again(&extent) else {
+            continue;
+        };
+        if extent.disk_free_bytes() == 0 {
+            continue;
+        }
+        let reason = extent
+            .not_worth_rewriting()
+            .or_else(|| runner.process(&extent));
+        if let Some(reason) = reason {
+            scanner.stats.left_alone.add(reason, Some(&extent));
         }
     }
 

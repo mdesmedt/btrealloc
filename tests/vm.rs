@@ -31,6 +31,7 @@ mod support;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use btrealloc::extent::LeftAlone;
 use support::{Fs, MIB};
 
 /// The size of the files these shapes are built from. btrfs caps one extent at
@@ -242,7 +243,14 @@ fn wasteful_file(path: &Path) {
 fn assert_reclaimed_from_all(fs: &Fs, files: &[PathBuf], extent: u64) {
     let before = support::checksums(fs.root());
     let scan = support::scan(fs);
-    assert_eq!(scan.stats.skipped, 0, "the scan left extents alone");
+    for reason in [LeftAlone::Changed, LeftAlone::Unresolved] {
+        assert_eq!(
+            scan.stats.left_alone.get(reason).count,
+            0,
+            "the scan left extents alone: {}",
+            reason.label()
+        );
+    }
     let found = scan
         .extents
         .get(&extent)
