@@ -14,14 +14,14 @@
     in
     {
       packages = forAll (pkgs: {
-        btrealloc = pkgs.rustPlatform.buildRustPackage {
-          pname = "btrealloc";
-          version = "0.1.0";
-          src = self;
-          cargoLock.lockFile = ./Cargo.lock;
-        };
+        btrealloc = pkgs.callPackage ./package.nix { };
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.btrealloc;
       });
+
+      # Adds btrealloc to a NixOS config's own nixpkgs.
+      overlays.default = final: prev: {
+        btrealloc = final.callPackage ./package.nix { };
+      };
 
       devShells = forAll (
         pkgs: with pkgs; {
