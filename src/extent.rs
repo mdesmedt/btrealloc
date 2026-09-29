@@ -1,6 +1,6 @@
 use std::ops::Range;
-use std::path::PathBuf;
-use std::rc::Rc;
+
+use crate::format::human;
 
 // Hard-coded tunables for now
 
@@ -12,7 +12,8 @@ const MAX_COPY_RATIO: u64 = 4;
 
 /// One reference from a file into a physical extent.
 pub struct ExtentRef {
-    pub path: Rc<PathBuf>,
+    /// Tree id of the subvolume holding the file.
+    pub root: u64,
     /// Inode number of the holding file, in its subvolume.
     pub inode: u64,
     /// Physical address of the extent this reference points into, i.e. its identity.
@@ -28,9 +29,6 @@ pub struct ExtentRef {
     pub extent_offset: u64,
     /// Uncompressed bytes of the extent this reference uses.
     pub num_bytes: u64,
-    /// The holding file is nodatacow, which rules out rewriting it: dedupe
-    /// does not work on those, and overwrites go in place anyway.
-    pub nocow: bool,
     /// The generation of the tree leaf this reference was read from. A leaf no
     /// newer than the subvolume's last snapshot may be shared with another
     /// tree, which reaches the extent through it too.
@@ -72,8 +70,8 @@ impl Extent {
     }
 
     /// The extent `refs` point into, from every reference to it there is, as
-    /// [`Filesystem::resolve_extents`](crate::kernel::Filesystem::resolve_extents)
-    /// finds them. `refs` must not be empty.
+    /// [`ExtentWalk`](crate::kernel::ExtentWalk) finds them. `refs` must not be
+    /// empty.
     pub fn from_refs(refs: Vec<ExtentRef>) -> Extent {
         let first = &refs[0];
         let (disk_address, disk_bytes, uncompressed_bytes) = (
@@ -113,27 +111,26 @@ impl Extent {
         self.disk_bytes - self.disk_used_bytes()
     }
 
-    /// Returns the files holding this extent, in path order, each file's
-    /// references in file order.
+    /// Returns the files holding this extent, by subvolume and inode, each
+    /// file's references in file order.
     ///
-    /// Sorting first and grouping runs of equal paths keeps this linear in the
-    /// reference count past the sort; a deduplicator can spread one extent over
-    /// thousands of files, where searching the groups built so far does not
-    /// finish.
+    /// Sorting first and grouping runs of the same file keeps this linear in
+    /// the reference count past the sort; a deduplicator can spread one extent
+    /// over thousands of files, where searching the groups built so far does
+    /// not finish.
     pub fn holders(&self) -> Vec<Holder<'_>> {
         let mut refs: Vec<&ExtentRef> = self.refs.iter().collect();
-        refs.sort_unstable_by(|a, b| (&*a.path, a.file_offset).cmp(&(&*b.path, b.file_offset)));
+        refs.sort_unstable_by_key(|r| (r.root, r.inode, r.file_offset));
 
         let mut holders: Vec<Holder> = Vec::new();
         for r in refs {
             match holders.last_mut() {
-                // Refs for the same file can come from different `file_extents`
-                // calls (the scan's own walk, and a backref resolution elsewhere),
-                // so they are not always the same `Rc`: compare the paths, not
-                // their pointers.
-                Some(holder) if holder.path.as_path() == r.path.as_path() => holder.refs.push(r),
+                Some(holder) if (holder.root, holder.inode) == (r.root, r.inode) => {
+                    holder.refs.push(r)
+                }
                 _ => holders.push(Holder {
-                    path: &r.path,
+                    root: r.root,
+                    inode: r.inode,
                     refs: vec![r],
                 }),
             }
@@ -143,26 +140,68 @@ impl Extent {
 
     /// Whether reallocating this extent is worth what it costs.
     pub fn worth_rewriting(&self) -> bool {
+        self.not_worth_rewriting().is_none()
+    }
+
+    /// Why reallocating this extent is not worth what it costs, if it isn't.
+    pub fn not_worth_rewriting(&self) -> Option<LeftAlone> {
         let free_bytes = self.disk_free_bytes();
 
         // Check if the extent has at least MIN_RECLAIM_BYTES reclaimable bytes
         if free_bytes < MIN_RECLAIM_BYTES {
-            return false;
+            return Some(LeftAlone::TooLittleToFree);
         }
 
         // Check that we're not going to copy much to reclaim little
         if free_bytes * MAX_COPY_RATIO < self.live_uncompressed_bytes() {
-            return false;
+            return Some(LeftAlone::TooMuchToCopy);
         }
+        None
+    }
+}
 
-        // A nodatacow holder can never be rewritten, so the extent will not be freed
-        !self.refs.iter().any(|r| r.nocow)
+/// Why an extent with unreachable space in it was not rewritten.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LeftAlone {
+    /// It frees less than [`MIN_RECLAIM_BYTES`].
+    TooLittleToFree,
+    /// It copies more than [`MAX_COPY_RATIO`] times what it frees.
+    TooMuchToCopy,
+    /// A nodatacow file holds it.
+    NoDataCow,
+    /// Looking up who holds it failed, during the walk or just before acting.
+    Unresolved,
+    /// Finding, opening or rewriting one of its holders failed.
+    Failed,
+}
+
+impl LeftAlone {
+    pub const ALL: [LeftAlone; 5] = [
+        LeftAlone::TooLittleToFree,
+        LeftAlone::TooMuchToCopy,
+        LeftAlone::NoDataCow,
+        LeftAlone::Unresolved,
+        LeftAlone::Failed,
+    ];
+
+    /// The reason, for the table at the end of a run.
+    pub fn label(self) -> String {
+        match self {
+            LeftAlone::TooLittleToFree => format!("frees under {}", human(MIN_RECLAIM_BYTES)),
+            LeftAlone::TooMuchToCopy => format!("copies over {MAX_COPY_RATIO}x what it frees"),
+            LeftAlone::NoDataCow => "held by a nodatacow file".to_string(),
+            LeftAlone::Unresolved => "holders could not be looked up".to_string(),
+            LeftAlone::Failed => "rewrite failed".to_string(),
+        }
     }
 }
 
 /// One file holding an extent, and its references into it in file order.
 pub struct Holder<'a> {
-    pub path: &'a Rc<PathBuf>,
+    /// Tree id of the subvolume the file is in.
+    pub root: u64,
+    /// Inode number of the file, in that subvolume.
+    pub inode: u64,
     pub refs: Vec<&'a ExtentRef>,
 }
 
@@ -188,9 +227,9 @@ fn live_ranges(refs: &[ExtentRef]) -> Vec<Range<u64>> {
 mod tests {
     use super::*;
 
-    fn extent_ref(path: &Rc<PathBuf>, start: u64, len: u64) -> ExtentRef {
+    fn extent_ref(start: u64, len: u64) -> ExtentRef {
         ExtentRef {
-            path: Rc::clone(path),
+            root: 5,
             inode: 257,
             disk_address: 0,
             disk_bytes: 1024,
@@ -198,16 +237,14 @@ mod tests {
             file_offset: 0,
             extent_offset: start,
             num_bytes: len,
-            nocow: false,
             leaf_generation: 0,
         }
     }
 
     fn extent(refs: &[(u64, u64)]) -> Extent {
-        let path = Rc::new(PathBuf::from("f"));
         let refs = refs
             .iter()
-            .map(|&(off, len)| extent_ref(&path, off, len))
+            .map(|&(off, len)| extent_ref(off, len))
             .collect();
         Extent::new(0, 1024, 1024, refs)
     }
@@ -238,6 +275,26 @@ mod tests {
     #[test]
     fn touching_stretches_merge() {
         assert_eq!(extent(&[(0, 512), (512, 512)]).live_ranges, vec![0..1024]);
+    }
+
+    #[test]
+    fn mostly_dead_extent_is_worth_rewriting() {
+        let e = Extent::new(0, 1 << 20, 1 << 20, vec![extent_ref(0, 4096)]);
+        assert_eq!(e.not_worth_rewriting(), None);
+    }
+
+    #[test]
+    fn small_gap_frees_too_little() {
+        assert_eq!(
+            extent(&[(0, 1000)]).not_worth_rewriting(),
+            Some(LeftAlone::TooLittleToFree)
+        );
+    }
+
+    #[test]
+    fn mostly_live_extent_copies_too_much() {
+        let e = Extent::new(0, 1 << 20, 1 << 20, vec![extent_ref(0, 900 << 10)]);
+        assert_eq!(e.not_worth_rewriting(), Some(LeftAlone::TooMuchToCopy));
     }
 
     #[test]

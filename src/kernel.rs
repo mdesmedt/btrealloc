@@ -1,8 +1,8 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{OsStr, c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::iter::Peekable;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -15,19 +15,21 @@ use std::vec;
 use linux_raw_sys::btrfs::{
     BTRFS_EXTENT_DATA_KEY, BTRFS_EXTENT_DATA_REF_KEY, BTRFS_EXTENT_FLAG_DATA,
     BTRFS_EXTENT_ITEM_KEY, BTRFS_EXTENT_OWNER_REF_KEY, BTRFS_EXTENT_TREE_OBJECTID,
-    BTRFS_FILE_EXTENT_INLINE, BTRFS_FIRST_FREE_OBJECTID, BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET,
+    BTRFS_FILE_EXTENT_INLINE, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_INFO_FLAG_GENERATION,
+    BTRFS_FS_TREE_OBJECTID, BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET, BTRFS_ROOT_BACKREF_KEY,
     BTRFS_ROOT_ITEM_KEY, BTRFS_ROOT_TREE_OBJECTID, BTRFS_SHARED_DATA_REF_KEY,
     btrfs_extent_data_ref, btrfs_extent_item, btrfs_extent_owner_ref, btrfs_file_extent_item,
-    btrfs_ioctl_ino_lookup_args, btrfs_ioctl_ino_path_args, btrfs_ioctl_logical_ino_args,
-    btrfs_ioctl_search_header, btrfs_ioctl_search_key, btrfs_root_item,
+    btrfs_ioctl_fs_info_args, btrfs_ioctl_ino_lookup_args, btrfs_ioctl_ino_path_args,
+    btrfs_ioctl_logical_ino_args, btrfs_ioctl_search_header, btrfs_ioctl_search_key,
+    btrfs_root_item, btrfs_root_ref,
 };
 use linux_raw_sys::general::{
     __IncompleteArrayField, BTRFS_SUPER_MAGIC, FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_TMPFILE,
     file_dedupe_range, file_dedupe_range_info, statfs,
 };
 use linux_raw_sys::ioctl::{
-    BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2, BTRFS_IOC_TREE_SEARCH_V2,
-    FIDEDUPERANGE, FS_IOC_GETFLAGS,
+    BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
+    BTRFS_IOC_TREE_SEARCH_V2, FIDEDUPERANGE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS,
 };
 
 use crate::extent::{Extent, ExtentRef};
@@ -40,6 +42,9 @@ const BUF_SIZE: usize = 256 * 1024;
 /// No btrfs item is larger than a tree node, and no tree node is larger than
 /// 64 KiB.
 const MAX_ITEM_SIZE: usize = 64 * 1024;
+
+/// `statfs`'s flag for a read-only mount, as `<sys/statvfs.h>` has it.
+const ST_RDONLY: u64 = 1;
 
 /// A zeroed `Box<T>`, allocated straight on the heap: `Box::new(x)` builds `x`
 /// on the stack first, which overflows it for something [`SearchArgs`]-sized.
@@ -61,6 +66,7 @@ const _: () = assert!(cfg!(target_endian = "little"));
 unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> c_int;
     fn fstatfs(fd: c_int, buf: *mut statfs) -> c_int;
+    fn syncfs(fd: c_int) -> c_int;
 }
 
 /// `struct btrfs_ioctl_search_args_v2` with its trailing buffer given a fixed
@@ -117,6 +123,36 @@ impl SearchArgs {
         Ok(())
     }
 
+    /// Hands every item the last search returned to `each` with its header.
+    /// Returns the header of the last one, and whether the search reached the
+    /// end of its range rather than stopping for want of room.
+    fn items(
+        &self,
+        mut each: impl FnMut(&btrfs_ioctl_search_header, &[u8]) -> io::Result<()>,
+    ) -> io::Result<(Option<btrfs_ioctl_search_header>, bool)> {
+        const HEADER_SIZE: usize = size_of::<btrfs_ioctl_search_header>();
+        let mut pos = 0usize;
+        let mut last = None;
+        for _ in 0..self.key.nr_items {
+            let header =
+                read_struct::<btrfs_ioctl_search_header>(&self.buf, pos).ok_or_else(|| {
+                    io::Error::other("search claimed more items than its buffer holds")
+                })?;
+            let start = pos + HEADER_SIZE;
+            let end = start + header.len as usize;
+            if end > self.buf.len() {
+                return Err(io::Error::other("search item runs past its buffer"));
+            }
+            each(&header, &self.buf[start..end])?;
+            last = Some(header);
+            pos = end;
+        }
+        // The kernel only stops short of the end of the range when the next
+        // item does not fit. Room left for any item means it did not stop
+        // short.
+        Ok((last, BUF_SIZE - pos >= HEADER_SIZE + MAX_ITEM_SIZE))
+    }
+
     /// Runs the search over its whole key range, however many calls that
     /// takes, handing every item found to `each` with its header.
     fn search_all(
@@ -124,40 +160,16 @@ impl SearchArgs {
         fd: c_int,
         mut each: impl FnMut(&btrfs_ioctl_search_header, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
-        const HEADER_SIZE: usize = size_of::<btrfs_ioctl_search_header>();
         loop {
             self.search(fd)?;
-            if self.key.nr_items == 0 {
-                return Ok(());
-            }
-
-            let mut pos = 0usize;
-            let mut last = None;
-            for _ in 0..self.key.nr_items {
-                let header =
-                    read_struct::<btrfs_ioctl_search_header>(&self.buf, pos).ok_or_else(|| {
-                        io::Error::other("search claimed more items than its buffer holds")
-                    })?;
-                let start = pos + HEADER_SIZE;
-                let end = start + header.len as usize;
-                if end > self.buf.len() {
-                    return Err(io::Error::other("search item runs past its buffer"));
-                }
-                each(&header, &self.buf[start..end])?;
-                last = Some(header);
-                pos = end;
-            }
-
-            // The kernel only stops short of the end of the range when the
-            // next item does not fit. Room left for any item means it did not
-            // stop short.
-            if BUF_SIZE - pos >= HEADER_SIZE + MAX_ITEM_SIZE {
+            let (last, complete) = self.items(&mut each)?;
+            let Some(last) = last else { return Ok(()) };
+            if complete {
                 return Ok(());
             }
 
             // Carry on from just past the last key returned. Keys order as
             // (objectid, type, offset) tuples, and so does the search range.
-            let Some(last) = last else { return Ok(()) };
             self.key.min_objectid = last.objectid;
             self.key.min_type = last.type_;
             if last.offset < u64::MAX {
@@ -176,25 +188,39 @@ impl SearchArgs {
     }
 }
 
+/// Whether an extent tree item is one [`Tally`] reads: the extent item, and
+/// the backreferences stored after it.
+fn is_extent_key(key_type: u32) -> bool {
+    (BTRFS_EXTENT_ITEM_KEY..=BTRFS_SHARED_DATA_REF_KEY).contains(&key_type)
+}
+
+/// What an extent item says about its extent.
+#[derive(Clone, Copy)]
+struct ExtentItem {
+    /// Bytes on disk, from the item's key.
+    disk_bytes: u64,
+    /// How many references the extent has in all.
+    refs: u64,
+    /// The transaction the extent was allocated in.
+    generation: u64,
+}
+
 /// Who holds an extent, as the extent tree records it.
 enum Backrefs {
-    /// There is no extent of that size at that address: it was freed while we
-    /// scanned.
-    Gone,
     /// Every reference names the file holding it directly.
     Files(Vec<DataRef>),
     /// At least one reference goes through a shared metadata block, as a
     /// snapshot or a balance leaves behind, or has a shape not read here. Only
-    /// a full backreference walk can say whose files those are. `total` is the
-    /// reference count the extent item gives.
-    Opaque { total: u64 },
+    /// a full backreference walk can say whose files those are.
+    Opaque,
 }
 
 /// The extent tree's account of one extent, as it is read item by item.
 #[derive(Default)]
 struct Tally {
-    /// The reference count the extent item gives, once it is found.
-    total: Option<u64>,
+    /// The extent item, once it is found. It stays `None` for a tree block,
+    /// which holds metadata rather than any file's data.
+    item: Option<ExtentItem>,
     /// What the references read so far add up to.
     counted: u64,
     data_refs: Vec<DataRef>,
@@ -203,30 +229,29 @@ struct Tally {
 }
 
 impl Tally {
-    fn add_item(&mut self, key_type: u32, key_offset: u64, disk_bytes: u64, item: &[u8]) {
+    fn add_item(&mut self, key_type: u32, key_offset: u64, item: &[u8]) {
         match key_type {
             BTRFS_EXTENT_ITEM_KEY => {
-                // A different size at this address is a different extent,
-                // allocated after ours was freed.
-                if key_offset != disk_bytes {
-                    return;
-                }
                 let Some(extent) = read_struct::<btrfs_extent_item>(item, 0) else {
                     self.opaque = true;
                     return;
                 };
                 if extent.flags & BTRFS_EXTENT_FLAG_DATA as u64 == 0 {
-                    self.opaque = true;
+                    return;
                 }
-                self.total = Some(extent.refs);
+                self.item = Some(ExtentItem {
+                    disk_bytes: key_offset,
+                    refs: extent.refs,
+                    generation: extent.generation,
+                });
                 self.add_inline(&item[size_of::<btrfs_extent_item>()..]);
             }
             BTRFS_EXTENT_DATA_REF_KEY => match read_struct::<btrfs_extent_data_ref>(item, 0) {
                 Some(r) => self.add_data_ref(&r),
                 None => self.opaque = true,
             },
-            // A shared data reference stored as its own item, or anything else
-            // in the backreference key range.
+            // A shared data reference stored as its own item, a tree block's
+            // references, or anything else in the backreference key range.
             _ => self.opaque = true,
         }
     }
@@ -272,13 +297,25 @@ impl Tally {
         });
     }
 
-    fn finish(self) -> Backrefs {
-        match self.total {
-            None => Backrefs::Gone,
-            Some(total) if self.opaque || self.counted != total => Backrefs::Opaque { total },
-            Some(_) => Backrefs::Files(self.data_refs),
-        }
+    /// The extent item and who holds the extent, or `None` if this is not a
+    /// data extent.
+    fn finish(self) -> Option<(ExtentItem, Backrefs)> {
+        let item = self.item?;
+        let backrefs = if self.opaque || self.counted != item.refs {
+            Backrefs::Opaque
+        } else {
+            Backrefs::Files(self.data_refs)
+        };
+        Some((item, backrefs))
     }
+}
+
+/// A data extent as a batch reads it from the extent tree, before it is
+/// resolved to the file extent items pointing into it.
+struct Unresolved {
+    disk_address: u64,
+    item: ExtentItem,
+    backrefs: Backrefs,
 }
 
 /// `count` file extent items of `inode` in subvolume `root` point into the
@@ -300,33 +337,73 @@ enum RefOffsets {
     Between(u64, u64),
 }
 
-/// A handle on the mounted filesystem, for questions about it as a whole
-/// rather than about one file.
+/// One subvolume, found by path from the top-level one.
+///
+/// Only the path is kept. Its root directory is opened again wherever it is
+/// needed: a descriptor held for every subvolume is what runs into
+/// `RLIMIT_NOFILE` on a filesystem with thousands of snapshots.
+struct Subvolume {
+    path: PathBuf,
+}
+
+impl Subvolume {
+    /// Opens the subvolume's root directory, which inode numbers in it are
+    /// resolved through, or `None` if its path no longer leads there.
+    fn open(&self, root: u64) -> io::Result<Option<File>> {
+        open_subvolume(&self.path, root)
+    }
+}
+
+/// Opens `path` as the root directory of subvolume `root`, or `None` if there
+/// is nothing there, or it is something else: a directory, another subvolume,
+/// or a mount on top of it.
+fn open_subvolume(path: &Path, root: u64) -> io::Result<Option<File>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if own_root_id(file.as_raw_fd())? != root
+        || file.metadata()?.ino() != BTRFS_FIRST_FREE_OBJECTID as u64
+    {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+/// A handle on the whole filesystem, through the root directory of its
+/// top-level subvolume. From there every other subvolume, and every inode in
+/// it, can be reached.
 pub struct Filesystem {
     file: File,
+    /// Where the top-level subvolume is mounted.
+    pub mount: PathBuf,
     /// The sector size: a file extent reference covers whole sectors, never
     /// part of one. It is the page size at mkfs time, typically 4096 bytes.
     pub sectorsize: u64,
+    /// Whether it is mounted read-only, which leaves nothing to rewrite with.
+    pub read_only: bool,
     /// One search buffer, reused for every search made through this handle.
     searchargs: RefCell<Box<SearchArgs>>,
     /// The buffer [`Filesystem::logical_ino`] hands the kernel, as `u64`s:
     /// `struct btrfs_data_container`'s four `u32`s fill the first two. It
-    /// starts small, because the kernel zeroes and copies all of it on every
-    /// call, and grows for the rare extent with more references than fit.
+    /// grows for the rare extent with more references than fit, and is kept
+    /// at that size, but each lookup only offers the kernel as much of it as
+    /// that lookup needs.
     logicalino: RefCell<Vec<u64>>,
-    /// The subvolume tree id of the filesystem handle opened on, for telling
-    /// apart a backreference in this subvolume from one in another (most often
-    /// a snapshot's).
-    root_id: u64,
-    /// The absolute path of that subvolume's own root directory, found by
-    /// walking up from the path opened. `None` if that walk never reached it,
-    /// in which case a backreference can never be resolved to a path.
-    subvol_root: Option<PathBuf>,
+    /// Every subvolume looked up so far, by tree id, or `None` for one there
+    /// is no path to.
+    subvolumes: RefCell<HashMap<u64, Option<Rc<Subvolume>>>>,
+    /// Each subvolume's last snapshot, by tree id, as read for the current
+    /// batch of the walk. Forgotten with every batch, so a snapshot taken
+    /// mid-run is not missed.
+    last_snapshots: RefCell<HashMap<u64, u64>>,
 }
 
 impl Filesystem {
-    /// Any path on the filesystem will do. Fails if that path is not on btrfs:
-    /// every extent question we ask later goes through btrfs-only ioctls.
+    /// Opens the filesystem through `path`, which has to be where its
+    /// top-level subvolume (subvolid=5) is mounted: only from there can every
+    /// subvolume be reached. Anything else is refused with what to do instead.
     pub fn open(path: &Path) -> io::Result<Filesystem> {
         let file = File::open(path)?;
 
@@ -335,7 +412,7 @@ impl Filesystem {
             return Err(io::Error::last_os_error());
         }
         if buf.f_type as u64 != BTRFS_SUPER_MAGIC as u64 {
-            return Err(io::Error::other("not a btrfs filesystem"));
+            return Err(io::Error::other("not on a btrfs filesystem"));
         }
 
         // btrfs reports its sector size as the block size, so the statfs above
@@ -347,192 +424,240 @@ impl Filesystem {
             )));
         }
 
-        let root_id = own_root_id(file.as_raw_fd())?;
-        let dev = file.metadata()?.dev();
-        let subvol_root = find_subvol_root(path, dev);
+        let meta = file.metadata()?;
+        if !meta.is_dir() {
+            return Err(io::Error::other(
+                "not a directory: pass the mount point of the filesystem's top-level \
+                 subvolume, mounted with -o subvolid=5",
+            ));
+        }
+        let root = own_root_id(file.as_raw_fd())?;
+        if root != BTRFS_FS_TREE_OBJECTID as u64 {
+            return Err(io::Error::other(format!(
+                "in subvolume {root}, not the top-level subvolume: mount the filesystem \
+                 with -o subvolid=5 and pass that mount point"
+            )));
+        }
+        if meta.ino() != BTRFS_FIRST_FREE_OBJECTID as u64 {
+            return Err(io::Error::other(
+                "a directory inside the top-level subvolume, not its root: pass the \
+                 mount point itself",
+            ));
+        }
 
         Ok(Filesystem {
             file,
+            mount: path.to_path_buf(),
             sectorsize,
+            read_only: buf.f_flags as u64 & ST_RDONLY != 0,
             searchargs: RefCell::new(SearchArgs::new(0)),
             logicalino: RefCell::new(vec![0; LOGICAL_INO_START_SIZE / size_of::<u64>()]),
-            root_id,
-            subvol_root,
+            subvolumes: RefCell::new(HashMap::new()),
+            last_snapshots: RefCell::new(HashMap::new()),
         })
     }
 
-    /// Resolves every extent `refs` point into, `refs` being everything one
-    /// file references, to every reference the whole filesystem holds to it,
-    /// down to the file and byte range each one is at.
-    ///
-    /// The extent tree keeps an extent's references next to the extent, in
-    /// address order, and a file's extents mostly sit close together on disk.
-    /// So they are read a stretch of addresses at a time, many extents to a
-    /// search, rather than one search per extent. Most extents are settled by
-    /// that alone. The rest need the files the extent tree names searched, and
-    /// only the stretch of each that can hold a reference; where it names no
-    /// file, the kernel's backreference walk finds them.
-    ///
-    /// Nothing is looked up until the extents are asked for, and then only a
-    /// stretch at a time: an extent can be dealt with, rewritten even, before
-    /// the next stretch is read.
-    pub fn resolve_extents(self: &Rc<Self>, mut refs: Vec<ExtentRef>) -> Resolver {
-        // One group per extent, in address order.
-        refs.sort_unstable_by_key(|r| (r.disk_address, r.file_offset));
-        let mut groups: Vec<Vec<ExtentRef>> = Vec::new();
-        for r in refs {
-            match groups.last_mut() {
-                Some(group) if group[0].disk_address == r.disk_address => group.push(r),
-                _ => groups.push(vec![r]),
-            }
+    /// Every data extent on the filesystem, in address order, each with every
+    /// reference to it. See [`ExtentWalk`].
+    pub fn walk(self: &Rc<Self>) -> io::Result<ExtentWalk> {
+        // Commit what is pending first, so that everything allocated from here
+        // on, our own copies included, is newer than the generation read next.
+        if unsafe { syncfs(self.file.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
         }
-
-        Resolver {
+        Ok(ExtentWalk {
             fs: Rc::clone(self),
-            groups: groups.into_iter().peekable(),
-            window: Vec::new().into_iter(),
-            last_snapshot: u64::MAX,
-        }
+            next: Some(0),
+            generation: self.generation()?,
+            batch: Vec::new().into_iter(),
+        })
     }
 
-    /// Reads who holds each extent in `window` from the extent tree: every
-    /// extent item with the references stored inline in it, and the ones
-    /// stored as items of their own after it, all in one search over the
-    /// addresses the window spans. Items of extents not in the window are
-    /// passed over.
-    fn backrefs(&self, window: &[Vec<ExtentRef>]) -> io::Result<Vec<Backrefs>> {
-        let first = window[0][0].disk_address;
-        let last = window[window.len() - 1][0].disk_address;
+    /// The filesystem's current generation: the transaction last committed,
+    /// or the one running.
+    fn generation(&self) -> io::Result<u64> {
+        let mut args: btrfs_ioctl_fs_info_args = unsafe { std::mem::zeroed() };
+        args.flags = BTRFS_FS_INFO_FLAG_GENERATION as u64;
+        let rc = unsafe {
+            ioctl(
+                self.file.as_raw_fd(),
+                BTRFS_IOC_FS_INFO as c_ulong,
+                (&raw mut args).cast(),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The kernel clears the flags it does not know.
+        if args.flags & BTRFS_FS_INFO_FLAG_GENERATION as u64 == 0 {
+            return Err(io::Error::other(
+                "this kernel is too old to report the filesystem's generation",
+            ));
+        }
+        Ok(args.generation)
+    }
+
+    /// The data extents from address `from` on, as many as one search returns,
+    /// with the address the next batch starts from, or `None` once the extent
+    /// tree is read to its end. Extents allocated after `generation` are left
+    /// out.
+    fn extent_batch(
+        &self,
+        from: u64,
+        generation: u64,
+    ) -> io::Result<(Vec<Unresolved>, Option<u64>)> {
+        self.last_snapshots.borrow_mut().clear();
 
         let mut args = self.searchargs.borrow_mut();
         args.key.tree_id = BTRFS_EXTENT_TREE_OBJECTID as u64;
         args.set_range(
-            (first, BTRFS_EXTENT_ITEM_KEY, 0),
-            (last, BTRFS_SHARED_DATA_REF_KEY, u64::MAX),
+            (from, BTRFS_EXTENT_ITEM_KEY, 0),
+            (u64::MAX, BTRFS_SHARED_DATA_REF_KEY, u64::MAX),
         );
-
-        let mut tallies: Vec<Tally> = window.iter().map(|_| Tally::default()).collect();
-        args.search_all(self.file.as_raw_fd(), |header, item| {
-            if !(BTRFS_EXTENT_ITEM_KEY..=BTRFS_SHARED_DATA_REF_KEY).contains(&header.type_) {
+        args.search(self.file.as_raw_fd())?;
+        let mut tallies: Vec<(u64, Tally)> = Vec::new();
+        let (last, complete) = args.items(|header, item| {
+            if !is_extent_key(header.type_) {
                 return Ok(());
             }
-            let Ok(i) =
-                window.binary_search_by_key(&header.objectid, |group| group[0].disk_address)
-            else {
-                return Ok(());
-            };
-            let disk_bytes = window[i][0].disk_bytes;
-            tallies[i].add_item(header.type_, header.offset, disk_bytes, item);
+            match tallies.last_mut() {
+                Some((address, tally)) if *address == header.objectid => {
+                    tally.add_item(header.type_, header.offset, item);
+                }
+                _ => {
+                    let mut tally = Tally::default();
+                    tally.add_item(header.type_, header.offset, item);
+                    tallies.push((header.objectid, tally));
+                }
+            }
             Ok(())
         })?;
-        Ok(tallies.into_iter().map(Tally::finish).collect())
+        drop(args);
+
+        let next = match last {
+            // The search stopped for want of room, so the last extent it
+            // reached may have references past the end of the buffer. It is
+            // read again on its own, which also makes progress when a single
+            // extent's references fill the whole buffer.
+            Some(last) if !complete => {
+                if tallies.last().is_some_and(|(a, _)| *a == last.objectid) {
+                    tallies.pop();
+                }
+                tallies.push((last.objectid, self.tally(last.objectid)?));
+                last.objectid.checked_add(1)
+            }
+            _ => None,
+        };
+
+        let batch = tallies
+            .into_iter()
+            .filter_map(|(address, tally)| {
+                let (item, backrefs) = tally.finish()?;
+                (item.generation <= generation).then_some(Unresolved {
+                    disk_address: address,
+                    item,
+                    backrefs,
+                })
+            })
+            .collect();
+        Ok((batch, next))
     }
 
-    /// Every reference to one extent, given the references to it one file
-    /// holds (`local`), what the extent tree says about it, and the generation
-    /// of the subvolume's last snapshot.
+    /// Everything the extent tree holds about the extent at `address`.
+    fn tally(&self, address: u64) -> io::Result<Tally> {
+        let mut args = self.searchargs.borrow_mut();
+        args.key.tree_id = BTRFS_EXTENT_TREE_OBJECTID as u64;
+        args.set_range(
+            (address, BTRFS_EXTENT_ITEM_KEY, 0),
+            (address, BTRFS_SHARED_DATA_REF_KEY, u64::MAX),
+        );
+        let mut tally = Tally::default();
+        args.search_all(self.file.as_raw_fd(), |header, item| {
+            if is_extent_key(header.type_) {
+                tally.add_item(header.type_, header.offset, item);
+            }
+            Ok(())
+        })?;
+        Ok(tally)
+    }
+
+    /// Every reference to one extent, given what the extent tree says about it.
     ///
     /// The extent tree records a reference once, against the tree block holding
     /// it. A block another tree shares since a snapshot is recorded as though
-    /// only this subvolume held it, until one side writes to it. The extent tree
+    /// only one subvolume held it, until one side writes to it. The extent tree
     /// alone is trusted only where every reference was read from a leaf written
-    /// since the last snapshot, which no other tree can share. For the rest, the
+    /// since its subvolume's last snapshot, which no other tree can share. For
+    /// the rest, and wherever the extent tree's account does not add up, the
     /// kernel's backreference walk follows the shared blocks to every tree
     /// reaching the extent.
     fn resolve(
         &self,
-        local: Vec<ExtentRef>,
+        disk_address: u64,
+        item: &ExtentItem,
         backrefs: Backrefs,
-        last_snapshot: u64,
-    ) -> io::Result<Option<Vec<ExtentRef>>> {
-        let may_be_shared =
-            |refs: &[ExtentRef]| refs.iter().any(|r| r.leaf_generation <= last_snapshot);
-        let disk_address = local[0].disk_address;
-        let unshared = !may_be_shared(&local);
-        let data_refs = match backrefs {
-            Backrefs::Gone => return Ok(None),
-            // One reference in all, it is the one in hand, and no other tree
-            // reaches the leaf holding it.
-            Backrefs::Opaque { total: 1 } if local.len() == 1 && unshared => {
-                return Ok(Some(local));
-            }
-            Backrefs::Files(data_refs) if unshared => data_refs,
-            _ => return self.collect(local, &self.logical_ino(disk_address)?),
-        };
-
-        // The other files' references can sit in shared leaves too, and that
-        // only shows once they are read.
-        let own = local.len();
-        let Some(mut refs) = self.collect(local, &data_refs)? else {
-            return Ok(None);
-        };
-        if !may_be_shared(&refs[own..]) {
-            return Ok(Some(refs));
+    ) -> io::Result<Vec<ExtentRef>> {
+        if let Backrefs::Files(data_refs) = backrefs
+            && let Ok(refs) = self.collect(disk_address, item.disk_bytes, &data_refs)
+            && !self.may_be_shared(&refs)?
+        {
+            return Ok(refs);
         }
-        refs.truncate(own);
-        self.collect(refs, &self.logical_ino(disk_address)?)
+        self.collect(
+            disk_address,
+            item.disk_bytes,
+            &self.logical_ino(disk_address)?,
+        )
     }
 
-    /// Every reference to one extent, given the references to it one file
-    /// holds (`local`) and every file extent item that points into it, by
-    /// subvolume and inode. `None` if any of those is in another subvolume, or
-    /// the two do not add up.
-    fn collect(
-        &self,
-        local: Vec<ExtentRef>,
-        data_refs: &[DataRef],
-    ) -> io::Result<Option<Vec<ExtentRef>>> {
-        if data_refs.iter().any(|r| r.root != self.root_id) {
-            return Ok(None);
-        }
+    /// The extent at `extent.disk_address` again, resolved afresh by the
+    /// kernel's backreference walk, for acting on.
+    ///
+    /// The walk read the extent from the extent tree, which lags behind: the
+    /// references a rewrite moves are queued, and reach the extent tree only
+    /// when the transaction commits. A rewrite of one extent can by then have
+    /// changed who holds another the walk has already read, most of all where
+    /// a snapshot shares the leaf both are in. The backreference walk takes
+    /// what is queued into account.
+    pub fn reresolve(&self, extent: &Extent) -> io::Result<Extent> {
+        let data_refs = self.logical_ino(extent.disk_address)?;
+        let refs = self.collect(extent.disk_address, extent.disk_bytes, &data_refs)?;
+        Ok(Extent::from_refs(refs))
+    }
 
-        let first = &local[0];
-        let (inode, disk_address, uncompressed_bytes) =
-            (first.inode, first.disk_address, first.uncompressed_bytes);
-        // This file's own references are all in hand already. If they are not
-        // all there is to this file, it changed since it was read: leave the
-        // extent for now rather than act on half a picture.
-        let own: u64 = data_refs
-            .iter()
-            .filter(|r| r.inode == inode)
-            .map(|r| r.count)
-            .sum();
-        if own != local.len() as u64 {
-            return Ok(None);
-        }
-
-        // Any other file's are read from the stretch of that file which can
-        // hold them.
-        let mut refs = local;
-        let mut files: Vec<(u64, Rc<PathBuf>, bool)> = Vec::new();
-        for data_ref in data_refs.iter().filter(|r| r.inode != inode) {
-            let (path, nocow) = match files.iter().find(|(inode, ..)| *inode == data_ref.inode) {
-                Some((_, path, nocow)) => (Rc::clone(path), *nocow),
-                None => {
-                    let Some(path) = self.resolve_path(data_ref.inode)? else {
-                        return Ok(None);
-                    };
-                    let path = Rc::new(path);
-                    let nocow = is_nocow(&File::open(&*path)?)?;
-                    files.push((data_ref.inode, Rc::clone(&path), nocow));
-                    (path, nocow)
-                }
-            };
-
-            let found = refs.len();
-            self.data_ref_extents(
-                data_ref,
-                disk_address,
-                uncompressed_bytes,
-                &path,
-                nocow,
-                &mut refs,
-            )?;
-            if (refs.len() - found) as u64 != data_ref.count {
-                return Ok(None);
+    /// Whether any of `refs` was read from a leaf another tree may share: one
+    /// no newer than its subvolume's last snapshot.
+    fn may_be_shared(&self, refs: &[ExtentRef]) -> io::Result<bool> {
+        for r in refs {
+            if r.leaf_generation <= self.last_snapshot(r.root)? {
+                return Ok(true);
             }
         }
-        Ok(Some(refs))
+        Ok(false)
+    }
+
+    /// Every file extent item pointing into the extent at `disk_address`, read
+    /// from the stretch of each file `data_refs` says holds them. Fails if what
+    /// is there does not add up to what they said, which means the extent
+    /// changed since they were read.
+    fn collect(
+        &self,
+        disk_address: u64,
+        disk_bytes: u64,
+        data_refs: &[DataRef],
+    ) -> io::Result<Vec<ExtentRef>> {
+        let mut refs = Vec::new();
+        for data_ref in data_refs {
+            let found = refs.len();
+            self.data_ref_extents(data_ref, disk_address, disk_bytes, &mut refs)?;
+            if (refs.len() - found) as u64 != data_ref.count {
+                return Err(io::Error::other("changed while it was being read"));
+            }
+        }
+        if refs.is_empty() {
+            return Err(io::Error::other("no longer referenced"));
+        }
+        Ok(refs)
     }
 
     /// The file extent items one [`DataRef`] stands for, searched for in only
@@ -541,25 +666,26 @@ impl Filesystem {
         &self,
         data_ref: &DataRef,
         disk_address: u64,
-        uncompressed_bytes: u64,
-        path: &Rc<PathBuf>,
-        nocow: bool,
+        disk_bytes: u64,
         refs: &mut Vec<ExtentRef>,
     ) -> io::Result<()> {
         let (start, last) = match data_ref.at {
             // Each item sits at the base plus its own offset into the extent,
-            // which is less than the extent's uncompressed length. The base
-            // wraps for an item placed earlier in its file than it sits in the
-            // extent, and the stretch then starts at the beginning of the file.
+            // which is less than the extent's uncompressed length: its length
+            // on disk, unless it is compressed, and then no more than btrfs
+            // compresses at once. The base wraps for an item placed earlier in
+            // its file than it sits in the extent, and the stretch then starts
+            // at the beginning of the file.
             RefOffsets::Base(base) => {
-                let last = base.wrapping_add(uncompressed_bytes.saturating_sub(1));
+                let uncompressed = disk_bytes.max(MAX_COMPRESSED_BYTES);
+                let last = base.wrapping_add(uncompressed - 1);
                 (if last >= base { base } else { 0 }, last)
             }
             RefOffsets::Between(first, last) => (first, last),
         };
 
         let mut args = self.searchargs.borrow_mut();
-        args.key.tree_id = self.root_id;
+        args.key.tree_id = data_ref.root;
         args.set_range(
             (data_ref.inode, BTRFS_EXTENT_DATA_KEY, start),
             (data_ref.inode, BTRFS_EXTENT_DATA_KEY, last),
@@ -568,38 +694,43 @@ impl Filesystem {
         search_extent_refs(
             &mut args,
             self.file.as_raw_fd(),
+            data_ref.root,
             data_ref.inode,
-            path,
-            nocow,
             |r| {
                 let belongs = match data_ref.at {
                     RefOffsets::Base(base) => r.file_offset.wrapping_sub(r.extent_offset) == base,
                     RefOffsets::Between(..) => true,
                 };
-                if r.disk_address == disk_address && belongs {
+                if r.disk_address == disk_address && r.disk_bytes == disk_bytes && belongs {
                     refs.push(r);
                 }
             },
         )
     }
 
-    /// The generation in which this subvolume was last snapshotted, or was
-    /// last made from a snapshot, from its root item. A tree block no newer than
-    /// this may be shared with another tree; one written since cannot be.
-    fn last_snapshot(&self) -> io::Result<u64> {
+    /// The generation in which subvolume `root` was last snapshotted, or was
+    /// last made from a snapshot, from its root item. A tree block no newer
+    /// than this may be shared with another tree; one written since cannot be.
+    fn last_snapshot(&self, root: u64) -> io::Result<u64> {
+        if let Some(&generation) = self.last_snapshots.borrow().get(&root) {
+            return Ok(generation);
+        }
         const AT: usize = std::mem::offset_of!(btrfs_root_item, last_snapshot);
         let mut args = self.searchargs.borrow_mut();
         args.key.tree_id = BTRFS_ROOT_TREE_OBJECTID as u64;
         args.set_range(
-            (self.root_id, BTRFS_ROOT_ITEM_KEY, 0),
-            (self.root_id, BTRFS_ROOT_ITEM_KEY, u64::MAX),
+            (root, BTRFS_ROOT_ITEM_KEY, 0),
+            (root, BTRFS_ROOT_ITEM_KEY, u64::MAX),
         );
         let mut found = None;
         args.search_all(self.file.as_raw_fd(), |_, item| {
             found = read_struct::<u64>(item, AT);
             Ok(())
         })?;
-        found.ok_or_else(|| io::Error::other("the subvolume has no root item to read"))
+        let generation =
+            found.ok_or_else(|| io::Error::other(format!("subvolume {root} has no root item")))?;
+        self.last_snapshots.borrow_mut().insert(root, generation);
+        Ok(generation)
     }
 
     /// Every file extent item referencing the extent at `disk_address`, found
@@ -608,8 +739,13 @@ impl Filesystem {
     /// tree gives when it names the files itself.
     fn logical_ino(&self, disk_address: u64) -> io::Result<Vec<DataRef>> {
         let mut buf = self.logicalino.borrow_mut();
+        // Every lookup starts small, however large an earlier one grew the
+        // buffer: the kernel zeroes and copies as much as it is told it has.
+        let mut size = LOGICAL_INO_START_SIZE;
         loop {
-            let size = buf.len() * size_of::<u64>();
+            if buf.len() * size_of::<u64>() < size {
+                buf.resize(size.div_ceil(size_of::<u64>()), 0);
+            }
             let mut args = btrfs_ioctl_logical_ino_args {
                 logical: disk_address,
                 size: size as u64,
@@ -636,13 +772,12 @@ impl Filesystem {
             // `elem_missed`, each pair little-endian in one `u64`.
             let bytes_missing = (buf[0] >> 32) as usize;
             if bytes_missing > 0 {
-                let wanted = size + bytes_missing;
-                if wanted > LOGICAL_INO_MAX_SIZE {
+                size += bytes_missing;
+                if size > LOGICAL_INO_MAX_SIZE {
                     return Err(io::Error::other(
                         "extent has more backreferences than fit in one lookup",
                     ));
                 }
-                buf.resize(wanted.div_ceil(size_of::<u64>()), 0);
                 continue;
             }
 
@@ -683,15 +818,82 @@ impl Filesystem {
         }
     }
 
-    /// The absolute path of inode `inum` in this filesystem's own subvolume, or
-    /// `None` if that subvolume's root was never found, or `inum` has no name
-    /// any more (an orphan, unlinked but still open elsewhere).
+    /// The subvolume with tree id `root`, or `None` if there is no path to it.
+    fn subvolume(&self, root: u64) -> io::Result<Option<Rc<Subvolume>>> {
+        if let Some(known) = self.subvolumes.borrow().get(&root) {
+            return Ok(known.clone());
+        }
+        let found = self.find_subvolume(root)?.map(Rc::new);
+        self.subvolumes.borrow_mut().insert(root, found.clone());
+        Ok(found)
+    }
+
+    /// Finds the path to subvolume `root` the way `btrfs subvolume list` does:
+    /// its root backreference names the subvolume it sits in, the directory
+    /// there, and its own name in that directory. `None` for a subvolume with
+    /// no backreference, which is one being deleted, or one whose path leads
+    /// somewhere else, such as a mount on top of it.
+    fn find_subvolume(&self, root: u64) -> io::Result<Option<Subvolume>> {
+        let path = if root == BTRFS_FS_TREE_OBJECTID as u64 {
+            self.mount.clone()
+        } else {
+            let Some((parent, dirid, name)) = self.root_backref(root)? else {
+                return Ok(None);
+            };
+            let Some(parent_subvolume) = self.subvolume(parent)? else {
+                return Ok(None);
+            };
+            let dir = ino_lookup(self.file.as_raw_fd(), parent, dirid)?;
+            parent_subvolume.path.join(dir).join(name)
+        };
+
+        if open_subvolume(&path, root)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Subvolume { path }))
+    }
+
+    /// Where subvolume `root` sits: the subvolume holding it, the directory
+    /// there, and its name in that directory.
+    fn root_backref(&self, root: u64) -> io::Result<Option<(u64, u64, PathBuf)>> {
+        let mut args = self.searchargs.borrow_mut();
+        args.key.tree_id = BTRFS_ROOT_TREE_OBJECTID as u64;
+        args.set_range(
+            (root, BTRFS_ROOT_BACKREF_KEY, 0),
+            (root, BTRFS_ROOT_BACKREF_KEY, u64::MAX),
+        );
+        let mut found = None;
+        args.search_all(self.file.as_raw_fd(), |header, item| {
+            if found.is_none()
+                && let Some(r) = read_struct::<btrfs_root_ref>(item, 0)
+                && let Some(name) = item
+                    .get(size_of::<btrfs_root_ref>()..)
+                    .and_then(|rest| rest.get(..r.name_len as usize))
+            {
+                // The key's offset is the subvolume holding this one.
+                found = Some((
+                    header.offset,
+                    r.dirid,
+                    PathBuf::from(OsStr::from_bytes(name)),
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    /// The absolute path of inode `inode` in subvolume `root`, or `None` if the
+    /// subvolume cannot be reached, or `inode` has no name any more (an orphan,
+    /// unlinked but still open elsewhere).
     ///
     /// An inode can have more than one name — hardlinks — in which case this
     /// takes the first the kernel returns. Any of them opens the same data,
     /// which is all a rewrite needs.
-    fn resolve_path(&self, inum: u64) -> io::Result<Option<PathBuf>> {
-        let Some(subvol_root) = &self.subvol_root else {
+    pub fn inode_path(&self, root: u64, inode: u64) -> io::Result<Option<PathBuf>> {
+        let Some(subvolume) = self.subvolume(root)? else {
+            return Ok(None);
+        };
+        let Some(subvolume_root) = subvolume.open(root)? else {
             return Ok(None);
         };
         let mut buf = Box::new(InoPathBuf {
@@ -702,14 +904,16 @@ impl Filesystem {
             data: [0; INO_PATH_DATA_SIZE],
         });
         let mut args = btrfs_ioctl_ino_path_args {
-            inum,
+            inum: inode,
             size: size_of::<InoPathBuf>() as u64,
             reserved: [0; 4],
             fspath: (&raw mut *buf).cast::<c_void>() as u64,
         };
+        // The kernel looks `inum` up in the subvolume of the descriptor it is
+        // asked through.
         let rc = unsafe {
             ioctl(
-                self.file.as_raw_fd(),
+                subvolume_root.as_raw_fd(),
                 BTRFS_IOC_INO_PATHS as c_ulong,
                 (&raw mut args).cast(),
             )
@@ -728,102 +932,75 @@ impl Filesystem {
             .data
             .get(offset..)
             .ok_or_else(|| io::Error::other("path offset runs past its buffer"))?;
-        Ok(Some(subvol_root.join(cstr_bytes(name))))
+        Ok(Some(subvolume.path.join(cstr_bytes(name))))
     }
 }
 
-/// One extent of a file, as [`Filesystem::resolve_extents`] resolves it.
+/// One extent, as [`ExtentWalk`] resolves it.
 pub enum Resolved {
     /// The extent, with every reference to it, wherever on the filesystem.
     Extent(Extent),
-    /// Nothing safe can be said about the extent at this address: it was freed
-    /// while we scanned, at least one reference belongs to an inode we cannot
-    /// resolve to a path on this handle (most often a snapshot's, in a
-    /// different subvolume tree than the one opened), or looking it up failed
-    /// with `error`.
-    LeftAlone {
-        disk_address: u64,
-        error: Option<io::Error>,
-    },
+    /// Nothing safe can be said about the extent at this address, for the
+    /// reason `error` gives: it changed while it was being read, or looking it
+    /// up failed.
+    LeftAlone { disk_address: u64, error: io::Error },
 }
 
-/// The extents of one file, resolved a stretch of addresses at a time as they
-/// are asked for. See [`Filesystem::resolve_extents`].
+/// Every data extent on the filesystem, in address order, read from the
+/// extent tree a batch at a time as they are asked for.
+///
+/// Each extent is met once, however many files and snapshots reference it,
+/// and is handed over with every one of those references. Nothing is kept
+/// about it afterwards. An extent can be dealt with, rewritten even, before
+/// the next is read.
+///
+/// The walk runs over a tree that changes under it, our own rewrites
+/// included. It resumes from an address rather than a place in the tree, so
+/// extents freed or allocated behind it make no difference. Extents allocated
+/// ahead of it after it started, our own copies among them, are passed over:
+/// they are fully referenced when they are made, and counting them would count
+/// the same data twice.
 ///
 /// An `Err` is a search over the extent tree that failed outright. It ends the
-/// file: the extents handed over before it stand.
-pub struct Resolver {
+/// walk.
+pub struct ExtentWalk {
     fs: Rc<Filesystem>,
-    /// The file's references not looked up yet, one group per extent, in
-    /// address order.
-    groups: Peekable<vec::IntoIter<Vec<ExtentRef>>>,
-    /// The stretch looked up last, with what the extent tree says about each
-    /// extent in it, less the extents already handed over.
-    window: vec::IntoIter<(Vec<ExtentRef>, Backrefs)>,
-    /// The subvolume's last snapshot, as it stood when that stretch was looked
-    /// up: read again for every stretch, so one taken mid-run is not missed.
-    last_snapshot: u64,
+    /// The address the next batch starts from, or `None` once the extent tree
+    /// is read to its end.
+    next: Option<u64>,
+    /// Extents allocated after this generation are passed over.
+    generation: u64,
+    /// The batch read last, less the extents already handed over.
+    batch: vec::IntoIter<Unresolved>,
 }
 
-impl Resolver {
-    /// The next extents close enough together on disk to look up with one
-    /// search, or nothing once every extent is.
-    fn next_window(&mut self) -> Option<Vec<Vec<ExtentRef>>> {
-        let mut window = vec![self.groups.next()?];
-        while let Some(next) = self.groups.peek()
-            && window.len() < MAX_WINDOW_EXTENTS
-        {
-            let last = &window[window.len() - 1][0];
-            let end = last.disk_address.saturating_add(last.disk_bytes);
-            if next[0].disk_address > end.saturating_add(MAX_WINDOW_GAP) {
-                break;
-            }
-            window.extend(self.groups.next());
-        }
-        Some(window)
-    }
-}
-
-impl Iterator for Resolver {
+impl Iterator for ExtentWalk {
     type Item = io::Result<Resolved>;
 
     fn next(&mut self) -> Option<io::Result<Resolved>> {
         loop {
-            if let Some((group, backrefs)) = self.window.next() {
-                let disk_address = group[0].disk_address;
-                return Some(Ok(
-                    match self.fs.resolve(group, backrefs, self.last_snapshot) {
-                        Ok(Some(refs)) => Resolved::Extent(Extent::from_refs(refs)),
-                        Ok(None) => Resolved::LeftAlone {
-                            disk_address,
-                            error: None,
-                        },
-                        Err(error) => Resolved::LeftAlone {
-                            disk_address,
-                            error: Some(error),
-                        },
+            if let Some(Unresolved {
+                disk_address,
+                item,
+                backrefs,
+            }) = self.batch.next()
+            {
+                return Some(Ok(match self.fs.resolve(disk_address, &item, backrefs) {
+                    Ok(refs) => Resolved::Extent(Extent::from_refs(refs)),
+                    Err(error) => Resolved::LeftAlone {
+                        disk_address,
+                        error,
                     },
-                ));
+                }));
             }
 
-            let window = self.next_window()?;
-            let looked_up = self.fs.last_snapshot().and_then(|last_snapshot| {
-                self.fs
-                    .backrefs(&window)
-                    .map(|backrefs| (last_snapshot, backrefs))
-            });
-            match looked_up {
-                Ok((last_snapshot, backrefs)) => {
-                    self.last_snapshot = last_snapshot;
-                    self.window = window
-                        .into_iter()
-                        .zip(backrefs)
-                        .collect::<Vec<_>>()
-                        .into_iter();
+            match self.fs.extent_batch(self.next?, self.generation) {
+                Ok((batch, next)) => {
+                    self.batch = batch.into_iter();
+                    self.next = next;
                 }
                 Err(e) => {
-                    // Nothing more is looked up for this file.
-                    self.groups = Vec::new().into_iter().peekable();
+                    self.next = None;
                     return Some(Err(e));
                 }
             }
@@ -831,35 +1008,46 @@ impl Iterator for Resolver {
     }
 }
 
-/// The subvolume tree id `fd` itself belongs to.
-fn own_root_id(fd: c_int) -> io::Result<u64> {
+/// Looks `objectid` up in subvolume `treeid`, or in the subvolume `fd` is in if
+/// `treeid` is zero. The kernel fills in the tree id it looked in, and the path
+/// of `objectid` from that subvolume's root.
+fn ino_lookup(fd: c_int, treeid: u64, objectid: u64) -> io::Result<PathBuf> {
+    ino_lookup_args(fd, treeid, objectid).map(|args| {
+        let name: Vec<u8> = args.name.iter().map(|&c| c as u8).collect();
+        PathBuf::from(cstr_bytes(&name))
+    })
+}
+
+fn ino_lookup_args(
+    fd: c_int,
+    treeid: u64,
+    objectid: u64,
+) -> io::Result<btrfs_ioctl_ino_lookup_args> {
     let mut args: btrfs_ioctl_ino_lookup_args = unsafe { std::mem::zeroed() };
-    args.treeid = 0; // the tree `fd` lives in
-    args.objectid = BTRFS_FIRST_FREE_OBJECTID as u64;
+    args.treeid = treeid;
+    args.objectid = objectid;
     let rc = unsafe { ioctl(fd, BTRFS_IOC_INO_LOOKUP as c_ulong, (&raw mut args).cast()) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    // The kernel fills in the tree id it resolved `treeid: 0` to.
-    Ok(args.treeid)
+    Ok(args)
 }
 
-/// The absolute path of the subvolume root `path` lives under, found by
-/// walking up from it until an ancestor's inode number is the one every btrfs
-/// subvolume root has. `None` if that walk runs off the filesystem (`dev`
-/// changes) or off the directory tree first.
-fn find_subvol_root(path: &Path, dev: u64) -> Option<PathBuf> {
-    let path = path.canonicalize().ok()?;
-    for ancestor in path.ancestors() {
-        let meta = std::fs::metadata(ancestor).ok()?;
-        if meta.dev() != dev {
-            return None;
-        }
-        if meta.ino() == BTRFS_FIRST_FREE_OBJECTID as u64 {
-            return Some(ancestor.to_path_buf());
-        }
+/// The subvolume tree id `fd` itself belongs to.
+fn own_root_id(fd: c_int) -> io::Result<u64> {
+    Ok(ino_lookup_args(fd, 0, BTRFS_FIRST_FREE_OBJECTID as u64)?.treeid)
+}
+
+/// Opens the file at `path` read-only, making sure it is still inode `inode` of
+/// subvolume `root`. A path is only ever a way to reach an inode: one renamed
+/// or replaced since it was found, or hidden under another mount, leads
+/// somewhere else.
+pub fn open_inode(path: &Path, root: u64, inode: u64) -> io::Result<File> {
+    let file = File::open(path)?;
+    if file.metadata()?.ino() != inode || own_root_id(file.as_raw_fd())? != root {
+        return Err(io::Error::other("no longer the file the extent tree names"));
     }
-    None
+    Ok(file)
 }
 
 /// Reads a NUL-terminated string out of `bytes`, or all of it if there is no
@@ -870,7 +1058,7 @@ fn cstr_bytes(bytes: &[u8]) -> &OsStr {
 }
 
 /// `struct btrfs_data_container` with its trailing `val` array given a fixed
-/// size, holding the layout [`Filesystem::resolve_path`] gives the kernel to
+/// size, holding the layout [`Filesystem::inode_path`] gives the kernel to
 /// fill in: a table of byte offsets (relative to the start of this same
 /// array) to the NUL-terminated paths the offsets point at.
 #[repr(C)]
@@ -893,14 +1081,9 @@ const LOGICAL_INO_START_SIZE: usize = 4096;
 /// The most `BTRFS_IOC_LOGICAL_INO_V2` will fill, header included.
 const LOGICAL_INO_MAX_SIZE: usize = 16 * 1024 * 1024;
 
-/// Extents further apart on disk than this are looked up with searches of
-/// their own. Whatever lies between two extents in one search is read and
-/// passed over, and this bounds it to a few hundred other extents' items.
-const MAX_WINDOW_GAP: u64 = 1024 * 1024;
-
-/// The most extents looked up with one search over the extent tree, which
-/// bounds what is kept about them until each is handed over.
-const MAX_WINDOW_EXTENTS: usize = 4096;
+/// The most data btrfs compresses into one extent, and so the most any
+/// compressed extent holds uncompressed.
+const MAX_COMPRESSED_BYTES: u64 = 128 * 1024;
 
 /// Reads a `T` out of `buf` at `off`, or `None` if `buf` is too short to hold
 /// one there. The bytes need not be aligned. Items shorter than the struct we
@@ -913,44 +1096,14 @@ fn read_struct<T: Copy>(buf: &[u8], off: usize) -> Option<T> {
     Some(unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<T>()) })
 }
 
-/// Every extent reference held by the file at `path`. Holes and inline extents
-/// are left out; they occupy no extent of their own.
-///
-/// Requires `CAP_SYS_ADMIN` — the search ioctl is root-only.
-pub fn file_extents(path: &Path) -> io::Result<Vec<ExtentRef>> {
-    let file = File::open(path)?;
-    let path = Rc::new(path.to_path_buf());
-    let ino = file.metadata()?.ino();
-    let nocow = is_nocow(&file)?;
-
-    thread_local! {
-        /// One search buffer for every file read, rather than one allocated
-        /// for each of them.
-        static ARGS: RefCell<Box<SearchArgs>> = RefCell::new(SearchArgs::new(0));
-    }
-
-    let mut extents = Vec::new();
-    ARGS.with_borrow_mut(|args| {
-        args.key.tree_id = 0; // the tree the fd lives in
-        args.set_range(
-            (ino, BTRFS_EXTENT_DATA_KEY, 0),
-            (ino, BTRFS_EXTENT_DATA_KEY, u64::MAX),
-        );
-        search_extent_refs(args, file.as_raw_fd(), ino, &path, nocow, |r| {
-            extents.push(r)
-        })
-    })?;
-    Ok(extents)
-}
-
-/// Runs a search over file extent items of inode `inode`, handing each
-/// reference to an extent to `each`. Holes and inline extents are left out.
+/// Runs a search over file extent items of inode `inode` in subvolume `root`,
+/// handing each reference to an extent to `each`. Holes and inline extents are
+/// left out; they occupy no extent of their own.
 fn search_extent_refs(
     args: &mut SearchArgs,
     fd: c_int,
+    root: u64,
     inode: u64,
-    path: &Rc<PathBuf>,
-    nocow: bool,
     mut each: impl FnMut(ExtentRef),
 ) -> io::Result<()> {
     args.search_all(fd, |header, item| {
@@ -966,7 +1119,7 @@ fn search_extent_refs(
             return Ok(()); // hole
         }
         each(ExtentRef {
-            path: Rc::clone(path),
+            root,
             inode,
             file_offset: header.offset,
             disk_address: fe.disk_bytenr,
@@ -974,7 +1127,6 @@ fn search_extent_refs(
             uncompressed_bytes: fe.ram_bytes,
             extent_offset: fe.offset,
             num_bytes: fe.num_bytes,
-            nocow,
             // The search reports the generation of the leaf each item is in.
             leaf_generation: header.transid,
         });
@@ -997,24 +1149,43 @@ const _: () = assert!(
         == size_of::<file_dedupe_range>() + size_of::<file_dedupe_range_info>()
 );
 
-/// An unnamed file in `dir`, for holding a copy while one file is rewritten.
+/// An unnamed file in `dir`, for holding a copy while files are rewritten.
 /// It has no link from the moment it exists, so the kernel frees it when the
 /// last descriptor closes however the process ends, a kill included: there is
 /// no window in which a crash could strand it.
 ///
 /// `dir` itself is not modified. No directory entry is ever made, so not even
 /// its mtime moves.
+///
+/// The file takes its attributes from `dir`, nodatacow included, and btrfs
+/// refuses to dedupe between two inodes that disagree about checksums. The
+/// flag can still be cleared while the file is empty, so it is.
 pub fn temp_file(dir: &Path) -> io::Result<File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(O_TMPFILE as i32)
-        .open(dir)
+        .open(dir)?;
+    let flags = get_flags(&file)?;
+    if flags & FS_NOCOW_FL != 0 {
+        set_flags(&file, flags & !FS_NOCOW_FL)?;
+        if is_nocow(&file)? {
+            return Err(io::Error::other(
+                "the temporary file keeps nodatacow from its directory",
+            ));
+        }
+    }
+    Ok(file)
 }
 
 /// Whether the file is marked nodatacow, in which case rewriting it neither
 /// helps nor is safe to dedupe.
 pub fn is_nocow(file: &File) -> io::Result<bool> {
+    Ok(get_flags(file)? & FS_NOCOW_FL != 0)
+}
+
+/// The file's inode flags, as `lsattr` shows them.
+fn get_flags(file: &File) -> io::Result<u32> {
     let mut flags: c_int = 0;
     let rc = unsafe {
         ioctl(
@@ -1026,7 +1197,23 @@ pub fn is_nocow(file: &File) -> io::Result<bool> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(flags as u32 & FS_NOCOW_FL != 0)
+    Ok(flags as u32)
+}
+
+/// Sets the file's inode flags, as `chattr` does.
+fn set_flags(file: &File, flags: u32) -> io::Result<()> {
+    let mut flags = flags as c_int;
+    let rc = unsafe {
+        ioctl(
+            file.as_raw_fd(),
+            FS_IOC_SETFLAGS as c_ulong,
+            (&raw mut flags).cast(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Points `dest` at `src`'s extents for a range the two already hold identical

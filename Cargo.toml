@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 linux-raw-sys = { version = "0.12.1", default-features = false, features = ["btrfs", "ioctl", "general", "std"] }
+
+[dev-dependencies]
+# The end to end suite checksums every file before and after a run.
 sha2 = "0.11.0"
 
 # The end to end suite needs root, for the search ioctl as much as for the mkfs

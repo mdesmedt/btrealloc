@@ -4,18 +4,18 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use sha2::{Digest, Sha256};
-
 use crate::Options;
-use crate::extent::{Extent, ExtentRef, Holder};
-use crate::format::{hex, human};
+use crate::extent::{Extent, ExtentRef, Holder, LeftAlone};
+use crate::format::human;
 use crate::kernel::{self, Filesystem};
 
 /// Processes extents one at a time, as the scan hands them over, and keeps
 /// the account of what it did.
 ///
-/// `fs` is here for its sector size: a holder ending mid-sector needs
-/// [`redirect_tail`], and where that boundary falls is the filesystem's to say.
+/// `fs` is here to find each holder's path, for its sector size (a holder
+/// ending mid-sector needs [`redirect_tail`], and where that boundary falls is
+/// the filesystem's to say), and for the mount the temporary copies are made
+/// in.
 pub struct Runner {
     options: Options,
     fs: Rc<Filesystem>,
@@ -23,41 +23,49 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(options: Options, fs: Rc<Filesystem>) -> Runner {
+    pub fn new(options: Options, fs: &Rc<Filesystem>) -> Runner {
         if options.apply {
             println!("rewriting extents as they are found");
-            if options.verify {
-                println!("verifying: every file is hashed before and after it is rewritten");
-            }
         } else {
             println!("dry run: nothing will be written");
         }
         Runner {
             options,
-            fs,
+            fs: Rc::clone(fs),
             report: Report::default(),
         }
     }
 
     /// Reallocates one extent, or on a dry run says what doing so would do.
-    pub fn process(&mut self, extent: &Extent) {
+    /// Returns why it was left alone, if it was.
+    pub fn process(&mut self, extent: &Extent) -> Option<LeftAlone> {
         let (options, report) = (&self.options, &mut self.report);
-        let holders = extent.holders();
+        let holders = match locate(extent, &self.fs) {
+            Ok(Some(holders)) => holders,
+            // A nodatacow file is overwritten in place and cannot be deduped,
+            // so an extent one of them holds is never ours to rewrite.
+            Ok(None) => {
+                if options.verbose {
+                    println!(
+                        "extent {:#x}: held by a nodatacow file, leaving it alone",
+                        extent.disk_address
+                    );
+                }
+                return Some(LeftAlone::NoDataCow);
+            }
+            Err(failure) => {
+                report.failed(failure);
+                return Some(LeftAlone::Failed);
+            }
+        };
+
         if options.apply {
             // Reallocate the extent for real
-            let result = realloc_extent(extent, &holders, options, self.fs.as_ref());
-            // Check for failure
+            let result = realloc_extent(extent, &holders, self.fs.as_ref());
+            // Check for failure, and move on to the next extent if it failed
             if let Err(failure) = result {
-                // Print errors and move to the next extent
-                let entry = (failure.path.to_path_buf(), failure.error.to_string());
-                if failure.error.kind() == io::ErrorKind::InvalidData {
-                    eprintln!("CORRUPTED {}: {}", failure.path.display(), failure.error);
-                    report.corrupted.push(entry);
-                } else {
-                    eprintln!("skipped {}: {}", failure.path.display(), failure.error);
-                    report.skipped.push(entry);
-                }
-                return;
+                report.failed(failure);
+                return Some(LeftAlone::Failed);
             }
         }
 
@@ -74,7 +82,7 @@ impl Runner {
                 human(extent.disk_bytes),
             );
             for holder in &holders {
-                for r in &holder.refs {
+                for r in &holder.holder.refs {
                     println!(
                         "    {} at offset {} in {}",
                         human(r.num_bytes),
@@ -84,6 +92,7 @@ impl Runner {
                 }
             }
         }
+        None
     }
 
     /// Prints the summary of the whole run and returns its account.
@@ -107,37 +116,83 @@ impl Runner {
         if !report.skipped.is_empty() {
             println!("{} extents could not be rewritten", report.skipped.len());
         }
-        if !report.corrupted.is_empty() {
+        if !report.modified.is_empty() {
             println!(
-                "{} files no longer hold the contents they did",
-                report.corrupted.len()
+                "{} files were modified by something else while they were being rewritten",
+                report.modified.len()
             );
         }
         report
     }
 }
 
+/// A file holding the extent, and the path it was found at.
+struct Located<'a> {
+    path: PathBuf,
+    holder: Holder<'a>,
+}
+
+impl Located<'_> {
+    /// Opens the file, as long as it is still the one the extent tree names.
+    ///
+    /// Read-only is enough: the kernel lets CAP_SYS_ADMIN dedupe into a file it
+    /// has not opened for writing, a read-only snapshot's included. Opening for
+    /// writing would fail on a running executable, and tell inotify watchers
+    /// the file was written.
+    ///
+    /// Opened afresh wherever it is needed rather than held: a deduplicator can
+    /// spread one extent over thousands of files, and a descriptor held for
+    /// each of them is what runs into `RLIMIT_NOFILE`.
+    fn open(&self) -> Result<File, Failure> {
+        kernel::open_inode(&self.path, self.holder.root, self.holder.inode)
+            .map_err(|e| Failure::new(&self.path, e))
+    }
+}
+
+/// Finds a path to every file holding the extent. `None` if one of them is
+/// nodatacow.
+fn locate<'a>(extent: &'a Extent, fs: &Filesystem) -> Result<Option<Vec<Located<'a>>>, Failure> {
+    let mut located = Vec::new();
+    for holder in extent.holders() {
+        let path = match fs.inode_path(holder.root, holder.inode) {
+            Ok(Some(path)) => path,
+            Ok(None) => return Err(Failure::other(&unnamed(&holder), "no path leads to it")),
+            Err(e) => return Err(Failure::new(&unnamed(&holder), e)),
+        };
+        let holder = Located { path, holder };
+        let file = holder.open()?;
+        if kernel::is_nocow(&file).map_err(|e| Failure::new(&holder.path, e))? {
+            return Ok(None);
+        }
+        located.push(holder);
+    }
+    Ok(Some(located))
+}
+
+/// What a holder there is no path to is called instead.
+fn unnamed(holder: &Holder) -> PathBuf {
+    PathBuf::from(format!(
+        "<inode {} of subvolume {}>",
+        holder.inode, holder.root
+    ))
+}
+
 /// Copies an extent's live ranges into temporary files, then points the live ranges from
 /// every file holding that extent at the copy. No original inode is ever replaced. Each
 /// keeps its identity, owner, times and xattrs, and only its extent references change.
-fn realloc_extent(
-    extent: &Extent,
-    holders: &[Holder],
-    options: &Options,
-    fs: &Filesystem,
-) -> Result<(), Failure> {
-    let liveranges = read_liveranges(extent, fs)?;
+fn realloc_extent(extent: &Extent, holders: &[Located], fs: &Filesystem) -> Result<(), Failure> {
+    let liveranges = read_liveranges(extent, holders, fs)?;
 
     // What every holder looked like beforehand for checking after we reallocate.
     let before: Vec<HolderBefore> = holders
         .iter()
-        .map(|holder| HolderBefore::read(holder, options))
+        .map(HolderBefore::read)
         .collect::<Result<_, _>>()?;
 
     // Iterate over live ranges
     for liverange in &liveranges {
-        // Copy the live range into a temporary file, next to the first holder
-        let temp = stage(holders[0].path, liverange)?;
+        // Copy the live range into a temporary file
+        let temp = stage(&holders[0].path, liverange, fs)?;
         // Then point every holder at the newly allocated data
         for (holder, before) in holders.iter().zip(&before) {
             redirect_chunks(holder, &temp, liverange, before.filesize)?;
@@ -171,9 +226,16 @@ struct LiveRange {
 /// A stretch keeps its own copy rather than being packed in with the others:
 /// stretches held by different files have different lifetimes, and putting them
 /// in one extent would rebuild the part-dead extent this is meant to take apart.
-fn read_liveranges(extent: &Extent, fs: &Filesystem) -> Result<Vec<LiveRange>, Failure> {
-    let mut refs: Vec<&ExtentRef> = extent.refs.iter().collect();
-    refs.sort_unstable_by_key(|r| r.extent_offset);
+fn read_liveranges(
+    extent: &Extent,
+    holders: &[Located],
+    fs: &Filesystem,
+) -> Result<Vec<LiveRange>, Failure> {
+    let mut refs: Vec<(&ExtentRef, &Located)> = holders
+        .iter()
+        .flat_map(|holder| holder.holder.refs.iter().map(move |r| (*r, holder)))
+        .collect();
+    refs.sort_unstable_by_key(|(r, _)| r.extent_offset);
 
     let mut copies = Vec::new();
     for range in &extent.live_ranges {
@@ -191,15 +253,6 @@ fn read_liveranges(extent: &Extent, fs: &Filesystem) -> Result<Vec<LiveRange>, F
         }
     }
     Ok(copies)
-}
-
-/// The directory holding `path`, which is where its temporary copy goes.
-fn parent_dir(path: &Path) -> &Path {
-    match path.parent() {
-        // A path of one component has an empty parent, not a missing one.
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    }
 }
 
 fn copy_range(
@@ -220,73 +273,48 @@ fn copy_range(
     Ok(())
 }
 
-/// The SHA-256 of a file's contents, read through to the end.
-fn checksum(file: &File) -> io::Result<[u8; 32]> {
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut offset = 0u64;
-    loop {
-        let n = file.read_at(&mut buf, offset)?;
-        if n == 0 {
-            return Ok(hasher.finalize().into());
-        }
-        hasher.update(&buf[..n]);
-        offset += n as u64;
-    }
-}
-
 /// A rewrite that did not happen, and the file it is charged to.
 struct Failure {
-    path: Rc<PathBuf>,
+    path: PathBuf,
     error: io::Error,
 }
 
 impl Failure {
-    fn new(path: &Rc<PathBuf>, error: impl Into<io::Error>) -> Failure {
+    fn new(path: &Path, error: impl Into<io::Error>) -> Failure {
         Failure {
-            path: Rc::clone(path),
+            path: path.to_path_buf(),
             error: error.into(),
         }
     }
 
-    fn other(path: &Rc<PathBuf>, message: &str) -> Failure {
+    fn other(path: &Path, message: &str) -> Failure {
         Failure::new(path, io::Error::other(message))
     }
 
-    fn invalid(path: &Rc<PathBuf>, message: String) -> Failure {
+    /// The file was written to by something else while it was being rewritten.
+    fn modified(path: &Path, message: &str) -> Failure {
         Failure::new(path, io::Error::new(io::ErrorKind::InvalidData, message))
     }
 }
 
 /// What a holder held before anything moved, to check it against afterwards.
 struct HolderBefore {
-    checksum: Option<[u8; 32]>,
     filesize: u64,
     modified: std::time::SystemTime,
 }
 
 impl HolderBefore {
-    /// Reads a holder's contents and metadata, and refuses one a rewrite cannot
-    /// touch at all.
+    /// Reads a holder's metadata.
     ///
     /// Taken once for the whole extent rather than per stretch: the checks in
-    /// [`finish`] need something from before anything moved, and a stretch is
-    /// staged at a time, so there is no one place downstream that still sees the
-    /// file untouched.
-    fn read(holder: &Holder, options: &Options) -> Result<HolderBefore, Failure> {
-        let path = holder.path;
-        let file = File::open(&**path).map_err(|e| Failure::new(path, e))?;
-        if kernel::is_nocow(&file).map_err(|e| Failure::new(path, e))? {
-            return Err(Failure::other(path, "nodatacow"));
-        }
-        let checksum = if options.verify {
-            Some(checksum(&file).map_err(|e| Failure::new(path, e))?)
-        } else {
-            None
-        };
+    /// [`finish_holder`] need something from before anything moved, and a
+    /// stretch is staged at a time, so there is no one place downstream that
+    /// still sees the file untouched.
+    fn read(holder: &Located) -> Result<HolderBefore, Failure> {
+        let path = &holder.path;
+        let file = holder.open()?;
         let metadata = file.metadata().map_err(|e| Failure::new(path, e))?;
         Ok(HolderBefore {
-            checksum,
             filesize: metadata.len(),
             modified: metadata.modified().map_err(|e| Failure::new(path, e))?,
         })
@@ -296,18 +324,11 @@ impl HolderBefore {
 /// Writes one stretch out to a temporary of its own, ready to be deduped from
 /// and dropped again.
 ///
-/// The temporary inherits the directory's attributes, and btrfs refuses to
-/// dedupe between two inodes that disagree about checksums. A datacow file in a
-/// nodatacow directory is the one shape that reaches this, and it is worth
-/// naming rather than leaving as a bare EINVAL.
-fn stage(path: &Rc<PathBuf>, range: &LiveRange) -> Result<File, Failure> {
-    let temp = kernel::temp_file(parent_dir(path)).map_err(|e| Failure::new(path, e))?;
-    if kernel::is_nocow(&temp).map_err(|e| Failure::new(path, e))? {
-        return Err(Failure::other(
-            path,
-            "temporary file inherited nodatacow from its directory",
-        ));
-    }
+/// The temporary is made at the top of the mount, which is writable wherever
+/// the holders are: a read-only snapshot has no room for one. A failure is
+/// charged to `path`, the first holder.
+fn stage(path: &Path, range: &LiveRange, fs: &Filesystem) -> Result<File, Failure> {
+    let temp = kernel::temp_file(&fs.mount).map_err(|e| Failure::new(path, e))?;
     temp.write_all_at(&range.bytes, 0)
         .map_err(|e| Failure::new(path, e))?;
     Ok(temp)
@@ -316,17 +337,22 @@ fn stage(path: &Rc<PathBuf>, range: &LiveRange) -> Result<File, Failure> {
 /// Reads `[start, end)` of the extent into `buf`, taking each part from a file
 /// that holds it. Returns how far it got: a holder's last extent can run past
 /// the end of its data, so there may be less to read than the stretch claims.
-fn fill(refs: &[&ExtentRef], start: u64, end: u64, buf: &mut [u8]) -> Result<u64, Failure> {
+fn fill(
+    refs: &[(&ExtentRef, &Located)],
+    start: u64,
+    end: u64,
+    buf: &mut [u8],
+) -> Result<u64, Failure> {
     let mut at = start;
-    for r in refs {
+    for (r, holder) in refs {
         if at >= end {
             break;
         }
         if r.extent_offset > at || r.extent_offset + r.num_bytes <= at {
             continue;
         }
-        let path = &r.path;
-        let file = File::open(path.as_path()).map_err(|e| Failure::new(path, e))?;
+        let path = &holder.path;
+        let file = holder.open()?;
         let size = file.metadata().map_err(|e| Failure::new(path, e))?.len();
         let file_offset = r.file_offset + (at - r.extent_offset);
         let to = end
@@ -357,14 +383,14 @@ fn fill(refs: &[&ExtentRef], start: u64, end: u64, buf: &mut [u8]) -> Result<u64
 /// partial sector only if they end at the same offset, which is not something a
 /// rewrite gets to arrange.
 fn redirect_tail(
-    path: &Rc<PathBuf>,
+    path: &Path,
     file: &File,
     from: u64,
     size: u64,
     fs: &Filesystem,
 ) -> Result<(), Failure> {
     let len = size - from;
-    let temp = kernel::temp_file(parent_dir(path)).map_err(|e| Failure::new(path, e))?;
+    let temp = kernel::temp_file(&fs.mount).map_err(|e| Failure::new(path, e))?;
     // The tail sits a sector into the temporary, with a hole before it, rather
     // than at its start.
     //
@@ -401,18 +427,15 @@ fn redirect_tail(
 /// than holding it: the whole point of staging one stretch at a time is that
 /// nothing accumulates descriptors.
 fn redirect_chunks(
-    holder: &Holder,
+    holder: &Located,
     temp: &File,
     liverange: &LiveRange,
     size: u64,
 ) -> Result<(), Failure> {
-    let path = holder.path;
-    // Read-only is enough: the kernel lets CAP_SYS_ADMIN dedupe into a file it
-    // has not opened for writing. Opening for writing would fail on a running
-    // executable, and tell inotify watchers the file was written.
-    let file = File::open(&**path).map_err(|e| Failure::new(path, e))?;
+    let path = &holder.path;
+    let file = holder.open()?;
 
-    for r in &holder.refs {
+    for r in &holder.holder.refs {
         // Clamp the end of the byte range to the file size. The final reference
         // can extend past it.
         let end = (r.file_offset + r.num_bytes).min(size);
@@ -448,16 +471,17 @@ fn redirect_chunks(
     Ok(())
 }
 
-/// Processes each holder of an extent, performing any checks requested and
-/// optionally processing the final sector of the file with [`redirect_tail`].
-fn finish_holder(holder: &Holder, before: &HolderBefore, fs: &Filesystem) -> Result<(), Failure> {
-    let path = holder.path;
-    // Read-only, as in [`redirect_chunks`].
-    let file = File::open(&**path).map_err(|e| Failure::new(path, e))?;
+/// Processes each holder of an extent, checking its size and mtime did not
+/// change and optionally processing the final sector of the file with
+/// [`redirect_tail`].
+fn finish_holder(holder: &Located, before: &HolderBefore, fs: &Filesystem) -> Result<(), Failure> {
+    let path = &holder.path;
+    let file = holder.open()?;
 
     // Check if this extent overlaps the last sector of the file, and if so, redirect it to a copy of that sector.
     let tail_start = before.filesize / fs.sectorsize * fs.sectorsize;
     let holds_tail = holder
+        .holder
         .refs
         .iter()
         .any(|r| r.file_offset <= tail_start && tail_start < r.file_offset + r.num_bytes);
@@ -468,34 +492,16 @@ fn finish_holder(holder: &Holder, before: &HolderBefore, fs: &Filesystem) -> Res
     // Check the metadata hasn't changed
     let metadata_after = file.metadata().map_err(|e| Failure::new(path, e))?;
     if before.filesize != metadata_after.size() {
-        return Err(Failure::invalid(
-            path,
-            "size changed during rewrite".to_string(),
-        ));
+        return Err(Failure::modified(path, "size changed during rewrite"));
     }
     let after_time = metadata_after
         .modified()
         .map_err(|e| Failure::new(path, e))?;
     if before.modified != after_time {
-        return Err(Failure::invalid(
+        return Err(Failure::modified(
             path,
-            "modified time changed during rewrite".to_string(),
+            "modified time changed during rewrite",
         ));
-    }
-
-    // Check the file contents haven't changed
-    if let Some(checksum_before) = before.checksum {
-        let checksum_after = checksum(&file).map_err(|e| Failure::new(path, e))?;
-        if checksum_after != checksum_before {
-            return Err(Failure::invalid(
-                path,
-                format!(
-                    "contents changed: {} before, {} after",
-                    hex(&checksum_before),
-                    hex(&checksum_after),
-                ),
-            ));
-        }
     }
     Ok(())
 }
@@ -515,14 +521,29 @@ pub struct Report {
     /// Extents left alone, named after the file the failure is charged to,
     /// with the reason.
     pub skipped: Vec<(PathBuf, String)>,
-    /// Files which came back holding different bytes. Nothing else belongs
-    /// here: this is the one failure that means data was lost.
-    pub corrupted: Vec<(PathBuf, String)>,
+    /// Files something else wrote to while they were being rewritten, going by
+    /// their size or mtime. The kernel refuses to dedupe bytes that differ, so
+    /// this is a race with another writer, not lost data.
+    pub modified: Vec<(PathBuf, String)>,
+}
+
+impl Report {
+    /// Prints a failure and files it under what it means.
+    fn failed(&mut self, failure: Failure) {
+        let entry = (failure.path, failure.error.to_string());
+        if failure.error.kind() == io::ErrorKind::InvalidData {
+            eprintln!("warning: modified {}: {}", entry.0.display(), entry.1);
+            self.modified.push(entry);
+        } else {
+            eprintln!("skipped {}: {}", entry.0.display(), entry.1);
+            self.skipped.push(entry);
+        }
+    }
 }
 
 /// The head line for one extent: the file it is named after, what its rewrite
 /// copies, and what it frees.
-fn describe(extent: &Extent, holders: &[Holder], options: &Options) -> String {
+fn describe(extent: &Extent, holders: &[Located], options: &Options) -> String {
     let shared_with = match holders.len() - 1 {
         0 => String::new(),
         1 => " (shared with 1 other file)".to_string(),
@@ -540,26 +561,4 @@ fn describe(extent: &Extent, holders: &[Holder], options: &Options) -> String {
         },
         human(extent.disk_free_bytes()),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Larger than the read buffer, so a checksum that stopped at one bufferful
-    /// would not match.
-    #[test]
-    fn checksum_covers_the_whole_file() {
-        let contents: Vec<u8> = (0..(3 << 20) as u32).map(|i| i as u8).collect();
-        let path = std::env::temp_dir().join("btrealloc-checksum-test");
-        std::fs::write(&path, &contents).expect("write the test file");
-        let file = File::open(&path).expect("open the test file");
-        let digest = checksum(&file).expect("checksum the test file");
-        std::fs::remove_file(&path).expect("remove the test file");
-
-        let mut expected = Sha256::new();
-        expected.update(&contents);
-        let expected: [u8; 32] = expected.finalize().into();
-        assert_eq!(hex(&digest), hex(&expected));
-    }
 }

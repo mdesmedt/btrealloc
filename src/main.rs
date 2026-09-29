@@ -12,14 +12,13 @@ unsafe extern "C" {
 #[derive(Parser)]
 #[command(about = "Reclaim unreachable space on btrfs by rewriting live data into compact extents")]
 struct Args {
-    /// The file or directory to scan.
+    /// Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`).
+    /// Every subvolume and snapshot on it is scanned from there.
+    #[arg(value_name = "MOUNT")]
     path: PathBuf,
     /// Actually perform the extent reallocation operation, writing changes to the filesystem.
     #[arg(long)]
     apply: bool,
-    /// Hash every file before and after it is rewritten. This is an optional validation as the kernel already checks chunk equality.
-    #[arg(long)]
-    verify: bool,
     /// Increase logging verbosity.
     #[arg(short, long)]
     verbose: bool,
@@ -37,7 +36,6 @@ fn parse_options() -> Options {
     Options {
         apply: args.apply,
         dryrun: args.dryrun,
-        verify: args.verify,
         verbose: args.verbose,
         path: args.path,
     }
@@ -61,7 +59,7 @@ fn main() -> ExitCode {
     // Scan, and rewrite along the way if asked to
 
     println!("Scanning: {}", options.path.display());
-    let (stats, report) = match btrealloc::run(&options) {
+    let (stats, _) = match btrealloc::run(&options) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("{}: {e}", options.path.display());
@@ -76,12 +74,7 @@ fn main() -> ExitCode {
         println!(
             "Nothing done. Specify --dryrun to see what would be done, or --apply to rewrite extents."
         );
-        return ExitCode::SUCCESS;
     }
 
-    if report.corrupted.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    ExitCode::SUCCESS
 }
