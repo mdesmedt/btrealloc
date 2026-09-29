@@ -282,6 +282,22 @@ impl Fs {
         mount
     }
 
+    /// The directory at `rel` bound over itself, read-only, as NixOS does with
+    /// `/nix/store`.
+    pub fn mount_readonly_over(&self, rel: &str) -> Mount {
+        let path = self.path(rel);
+        must(
+            "mount",
+            &["--bind", path.to_str().unwrap(), path.to_str().unwrap()],
+        );
+        let mount = Mount { path };
+        must(
+            "mount",
+            &["-o", "remount,bind,ro", mount.path.to_str().unwrap()],
+        );
+        mount
+    }
+
     /// How many shared data backreferences the extent tree holds, read from
     /// the device with `btrfs inspect-internal dump-tree`.
     pub fn shared_data_backrefs(&self) -> usize {

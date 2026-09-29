@@ -691,6 +691,34 @@ fn only_the_top_level_subvolume_is_accepted() {
     );
 }
 
+/// A read-only mount over part of the filesystem, as NixOS puts over
+/// `/nix/store`, does not keep the files under it from being rewritten: the
+/// tool works through a copy of the mount it was given, which nothing is
+/// mounted on.
+#[test]
+fn a_readonly_mount_on_top_does_not_get_in_the_way() {
+    let fs = Fs::new();
+    fs.dir("store");
+    let file = fs.path("store/bookend");
+    support::bookend(&file, FILE_MIB);
+    let _over = fs.mount_readonly_over("store");
+
+    let before = support::checksums(fs.root());
+    let extents = support::physical_extents(&file);
+
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(!report.rewritten.is_empty(), "the file should be rewritten");
+
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+    assert_ne!(
+        extents,
+        support::physical_extents(&file),
+        "the file's extents should have moved"
+    );
+}
+
 /// Two files over the same bytes of one extent. The rewrite copies those bytes
 /// once and points both at the one copy: a private copy each would cost more
 /// than the extent it drops returns.

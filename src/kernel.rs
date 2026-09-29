@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{OsStr, c_int, c_ulong, c_void};
-use std::fs::{File, OpenOptions};
+use std::ffi::{CString, OsStr, c_int, c_long, c_ulong, c_void};
+use std::fs::File;
 use std::io;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::rc::Rc;
@@ -24,8 +24,10 @@ use linux_raw_sys::btrfs::{
     btrfs_root_item, btrfs_root_ref,
 };
 use linux_raw_sys::general::{
-    __IncompleteArrayField, BTRFS_SUPER_MAGIC, FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_TMPFILE,
-    file_dedupe_range, file_dedupe_range_info, statfs,
+    __IncompleteArrayField, __NR_open_tree, __NR_openat2, AT_EMPTY_PATH, BTRFS_SUPER_MAGIC,
+    FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_RDONLY, O_RDWR, O_TMPFILE,
+    OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV,
+    file_dedupe_range, file_dedupe_range_info, open_how, statfs,
 };
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
@@ -67,6 +69,60 @@ unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> c_int;
     fn fstatfs(fd: c_int, buf: *mut statfs) -> c_int;
     fn syncfs(fd: c_int) -> c_int;
+    fn syscall(number: c_long, ...) -> c_long;
+}
+
+/// A private copy of the mount `fd` is on, attached nowhere, with nothing
+/// mounted on top of it. Mounts made over parts of the original, such as the
+/// read-only bind NixOS puts over `/nix/store`, are not carried over, so every
+/// path from its root ends on the filesystem itself.
+///
+/// It lives only as long as the descriptor returned, and whatever is opened
+/// through it: the kernel unmounts it once those close, however the process
+/// ends, a kill included. Nothing is ever left in the mount table.
+fn clone_mount(fd: c_int) -> io::Result<OwnedFd> {
+    let rc = unsafe {
+        syscall(
+            __NR_open_tree as c_long,
+            fd,
+            c"".as_ptr(),
+            (OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH) as c_ulong,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(rc as c_int) })
+}
+
+/// Opens `path` below the directory `dir`, never leaving it: not through `..`,
+/// a symlink, or onto another mount. An empty `path` opens `dir` itself.
+fn open_beneath(dir: c_int, path: &Path, flags: u32) -> io::Result<File> {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("path holds a NUL byte"))?;
+    let mut how = open_how {
+        flags: (flags | O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV) as u64,
+    };
+    let rc = unsafe {
+        syscall(
+            __NR_openat2 as c_long,
+            dir,
+            path.as_ptr(),
+            &raw mut how,
+            size_of::<open_how>(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(rc as c_int) })
 }
 
 /// `struct btrfs_ioctl_search_args_v2` with its trailing buffer given a fixed
@@ -339,26 +395,19 @@ enum RefOffsets {
 
 /// One subvolume, found by path from the top-level one.
 ///
-/// Only the path is kept. Its root directory is opened again wherever it is
-/// needed: a descriptor held for every subvolume is what runs into
-/// `RLIMIT_NOFILE` on a filesystem with thousands of snapshots.
+/// Only the path is kept, relative to the top-level subvolume. Its root
+/// directory is opened again wherever it is needed: a descriptor held for
+/// every subvolume is what runs into `RLIMIT_NOFILE` on a filesystem with
+/// thousands of snapshots.
 struct Subvolume {
     path: PathBuf,
 }
 
-impl Subvolume {
-    /// Opens the subvolume's root directory, which inode numbers in it are
-    /// resolved through, or `None` if its path no longer leads there.
-    fn open(&self, root: u64) -> io::Result<Option<File>> {
-        open_subvolume(&self.path, root)
-    }
-}
-
-/// Opens `path` as the root directory of subvolume `root`, or `None` if there
-/// is nothing there, or it is something else: a directory, another subvolume,
-/// or a mount on top of it.
-fn open_subvolume(path: &Path, root: u64) -> io::Result<Option<File>> {
-    let file = match File::open(path) {
+/// Opens `path`, below the top-level subvolume's root directory `top`, as the
+/// root directory of subvolume `root`, or `None` if there is nothing there, or
+/// it is something else: a directory, or another subvolume.
+fn open_subvolume(top: c_int, path: &Path, root: u64) -> io::Result<Option<File>> {
+    let file = match open_beneath(top, path, O_RDONLY | O_DIRECTORY) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -374,9 +423,15 @@ fn open_subvolume(path: &Path, root: u64) -> io::Result<Option<File>> {
 /// A handle on the whole filesystem, through the root directory of its
 /// top-level subvolume. From there every other subvolume, and every inode in
 /// it, can be reached.
+///
+/// Everything is reached through a private copy of the mount, not through the
+/// mount itself: see [`clone_mount`]. Paths are only ever relative to its root.
 pub struct Filesystem {
+    /// The top-level subvolume's root directory, in the private mount.
     file: File,
-    /// Where the top-level subvolume is mounted.
+    /// The private mount, kept for as long as this is.
+    _private: OwnedFd,
+    /// Where the top-level subvolume is mounted, which paths are shown under.
     pub mount: PathBuf,
     /// The sector size: a file extent reference covers whole sectors, never
     /// part of one. It is the page size at mkfs time, typically 4096 bytes.
@@ -445,8 +500,17 @@ impl Filesystem {
             ));
         }
 
+        let private = clone_mount(file.as_raw_fd()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("making a private mount to work through: {e}"),
+            )
+        })?;
+        let file = open_beneath(private.as_raw_fd(), Path::new(""), O_RDONLY | O_DIRECTORY)?;
+
         Ok(Filesystem {
             file,
+            _private: private,
             mount: path.to_path_buf(),
             sectorsize,
             read_only: buf.f_flags as u64 & ST_RDONLY != 0,
@@ -832,10 +896,10 @@ impl Filesystem {
     /// its root backreference names the subvolume it sits in, the directory
     /// there, and its own name in that directory. `None` for a subvolume with
     /// no backreference, which is one being deleted, or one whose path leads
-    /// somewhere else, such as a mount on top of it.
+    /// somewhere else.
     fn find_subvolume(&self, root: u64) -> io::Result<Option<Subvolume>> {
         let path = if root == BTRFS_FS_TREE_OBJECTID as u64 {
-            self.mount.clone()
+            PathBuf::new()
         } else {
             let Some((parent, dirid, name)) = self.root_backref(root)? else {
                 return Ok(None);
@@ -847,10 +911,15 @@ impl Filesystem {
             parent_subvolume.path.join(dir).join(name)
         };
 
-        if open_subvolume(&path, root)?.is_none() {
+        if self.open_subvolume(&path, root)?.is_none() {
             return Ok(None);
         }
         Ok(Some(Subvolume { path }))
+    }
+
+    /// See [`open_subvolume`].
+    fn open_subvolume(&self, path: &Path, root: u64) -> io::Result<Option<File>> {
+        open_subvolume(self.file.as_raw_fd(), path, root)
     }
 
     /// Where subvolume `root` sits: the subvolume holding it, the directory
@@ -882,9 +951,9 @@ impl Filesystem {
         Ok(found)
     }
 
-    /// The absolute path of inode `inode` in subvolume `root`, or `None` if the
-    /// subvolume cannot be reached, or `inode` has no name any more (an orphan,
-    /// unlinked but still open elsewhere).
+    /// The path of inode `inode` in subvolume `root`, relative to the top-level
+    /// subvolume, or `None` if the subvolume cannot be reached, or `inode` has
+    /// no name any more (an orphan, unlinked but still open elsewhere).
     ///
     /// An inode can have more than one name — hardlinks — in which case this
     /// takes the first the kernel returns. Any of them opens the same data,
@@ -893,7 +962,7 @@ impl Filesystem {
         let Some(subvolume) = self.subvolume(root)? else {
             return Ok(None);
         };
-        let Some(subvolume_root) = subvolume.open(root)? else {
+        let Some(subvolume_root) = self.open_subvolume(&subvolume.path, root)? else {
             return Ok(None);
         };
         let mut buf = Box::new(InoPathBuf {
@@ -933,6 +1002,51 @@ impl Filesystem {
             .get(offset..)
             .ok_or_else(|| io::Error::other("path offset runs past its buffer"))?;
         Ok(Some(subvolume.path.join(cstr_bytes(name))))
+    }
+
+    /// Where `path`, relative to the top-level subvolume, is to be found
+    /// through the mount the filesystem was opened through, for naming it.
+    pub fn display_path(&self, path: &Path) -> PathBuf {
+        self.mount.join(path)
+    }
+
+    /// Opens the file at `path`, relative to the top-level subvolume, read-only,
+    /// making sure it is still inode `inode` of subvolume `root`. A path is only
+    /// ever a way to reach an inode: one renamed or replaced since it was found
+    /// leads somewhere else.
+    pub fn open_inode(&self, path: &Path, root: u64, inode: u64) -> io::Result<File> {
+        let file = open_beneath(self.file.as_raw_fd(), path, O_RDONLY)?;
+        if file.metadata()?.ino() != inode || own_root_id(file.as_raw_fd())? != root {
+            return Err(io::Error::other("no longer the file the extent tree names"));
+        }
+        Ok(file)
+    }
+
+    /// An unnamed file in the top-level subvolume's root directory, for holding
+    /// a copy while files are rewritten. It has no link from the moment it
+    /// exists, so the kernel frees it when the last descriptor closes however
+    /// the process ends, a kill included: there is no window in which a crash
+    /// could strand it.
+    ///
+    /// The directory itself is not modified. No directory entry is ever made,
+    /// so not even its mtime moves.
+    ///
+    /// The file takes its attributes from the directory, nodatacow included,
+    /// and btrfs refuses to dedupe between two inodes that disagree about
+    /// checksums. The flag can still be cleared while the file is empty, so it
+    /// is.
+    pub fn temp_file(&self) -> io::Result<File> {
+        let file = open_beneath(self.file.as_raw_fd(), Path::new(""), O_RDWR | O_TMPFILE)?;
+        let flags = get_flags(&file)?;
+        if flags & FS_NOCOW_FL != 0 {
+            set_flags(&file, flags & !FS_NOCOW_FL)?;
+            if is_nocow(&file)? {
+                return Err(io::Error::other(
+                    "the temporary file keeps nodatacow from its directory",
+                ));
+            }
+        }
+        Ok(file)
     }
 }
 
@@ -1040,18 +1154,6 @@ fn own_root_id(fd: c_int) -> io::Result<u64> {
     Ok(ino_lookup_args(fd, 0, BTRFS_FIRST_FREE_OBJECTID as u64)?.treeid)
 }
 
-/// Opens the file at `path` read-only, making sure it is still inode `inode` of
-/// subvolume `root`. A path is only ever a way to reach an inode: one renamed
-/// or replaced since it was found, or hidden under another mount, leads
-/// somewhere else.
-pub fn open_inode(path: &Path, root: u64, inode: u64) -> io::Result<File> {
-    let file = File::open(path)?;
-    if file.metadata()?.ino() != inode || own_root_id(file.as_raw_fd())? != root {
-        return Err(io::Error::other("no longer the file the extent tree names"));
-    }
-    Ok(file)
-}
-
 /// Reads a NUL-terminated string out of `bytes`, or all of it if there is no
 /// NUL — the kernel always writes one, but nothing here needs to trust that.
 fn cstr_bytes(bytes: &[u8]) -> &OsStr {
@@ -1150,35 +1252,6 @@ const _: () = assert!(
     size_of::<DedupeRange>()
         == size_of::<file_dedupe_range>() + size_of::<file_dedupe_range_info>()
 );
-
-/// An unnamed file in `dir`, for holding a copy while files are rewritten.
-/// It has no link from the moment it exists, so the kernel frees it when the
-/// last descriptor closes however the process ends, a kill included: there is
-/// no window in which a crash could strand it.
-///
-/// `dir` itself is not modified. No directory entry is ever made, so not even
-/// its mtime moves.
-///
-/// The file takes its attributes from `dir`, nodatacow included, and btrfs
-/// refuses to dedupe between two inodes that disagree about checksums. The
-/// flag can still be cleared while the file is empty, so it is.
-pub fn temp_file(dir: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(O_TMPFILE as i32)
-        .open(dir)?;
-    let flags = get_flags(&file)?;
-    if flags & FS_NOCOW_FL != 0 {
-        set_flags(&file, flags & !FS_NOCOW_FL)?;
-        if is_nocow(&file)? {
-            return Err(io::Error::other(
-                "the temporary file keeps nodatacow from its directory",
-            ));
-        }
-    }
-    Ok(file)
-}
 
 /// Whether the file is marked nodatacow, in which case rewriting it neither
 /// helps nor is safe to dedupe.
