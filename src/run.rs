@@ -128,8 +128,12 @@ impl Runner {
 
 /// A file holding the extent, and the path it was found at.
 struct Located<'a> {
+    /// Relative to the top-level subvolume, which is how it is opened.
+    name: PathBuf,
+    /// Where it is under the mount the tool was pointed at, for naming it.
     path: PathBuf,
     holder: Holder<'a>,
+    fs: &'a Filesystem,
 }
 
 impl Located<'_> {
@@ -144,22 +148,29 @@ impl Located<'_> {
     /// spread one extent over thousands of files, and a descriptor held for
     /// each of them is what runs into `RLIMIT_NOFILE`.
     fn open(&self) -> Result<File, Failure> {
-        kernel::open_inode(&self.path, self.holder.root, self.holder.inode)
+        self.fs
+            .open_inode(&self.name, self.holder.root, self.holder.inode)
             .map_err(|e| Failure::new(&self.path, e))
     }
 }
 
 /// Finds a path to every file holding the extent. `None` if one of them is
 /// nodatacow.
-fn locate<'a>(extent: &'a Extent, fs: &Filesystem) -> Result<Option<Vec<Located<'a>>>, Failure> {
+fn locate<'a>(extent: &'a Extent, fs: &'a Filesystem) -> Result<Option<Vec<Located<'a>>>, Failure> {
     let mut located = Vec::new();
     for holder in extent.holders() {
-        let path = match fs.inode_path(holder.root, holder.inode) {
-            Ok(Some(path)) => path,
+        let name = match fs.inode_path(holder.root, holder.inode) {
+            Ok(Some(name)) => name,
             Ok(None) => return Err(Failure::other(&unnamed(&holder), "no path leads to it")),
             Err(e) => return Err(Failure::new(&unnamed(&holder), e)),
         };
-        let holder = Located { path, holder };
+        let path = fs.display_path(&name);
+        let holder = Located {
+            name,
+            path,
+            holder,
+            fs,
+        };
         let file = holder.open()?;
         if kernel::is_nocow(&file).map_err(|e| Failure::new(&holder.path, e))? {
             return Ok(None);
@@ -328,7 +339,7 @@ impl HolderBefore {
 /// the holders are: a read-only snapshot has no room for one. A failure is
 /// charged to `path`, the first holder.
 fn stage(path: &Path, range: &LiveRange, fs: &Filesystem) -> Result<File, Failure> {
-    let temp = kernel::temp_file(&fs.mount).map_err(|e| Failure::new(path, e))?;
+    let temp = fs.temp_file().map_err(|e| Failure::new(path, e))?;
     temp.write_all_at(&range.bytes, 0)
         .map_err(|e| Failure::new(path, e))?;
     Ok(temp)
@@ -390,7 +401,7 @@ fn redirect_tail(
     fs: &Filesystem,
 ) -> Result<(), Failure> {
     let len = size - from;
-    let temp = kernel::temp_file(&fs.mount).map_err(|e| Failure::new(path, e))?;
+    let temp = fs.temp_file().map_err(|e| Failure::new(path, e))?;
     // The tail sits a sector into the temporary, with a hole before it, rather
     // than at its start.
     //

@@ -26,7 +26,7 @@ Btrealloc works on a whole filesystem at once, every subvolume and snapshot incl
 
 # Usage
 
-Btrealloc needs the filesystem's top-level subvolume (`subvolid=5`) mounted, and is given that mount point. Only from there can it reach every subvolume and snapshot. It does not mount anything itself. If you normally only mount subvolumes, mount the root subvolume first:
+Btrealloc needs the filesystem's top-level subvolume (`subvolid=5`) mounted, and is given that mount point. Only from there can it reach every subvolume and snapshot. It works through a private, detached copy of that mount (`open_tree`), so anything mounted over parts of it does not get in the way, and nothing is left mounted when it exits, however it exits. If you normally only mount subvolumes, mount the root subvolume first:
 
 ```
 sudo mkdir -p /mnt/rootsubvolume
