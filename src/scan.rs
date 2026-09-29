@@ -138,6 +138,13 @@ impl ScanStats {
             );
         }
 
+        self.report_left_alone();
+    }
+
+    /// Prints the extents with unreachable space that were not rewritten, by
+    /// reason. Unlike the totals, this still holds after an `--apply`: these
+    /// are the extents the run did not rewrite.
+    pub fn report_left_alone(&self) {
         if !self.left_alone.is_empty() {
             println!();
             println!("extents with unreachable space left alone:");

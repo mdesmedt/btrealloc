@@ -66,8 +66,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!();
-    stats.report();
+    // The totals are counted as the walk finds each extent, before it is
+    // rewritten, so after --apply they describe the filesystem as it was.
+    if options.apply {
+        stats.report_left_alone();
+    } else {
+        println!();
+        stats.report();
+    }
 
     if !options.dryrun && !options.apply {
         println!();
