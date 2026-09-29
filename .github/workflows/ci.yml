@@ -34,6 +34,54 @@ jobs:
       - name: cargo test
         run: nix develop --command cargo test
 
+  # The VM suite run straight on the runner, as root, with no VM around it.
+  # Trialled alongside vm-tests: aarch64 runners have no /dev/kvm, so there the
+  # VM crawls under software emulation. This tests the runner's own kernel
+  # rather than NixOS's.
+  bare-tests:
+    name: bare tests (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Show the environment
+        run: |
+          uname -a
+          ulimit -n
+          free -h
+          sudo modprobe btrfs
+          grep btrfs /proc/filesystems
+
+      # The same btrfs-progs the VM gets, from the flake's pinned nixpkgs.
+      - name: Install btrfs-progs
+        run: |
+          nix build --inputs-from . "nixpkgs#btrfs-progs^out" --no-link --print-out-paths \
+            | sed 's|$|/bin|' >> "$GITHUB_PATH"
+
+      - name: Build the VM suite
+        run: nix develop --command cargo test --release --test vm --no-run
+
+      # Cargo runs the test binary through sudo. sudo resets PATH, so it is
+      # passed along for mkfs.btrfs and btrfs from the step above.
+      - name: Run the VM suite
+        run: |
+          nix develop --command bash -c '
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="sudo env PATH=$PATH"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="sudo env PATH=$PATH"
+            cargo test --release --test vm -- --test-threads=1
+          '
+
   vm-tests:
     name: VM tests (${{ matrix.system }})
     strategy:
