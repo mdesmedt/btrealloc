@@ -7,8 +7,9 @@
 //!     ./runvm.sh                      in a throwaway VM, as `nix flake check` does
 //!     cargo test --test vm --no-run   then run the binary it names under sudo
 //!
-//! Each test builds only the shapes it needs, on a filesystem of its own, and
-//! asserts on what the phases return rather than on what they printed.
+//! Each test builds only the shapes it needs, on a filesystem of its own, runs
+//! the tool over all of it from its top-level subvolume, as the tool requires,
+//! and asserts on what the phases return rather than on what they printed.
 //!
 //! Most of them mount plainly. Running every one of them against each
 //! combination of `autodefrag` and `compress=zstd:3` was tried and dropped: it
@@ -28,7 +29,7 @@
 mod support;
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use support::{Fs, MIB};
 
@@ -42,12 +43,12 @@ const FILE_MIB: u64 = 64;
 #[test]
 fn a_bookend_extent_is_reclaimed() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
     let file = fs.path("data/bookend");
     support::bookend(&file, FILE_MIB);
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let reclaimable = support::file_reclaimable(&scan, &file);
     assert!(
@@ -59,15 +60,15 @@ fn a_bookend_extent_is_reclaimed() {
         "the file should be worth rewriting"
     );
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     assert!(report.freed_bytes >= reclaimable);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     let (allocated, used) = support::file_totals(&after, &file);
     assert_eq!(allocated, used, "nothing should be wasted afterwards");
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// Three live pieces of one extent, so the rewrite has three ranges to copy and
@@ -75,20 +76,21 @@ fn a_bookend_extent_is_reclaimed() {
 #[test]
 fn three_live_pieces_are_copied() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
     let file = fs.path("data/pieces");
     support::write_random(&file, FILE_MIB);
     support::punch_hole(&file, MIB, 19 * MIB); // keeps [0, 1)
     support::punch_hole(&file, 30 * MIB, 26 * MIB); // keeps [20, 30) and [56, 64)
     let live = (1 + 10 + 8) * MIB;
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
+    let id = support::identity(&file);
     let chunks: Vec<u64> = worklist
         .iter()
         .flat_map(|extent| &extent.refs)
-        .filter(|r| **r.path == *file)
+        .filter(|r| (r.root, r.inode) == id)
         .map(|r| r.num_bytes)
         .collect();
     // Three surviving pieces are at least three chunks: a split extent divides
@@ -103,13 +105,13 @@ fn three_live_pieces_are_copied() {
         "the job should copy exactly what is left of the file"
     );
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     let (allocated, used) = support::file_totals(&after, &file);
     assert_eq!(allocated, used);
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// One extent, two files, each keeping a different end of it. Neither file
@@ -117,7 +119,7 @@ fn three_live_pieces_are_copied() {
 #[test]
 fn one_extent_held_by_two_files_needs_both_rewritten() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
     let (a, b) = (fs.path("data/multi-a"), fs.path("data/multi-b"));
     support::write_random_one_extent(&a, FILE_MIB);
     support::reflink(&a, &b);
@@ -134,30 +136,29 @@ fn one_extent_held_by_two_files_needs_both_rewritten() {
         "fixture: the two files should hold one extent between them"
     );
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let job = support::job_for(&worklist, &a).expect("the shared extent is worth rewriting");
     assert_eq!(job.disk_address, extent);
     assert_eq!(job.holders().len(), 2, "both files hold the extent");
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     for file in [&a, &b] {
         let (allocated, used) = support::file_totals(&after, file);
         assert_eq!(allocated, used, "{} still wastes space", file.display());
     }
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// Extents the extent tree records against the tree block holding their
 /// references rather than against the files, as snapshot history leaves them.
-/// The extent tree cannot say who holds those, so the scan either trusts a
-/// reference count of one or asks the kernel's backreference walk. Either way,
-/// a file holding an extent alone and two files sharing one must come back
-/// whole and be rewritten.
+/// The extent tree cannot say who holds those, so the scan asks the kernel's
+/// backreference walk. A file holding an extent alone and two files sharing
+/// one must come back whole and be rewritten.
 #[test]
 fn extents_behind_shared_backreferences_are_reclaimed() {
     let fs = Fs::new();
@@ -179,7 +180,6 @@ fn extents_behind_shared_backreferences_are_reclaimed() {
     support::punch_hole(&b, MIB, (FILE_MIB - 2) * MIB);
 
     fs.snapshot_and_delete("original", "snapshot");
-    let data = fs.path("snapshot/data");
     let alone = fs.path("snapshot/data/alone");
     let (a, b) = (
         fs.path("snapshot/data/shared-a"),
@@ -190,8 +190,8 @@ fn extents_behind_shared_backreferences_are_reclaimed() {
         "fixture: the snapshot should be left with shared data backreferences"
     );
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     assert!(
         support::job_for(&worklist, &alone).is_some(),
@@ -201,11 +201,11 @@ fn extents_behind_shared_backreferences_are_reclaimed() {
     assert_eq!(job.holders().len(), 2, "both files hold the extent");
     assert_eq!(job.refs.len(), 4, "each file holds both ends of it");
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     for file in [&alone, &a, &b] {
         let (allocated, used) = support::file_totals(&after, file);
         assert_eq!(allocated, used, "{} still wastes space", file.display());
@@ -215,14 +215,14 @@ fn extents_behind_shared_backreferences_are_reclaimed() {
         support::physical_extents(&b),
         "the two files should still share one copy"
     );
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
-// Snapshots kept alongside the subvolume being scanned.
+// Extents held from more than one subvolume.
 //
-// A rewrite only moves the references in the subvolume it runs in. An extent a
-// snapshot also holds stays allocated for as long as the snapshot does, so
-// rewriting it costs a copy and frees nothing: it is to be left alone.
+// The tool runs over the whole filesystem, so an extent a snapshot or another
+// subvolume also holds is rewritten in every one of them, read-only snapshots
+// included, and freed like any other.
 //
 // How the extent tree records that a snapshot holds an extent depends on
 // whether the leaf holding the file's extent items has been written to since
@@ -236,39 +236,62 @@ fn wasteful_file(path: &Path) {
     support::punch_hole(path, MIB, (FILE_MIB - 2) * MIB);
 }
 
-/// Runs over `dir`, which holds `file`, and checks that the extent at `extent`
-/// is neither handed over by the scan nor touched by the rewrite.
-fn assert_left_alone(dir: &Path, file: &Path, extent: u64) {
-    let before = support::checksums(dir);
-    let scan = support::scan(dir);
+/// Runs over the whole filesystem, and checks that the extent at `extent`,
+/// which every one of `files` holds, is found with all of them, rewritten, and
+/// gone from each, and that they still share one copy of what they held.
+fn assert_reclaimed_from_all(fs: &Fs, files: &[PathBuf], extent: u64) {
+    let before = support::checksums(fs.root());
+    let scan = support::scan(fs);
+    assert_eq!(scan.stats.skipped, 0, "the scan left extents alone");
+    let found = scan
+        .extents
+        .get(&extent)
+        .expect("the scan should find the extent");
+    assert_eq!(
+        found.holders().len(),
+        files.len(),
+        "the scan should find every file holding the extent"
+    );
     assert!(
-        !scan.extents.contains_key(&extent),
-        "the scan handed over an extent a snapshot also holds"
+        support::on_worklist(&support::worklist(&scan), extent),
+        "the extent is worth rewriting"
     );
 
-    let (_, report) = support::apply(dir);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     assert!(
-        !report.rewritten.contains(&extent),
-        "rewrote an extent a snapshot also holds"
+        report.rewritten.contains(&extent),
+        "the extent was not rewritten"
     );
-    assert!(
-        support::physical_extents(file).contains(&extent),
-        "{} no longer references the extent its snapshot holds",
-        file.display()
-    );
-    assert_eq!(before, support::checksums(dir), "contents changed");
+    for file in files {
+        assert!(
+            !support::physical_extents(file).contains(&extent),
+            "{} still references the extent",
+            file.display()
+        );
+    }
+    let copy = support::physical_extents(&files[0]);
+    for file in &files[1..] {
+        assert_eq!(
+            support::physical_extents(file),
+            copy,
+            "{} no longer shares one copy with {}",
+            file.display(),
+            files[0].display()
+        );
+    }
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// The snapshot shares the leaf holding the file's extent items, and neither
 /// side has written to it since. The extent tree records one reference, from
 /// the live subvolume, with nothing to say a second tree reaches it.
 ///
-/// Data written after the snapshot is the live subvolume's alone, and must
-/// still be reclaimed: a snapshot is no reason to leave everything alone.
+/// Data written after the snapshot is the live subvolume's alone, and is
+/// reclaimed alongside it.
 #[test]
-fn an_extent_a_snapshot_reaches_through_an_untouched_leaf_is_left_alone() {
+fn an_extent_a_snapshot_reaches_through_an_untouched_leaf_is_reclaimed_from_both() {
     // Without noatime, reading a file for its checksum writes its inode, and
     // with it the leaf this test needs untouched.
     let fs = Fs::with_options(2048, "noatime");
@@ -286,9 +309,10 @@ fn an_extent_a_snapshot_reaches_through_an_untouched_leaf_is_left_alone() {
     wasteful_file(&new);
     support::sync_fs();
 
+    let snapshotted = fs.path("snapshot/old/file");
     let extent = support::single_extent(&old);
     assert_eq!(
-        support::single_extent(&fs.path("snapshot/old/file")),
+        support::single_extent(&snapshotted),
         extent,
         "fixture: the snapshot should hold the old file's extent"
     );
@@ -299,25 +323,15 @@ fn an_extent_a_snapshot_reaches_through_an_untouched_leaf_is_left_alone() {
     );
     let new_extent = support::single_extent(&new);
 
-    let live = fs.path("live");
-    let scan = support::scan(&live);
-    assert!(
-        support::on_worklist(&support::worklist(&scan), new_extent),
-        "data written since the snapshot is worth rewriting"
-    );
-    assert_left_alone(&live, &old, extent);
+    assert_reclaimed_from_all(&fs, &[old, snapshotted], extent);
     assert!(
         !support::physical_extents(&new).contains(&new_extent),
         "data written since the snapshot was not rewritten"
     );
-
-    // Scanned from the snapshot's side, the extent is just as shared.
-    let snapshot = fs.path("snapshot");
-    let before = support::checksums(&snapshot);
-    let (_, report) = support::apply(&snapshot);
-    assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
-    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
-    assert_eq!(before, support::checksums(&snapshot), "contents changed");
+    assert!(
+        fs.is_readonly("snapshot"),
+        "the snapshot is no longer read-only"
+    );
 }
 
 /// The live subvolume has written to the leaf holding the file's extent items
@@ -325,7 +339,7 @@ fn an_extent_a_snapshot_reaches_through_an_untouched_leaf_is_left_alone() {
 /// reaching the extent through a shared data backreference, which only the
 /// kernel's backreference walk can follow.
 #[test]
-fn an_extent_a_snapshot_reaches_through_a_changed_leaf_is_left_alone() {
+fn an_extent_a_snapshot_reaches_through_a_changed_leaf_is_reclaimed_from_both() {
     let fs = Fs::new();
     fs.subvolume("live");
     fs.dir("live/data");
@@ -339,9 +353,10 @@ fn an_extent_a_snapshot_reaches_through_a_changed_leaf_is_left_alone() {
         .expect("change the file's mode");
     support::sync_fs();
 
+    let snapshotted = fs.path("snapshot/data/file");
     let extent = support::single_extent(&file);
     assert_eq!(
-        support::single_extent(&fs.path("snapshot/data/file")),
+        support::single_extent(&snapshotted),
         extent,
         "fixture: the snapshot should hold the file's extent"
     );
@@ -350,7 +365,11 @@ fn an_extent_a_snapshot_reaches_through_a_changed_leaf_is_left_alone() {
         "fixture: the snapshot should be left with shared data backreferences"
     );
 
-    assert_left_alone(&fs.path("live/data"), &file, extent);
+    assert_reclaimed_from_all(&fs, &[file, snapshotted], extent);
+    assert!(
+        fs.is_readonly("snapshot"),
+        "the snapshot is no longer read-only"
+    );
 }
 
 /// The subvolume holds the extent through a shared data backreference already,
@@ -359,7 +378,7 @@ fn an_extent_a_snapshot_reaches_through_a_changed_leaf_is_left_alone() {
 /// since reaches it through that same leaf, which leaves the extent tree
 /// exactly as it was: one reference, naming the leaf rather than a tree.
 #[test]
-fn an_extent_behind_a_shared_backreference_a_snapshot_also_reaches_is_left_alone() {
+fn an_extent_behind_a_shared_backreference_a_snapshot_also_reaches_is_reclaimed_from_both() {
     let fs = Fs::new();
     fs.subvolume("original");
     fs.filler("original/filler");
@@ -378,9 +397,10 @@ fn an_extent_behind_a_shared_backreference_a_snapshot_also_reaches_is_left_alone
 
     fs.snapshot("live", "snapshot");
     let file = fs.path("live/data/file");
+    let snapshotted = fs.path("snapshot/data/file");
     let extent = support::single_extent(&file);
     assert_eq!(
-        support::single_extent(&fs.path("snapshot/data/file")),
+        support::single_extent(&snapshotted),
         extent,
         "fixture: the snapshot should hold the file's extent"
     );
@@ -390,7 +410,285 @@ fn an_extent_behind_a_shared_backreference_a_snapshot_also_reaches_is_left_alone
         "fixture: the snapshot should not have changed the extent tree"
     );
 
-    assert_left_alone(&fs.path("live/data"), &file, extent);
+    assert_reclaimed_from_all(&fs, &[file, snapshotted], extent);
+    assert!(
+        fs.is_readonly("snapshot"),
+        "the snapshot is no longer read-only"
+    );
+}
+
+/// A read-only snapshot whose subvolume has since been deleted, so it is the
+/// only thing left holding the extent. Nothing can be written inside it, so the
+/// copy has to be made elsewhere for the rewrite to happen at all.
+#[test]
+fn a_read_only_snapshot_as_the_only_holder_is_reclaimed() {
+    let fs = Fs::new();
+    fs.subvolume("original");
+    fs.dir("original/data");
+    wasteful_file(&fs.path("original/data/file"));
+    fs.snapshot("original", "snapshot");
+    fs.delete_subvolume("original");
+
+    let file = fs.path("snapshot/data/file");
+    let extent = support::single_extent(&file);
+    assert_reclaimed_from_all(&fs, &[file], extent);
+    assert!(
+        fs.is_readonly("snapshot"),
+        "the snapshot is no longer read-only"
+    );
+}
+
+/// Several read-only snapshots of one subvolume, one of them taken after the
+/// live file's leaf was written to, so the extent is reached both through a
+/// leaf the extent tree names and through ones only the backreference walk can
+/// follow. Every one of them has to let go for the extent to be freed.
+#[test]
+fn an_extent_held_by_many_read_only_snapshots_is_reclaimed() {
+    let fs = Fs::new();
+    fs.subvolume("live");
+    fs.dir("live/data");
+    let file = fs.path("live/data/file");
+    wasteful_file(&file);
+    fs.filler("live/filler");
+    fs.snapshot("live", "first");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+        .expect("change the file's mode");
+    support::sync_fs();
+    fs.snapshot("live", "second");
+    fs.snapshot("live", "third");
+
+    let extent = support::single_extent(&file);
+    let mut files = vec![file];
+    for snapshot in ["first", "second", "third"] {
+        let path = fs.path(&format!("{snapshot}/data/file"));
+        assert_eq!(
+            support::single_extent(&path),
+            extent,
+            "fixture: {snapshot} should hold the file's extent"
+        );
+        files.push(path);
+    }
+
+    assert_reclaimed_from_all(&fs, &files, extent);
+    for snapshot in ["first", "second", "third"] {
+        assert!(
+            fs.is_readonly(snapshot),
+            "{snapshot} is no longer read-only"
+        );
+    }
+}
+
+/// One extent held by more snapshots than the process may have files open.
+/// Holding a descriptor for every subvolume looked up would run out of them
+/// before the last holder was found.
+///
+/// The limit is lowered for the test first. At the usual 1024 the snapshots it
+/// takes to exceed it make this the slowest test in the suite by far, most of
+/// it spent checksumming them.
+#[test]
+fn an_extent_held_by_more_snapshots_than_open_files_allow_is_reclaimed() {
+    let lowered = support::OpenFilesLimit::lower_to(64);
+    let limit = lowered.soft();
+
+    let fs = Fs::new();
+    fs.subvolume("live");
+    let file = fs.path("live/file");
+    wasteful_file(&file);
+
+    let mut files = vec![file];
+    for i in 0..limit + 16 {
+        let name = format!("snap{i}");
+        fs.snapshot("live", &name);
+        files.push(fs.path(&format!("{name}/file")));
+    }
+    let extent = support::single_extent(&files[0]);
+    assert_eq!(
+        support::single_extent(files.last().unwrap()),
+        extent,
+        "fixture: the last snapshot should hold the file's extent"
+    );
+
+    assert_reclaimed_from_all(&fs, &files, extent);
+}
+
+/// One extent held from two subvolumes side by side, through a reflink between
+/// them.
+#[test]
+fn an_extent_reflinked_across_subvolumes_is_reclaimed() {
+    let fs = Fs::new();
+    fs.subvolume("a");
+    fs.subvolume("b");
+    let (first, second) = (fs.path("a/file"), fs.path("b/file"));
+    wasteful_file(&first);
+    support::reflink(&first, &second);
+
+    let extent = support::single_extent(&first);
+    assert_reclaimed_from_all(&fs, &[first, second], extent);
+}
+
+/// A subvolume inside a directory of another subvolume, so the path to a file
+/// in it is only found by working up through both.
+#[test]
+fn nested_subvolumes_are_reached() {
+    let fs = Fs::new();
+    fs.subvolume("outer");
+    fs.dir("outer/dir");
+    fs.subvolume("outer/dir/inner");
+    fs.dir("outer/dir/inner/deeper");
+    let file = fs.path("outer/dir/inner/deeper/file");
+    let copy = fs.path("outer/copy");
+    wasteful_file(&file);
+    support::reflink(&file, &copy);
+
+    let extent = support::single_extent(&file);
+    assert_reclaimed_from_all(&fs, &[file, copy], extent);
+}
+
+/// Two extents next to each other on disk, read from the extent tree together,
+/// both in files whose leaf a snapshot shares untouched. Rewriting the first
+/// writes that leaf, which changes who the extent tree says holds the second,
+/// but only once the transaction commits: acted on as first read, the
+/// snapshot's hold on the second would be missed and it would never be freed.
+#[test]
+fn an_extent_whose_holders_change_mid_walk_is_still_released() {
+    // Without noatime, reading the files for their checksums writes the leaf
+    // before the rewrite gets to.
+    let fs = Fs::with_options(2048, "noatime");
+    fs.subvolume("live");
+    fs.dir("live/old");
+    let (a, b) = (fs.path("live/old/a"), fs.path("live/old/b"));
+    wasteful_file(&a);
+    wasteful_file(&b);
+    fs.filler("live/filler");
+    fs.snapshot("live", "snapshot");
+    assert_eq!(
+        fs.shared_data_backrefs(),
+        0,
+        "fixture: no leaf should have been written since the snapshot"
+    );
+
+    let files = [
+        a.clone(),
+        b.clone(),
+        fs.path("snapshot/old/a"),
+        fs.path("snapshot/old/b"),
+    ];
+    let extents = [support::single_extent(&a), support::single_extent(&b)];
+
+    let before = support::checksums(fs.root());
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    for extent in extents {
+        assert!(
+            report.rewritten.contains(&extent),
+            "{extent:#x} was not rewritten"
+        );
+        for file in &files {
+            assert!(
+                !support::physical_extents(file).contains(&extent),
+                "{} still references {extent:#x}",
+                file.display()
+            );
+        }
+    }
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// A rewrite allocates new extents, often further along the disk than the walk
+/// has got. Those are fully used from the start, and the walk has to pass over
+/// them rather than count, or rewrite, the same data twice.
+#[test]
+fn extents_rewritten_mid_walk_are_not_revisited() {
+    let fs = Fs::new();
+    fs.dir("data");
+    for i in 0..4 {
+        support::bookend(&fs.path(&format!("data/bookend{i}")), FILE_MIB);
+    }
+
+    let before = support::scan(&fs);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(!report.rewritten.is_empty(), "nothing was rewritten");
+    for address in &report.rewritten {
+        assert!(
+            before.extents.contains_key(address),
+            "rewrote {address:#x}, which the run made itself"
+        );
+    }
+    let mut once = report.rewritten.clone();
+    once.sort_unstable();
+    once.dedup();
+    assert_eq!(
+        once.len(),
+        report.rewritten.len(),
+        "an extent was rewritten twice"
+    );
+
+    let (_, again) = support::dryrun(&fs);
+    assert!(
+        again.rewritten.is_empty(),
+        "a second run still found work: {:x?}",
+        again.rewritten
+    );
+}
+
+/// Anything other than where the top-level subvolume is mounted is refused
+/// before anything is read, with what to do instead. So is rewriting through a
+/// read-only mount of it, though reading through one is fine.
+#[test]
+fn only_the_top_level_subvolume_is_accepted() {
+    let fs = Fs::new();
+    fs.dir("data");
+    let file = fs.path("data/bookend");
+    support::bookend(&file, FILE_MIB);
+    fs.subvolume("live");
+    let inside = fs.dir("live/dir");
+    let mounted = fs.mount_subvolume("live");
+    let readonly = fs.mount_readonly();
+
+    let before = support::checksums(fs.root());
+    let extents = support::physical_extents(&file);
+
+    let refused: [(PathBuf, &str); 6] = [
+        (fs.path("data"), "inside the top-level subvolume"),
+        (file.clone(), "not a directory"),
+        (fs.path("live"), "subvolid=5"),
+        (inside, "subvolid=5"),
+        (mounted.path.clone(), "subvolid=5"),
+        (fs.tmpfs(), "not on a btrfs filesystem"),
+    ];
+    for (path, expected) in &refused {
+        for apply in [false, true] {
+            let error = btrealloc::run(&support::options(path, apply, false))
+                .err()
+                .unwrap_or_else(|| panic!("{} was accepted", path.display()));
+            assert!(
+                error.to_string().contains(expected),
+                "{}: said {error:?}, which should mention {expected:?}",
+                path.display()
+            );
+        }
+    }
+
+    let error = btrealloc::run(&support::options(&readonly.path, true, false))
+        .err()
+        .expect("--apply through a read-only mount was accepted");
+    assert!(
+        error.to_string().contains("read-only"),
+        "said {error:?}, which should mention the mount is read-only"
+    );
+    let (_, report) = btrealloc::run(&support::options(&readonly.path, false, true))
+        .expect("a dry run through a read-only mount");
+    assert!(!report.rewritten.is_empty(), "the dry run should find work");
+
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+    assert_eq!(
+        extents,
+        support::physical_extents(&file),
+        "the file's extents moved"
+    );
 }
 
 /// Two files over the same bytes of one extent. The rewrite copies those bytes
@@ -399,137 +697,90 @@ fn an_extent_behind_a_shared_backreference_a_snapshot_also_reaches_is_left_alone
 #[test]
 fn identical_holders_still_share_one_copy() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
     let (a, b) = (fs.path("data/same-a"), fs.path("data/same-b"));
     support::write_random(&a, FILE_MIB);
     support::reflink(&a, &b);
     support::punch_hole(&a, MIB, (FILE_MIB - 1) * MIB);
     support::punch_hole(&b, MIB, (FILE_MIB - 1) * MIB);
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let allocated_before = scan.totals().allocated_bytes;
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
 
     assert_eq!(
         support::physical_extents(&a),
         support::physical_extents(&b),
         "the two files no longer share one copy"
     );
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     assert!(
         after.totals().allocated_bytes < allocated_before,
         "the rewrite should have given space back, not taken more"
-    );
-    assert_eq!(before, support::checksums(&data), "contents changed");
-}
-
-/// An extent something outside the scanned path also holds. Rather than
-/// guessing at what that other reference means, the scan resolves it like any
-/// other: this tool works on the whole filesystem, the scanned path just
-/// decides where it starts looking. Punching the same hole on both sides
-/// leaves the extent genuinely part dead, so it lands on the worklist and both
-/// holders — the one outside `data` included — end up rewritten.
-#[test]
-fn an_extent_referenced_outside_the_scan_is_reclaimed_too() {
-    let fs = Fs::new();
-    let data = fs.dir("data");
-    fs.dir("outside");
-    let keeper = fs.path("outside/keeper");
-    let external = fs.path("data/external");
-    support::write_random(&keeper, FILE_MIB);
-    support::reflink(&keeper, &external);
-    support::punch_hole(&keeper, MIB, (FILE_MIB - 2) * MIB);
-    support::punch_hole(&external, MIB, (FILE_MIB - 2) * MIB);
-
-    let before = support::checksums(fs.root()); // covers both `data` and `outside`
-    let scan = support::scan(&data);
-    let worklist = support::worklist(&scan);
-    assert_eq!(
-        scan.totals().unreachable_bytes,
-        support::file_reclaimable(&scan, &external),
-        "the hole both files share should show up as reclaimable"
-    );
-    assert!(
-        worklist.iter().any(|extent| extent.holders().len() == 2),
-        "the extent is on the worklist with both its holders"
-    );
-
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
-
-    assert_eq!(
-        support::physical_extents(&keeper),
-        support::physical_extents(&external),
-        "the two files should still share one copy"
     );
     assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// nodatacow files are overwritten in place and cannot be deduped, so however
-/// much of their extents is dead, they are not ours to rewrite.
+/// much of their extents is dead, they are not ours to rewrite. The extent tree
+/// does not say which files are nodatacow, so the extent is found and judged
+/// worth it, and only the run, opening the file, finds out.
 #[test]
-fn a_nodatacow_file_never_reaches_the_worklist() {
+fn a_nodatacow_file_is_never_rewritten() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
     let file = fs.path("data/nocow");
     std::fs::File::create(&file).expect("create the file");
     support::set_nocow(&file);
     support::write_random(&file, FILE_MIB);
     support::punch_hole(&file, MIB, (FILE_MIB - 2) * MIB);
+    let extents = support::physical_extents(&file);
 
-    let scan = support::scan(&data);
-    let worklist = support::worklist(&scan);
+    let scan = support::scan(&fs);
     assert!(
-        scan.extents
-            .values()
-            .all(|extent| extent.refs.iter().all(|r| r.nocow)),
-        "the scan should see the file as nodatacow"
+        support::job_for(&support::worklist(&scan), &file).is_some(),
+        "fixture: the waste should be worth rewriting, were the file not nodatacow"
     );
-    assert!(worklist.is_empty(), "so it is never worked on");
+
+    let (_, report) = support::apply(&fs);
+    assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert_eq!(
+        extents,
+        support::physical_extents(&file),
+        "the file's extents moved"
+    );
 }
 
-/// A datacow file in a nodatacow directory. The temporary copy inherits the
-/// directory's flag, and btrfs will not dedupe between inodes that disagree
-/// about checksums, so the job is reached and then skipped by name.
+/// A datacow file in a nodatacow directory, on a filesystem whose top
+/// directory, where the temporary copies are made, is nodatacow too. A copy
+/// inherits the flag, and btrfs will not dedupe between inodes that disagree
+/// about checksums, so the copy has to shed it for the rewrite to work.
 #[test]
-fn a_nodatacow_directory_is_skipped_by_name() {
+fn a_nodatacow_directory_does_not_stop_a_rewrite() {
     let fs = Fs::new();
-    let data = fs.dir("data");
     let dir = fs.dir("data/latecow");
     let file = fs.path("data/latecow/datacow");
     support::bookend(&file, FILE_MIB);
     // +C after the file exists: it keeps its checksums, anything made
     // alongside it later does not.
     support::set_nocow(&dir);
+    support::set_nocow(fs.root());
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
-    let worklist = support::worklist(&scan);
-    assert!(
-        support::job_for(&worklist, &file).is_some(),
-        "the waste is real, so the job is made"
-    );
+    let before = support::checksums(fs.root());
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(!report.rewritten.is_empty(), "nothing was rewritten");
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
-    assert!(report.rewritten.is_empty(), "nothing could be rewritten");
-    let (path, reason) = report.skipped.first().expect("the job was skipped");
-    assert_eq!(path, &file, "the file it was charged to");
-    assert!(
-        reason.contains("nodatacow"),
-        "the reason should name the cause, said {reason:?}"
-    );
-
-    assert_eq!(before, support::checksums(&data), "contents changed");
-    let scan = support::scan(&data);
-    let worklist = support::worklist(&scan);
-    assert!(
-        support::job_for(&worklist, &file).is_some(),
-        "it is still on the worklist, and always will be"
-    );
+    let after = support::scan(&fs);
+    let (allocated, used) = support::file_totals(&after, &file);
+    assert_eq!(allocated, used, "nothing should be wasted afterwards");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// Waste too small to be worth an operation: reported in the totals, never
@@ -537,12 +788,12 @@ fn a_nodatacow_directory_is_skipped_by_name() {
 #[test]
 fn waste_below_the_floor_is_reported_but_not_worked() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
     let file = fs.path("data/tiny");
     support::write_random(&file, 1);
     support::punch_hole(&file, 64 * 1024, 8 * 1024);
 
-    let scan = support::scan(&data);
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     assert!(
         support::file_reclaimable(&scan, &file) > 0,
@@ -556,12 +807,12 @@ fn waste_below_the_floor_is_reported_but_not_worked() {
 #[test]
 fn an_extent_too_full_to_be_worth_copying_is_left_alone() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
     let file = fs.path("data/full");
     support::write_random(&file, FILE_MIB);
     support::punch_hole(&file, (FILE_MIB / 2) * MIB, 8 * MIB);
 
-    let scan = support::scan(&data);
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let extents = support::extents_of(&scan, &file);
     // Whatever the write was cut into, an extent which would cost more than
@@ -597,58 +848,57 @@ fn an_extent_too_full_to_be_worth_copying_is_left_alone() {
 #[test]
 fn a_clean_file_has_no_waste() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
     let file = fs.path("data/clean");
     support::write_random(&file, 8);
 
-    let scan = support::scan(&data);
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     assert_eq!(support::file_reclaimable(&scan, &file), 0);
     assert!(worklist.is_empty());
 }
 
-/// The temporary copy is made in each file's own directory, so a run has to
-/// reach into every directory it works in, not one fixed place.
+/// Files deep in a directory tree are found by their inode and reached by the
+/// path the kernel gives for it.
 #[test]
-fn files_are_rewritten_in_their_own_directories() {
+fn files_in_nested_directories_are_rewritten() {
     let fs = Fs::new();
-    let data = fs.dir("data");
     fs.dir("data/sub/deeper");
     let shallow = fs.path("data/sub/nested");
     let deep = fs.path("data/sub/deeper/nested");
     support::bookend(&shallow, FILE_MIB);
     support::bookend(&deep, FILE_MIB);
 
-    let before = support::checksums(&data);
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let before = support::checksums(fs.root());
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     for file in [&shallow, &deep] {
         let (allocated, used) = support::file_totals(&after, file);
         assert_eq!(allocated, used, "{} was not rewritten", file.display());
     }
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// The copy is an O_TMPFILE, which never makes a directory entry, so nothing
-/// can be stranded: not by a rewrite that worked, and not by one that failed.
+/// can be stranded: not at the top of the mount where copies are made, and
+/// not next to any holder, a read-only snapshot's included.
 #[test]
 fn no_temporary_file_is_left_behind() {
     let fs = Fs::new();
-    let data = fs.dir("data");
-    let dir = fs.dir("data/latecow");
+    fs.dir("data");
     support::bookend(&fs.path("data/bookend"), FILE_MIB);
-    support::bookend(&fs.path("data/latecow/datacow"), FILE_MIB);
-    support::set_nocow(&dir);
+    fs.subvolume("live");
+    fs.dir("live/data");
+    support::bookend(&fs.path("live/data/bookend"), FILE_MIB);
+    fs.snapshot("live", "snapshot");
 
     let before = support::listing(fs.root());
-    let (_, report) = support::apply(&data);
-    // Both paths have to be walked for this to prove anything: one rewrite
-    // which worked, and one which made a temporary and then failed.
+    let (_, report) = support::apply(&fs);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     assert!(!report.rewritten.is_empty(), "no rewrite worked");
-    assert!(!report.skipped.is_empty(), "no rewrite failed");
 
     assert_eq!(
         before,
@@ -657,30 +907,37 @@ fn no_temporary_file_is_left_behind() {
     );
 }
 
-/// A dry run walks the same worklist in the same order and writes nothing.
+/// A dry run walks the same worklist in the same order and writes nothing,
+/// in a read-only snapshot or anywhere else.
 #[test]
 fn a_dry_run_changes_nothing() {
     let fs = Fs::new();
-    let data = fs.dir("data");
-    let file = fs.path("data/bookend");
+    fs.subvolume("live");
+    fs.dir("live/data");
+    let file = fs.path("live/data/bookend");
     support::bookend(&file, FILE_MIB);
+    fs.snapshot("live", "snapshot");
+    let snapshotted = fs.path("snapshot/data/bookend");
 
-    let before = support::checksums(&data);
+    let before = support::checksums(fs.root());
     let listing = support::listing(fs.root());
     let extents = support::physical_extents(&file);
 
-    let (_, report) = support::dryrun(&data);
+    let (_, report) = support::dryrun(&fs);
     assert!(!report.rewritten.is_empty(), "it should have found work");
     assert!(report.skipped.is_empty());
-    assert!(report.corrupted.is_empty());
+    assert!(report.modified.is_empty());
 
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
     assert_eq!(listing, support::listing(fs.root()), "the listing changed");
-    assert_eq!(
-        extents,
-        support::physical_extents(&file),
-        "the file's extents moved"
-    );
+    for file in [&file, &snapshotted] {
+        assert_eq!(
+            extents,
+            support::physical_extents(file),
+            "{}'s extents moved",
+            file.display()
+        );
+    }
 }
 
 /// On a compressed filesystem an extent's on-disk size is not its uncompressed
@@ -688,14 +945,14 @@ fn a_dry_run_changes_nothing() {
 #[test]
 fn compressed_extents_are_counted_on_disk() {
     let fs = Fs::with_options(2048, "compress=zstd:3");
-    let data = fs.dir("data");
+    fs.dir("data");
     let file = fs.path("data/compressed");
     support::write_compressible(&file, 4);
     // Inside one compressed extent, which btrfs caps at 128 KiB uncompressed,
     // so this leaves a partly-referenced extent rather than dropping a whole one.
     support::punch_hole(&file, 16 * 1024, 32 * 1024);
 
-    let scan = support::scan(&data);
+    let scan = support::scan(&fs);
     let (allocated, used) = support::file_totals(&scan, &file);
     assert!(
         allocated < 4 * MIB,
@@ -719,7 +976,7 @@ fn every_holder_of_a_slivered_extent_is_redirected() {
     const SMALL_MIB: u64 = 1;
 
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
 
     // One extent, then a sector of it handed to each small file. The big file
     // goes afterwards, leaving the extent held only by the slivers.
@@ -739,8 +996,8 @@ fn every_holder_of_a_slivered_extent_is_redirected() {
     std::fs::remove_file(&big).expect("remove the big file");
     support::sync_fs();
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let extent = scan
         .extents
@@ -756,13 +1013,13 @@ fn every_holder_of_a_slivered_extent_is_redirected() {
         "an extent held by slivers alone is almost entirely waste",
     );
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
     // The point of the test: not that the rewrite reported success, but that
     // every holder actually moved and the extent is gone.
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     assert!(
         !after.extents.contains_key(&address),
         "the extent is still there, so some holder was never redirected",
@@ -774,7 +1031,7 @@ fn every_holder_of_a_slivered_extent_is_redirected() {
             holder.display(),
         );
     }
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// The same shape at the size it actually occurs: btrfs caps one extent at
@@ -788,14 +1045,13 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
 
     let fs = Fs::new();
     let sectorsize = fs.sectorsize();
-    let data = fs.dir("data");
+    fs.dir("data");
 
     // 128 MiB is btrfs's cap, and a write that sits on it can come back split,
     // so take whichever extent it gave us the most of and slice that one.
     let big = fs.path("data/big");
     support::write_random_one_extent(&big, 128);
-    let biggest = btrealloc::kernel::file_extents(&big)
-        .expect("read the big file's extents")
+    let biggest = support::file_extents(&big)
         .into_iter()
         .max_by_key(|extent| extent.disk_bytes)
         .expect("the big file should hold an extent");
@@ -820,8 +1076,8 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
     std::fs::remove_file(&big).expect("remove the big file");
     support::sync_fs();
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let extent = scan
         .extents
@@ -834,11 +1090,11 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
     );
     assert!(support::on_worklist(&worklist, address), "almost all waste");
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     let left: Vec<_> = holders
         .iter()
         .filter(|holder| support::physical_extents(holder).contains(&address))
@@ -852,7 +1108,7 @@ fn every_holder_of_a_full_size_slivered_extent_is_redirected() {
         !after.extents.contains_key(&address),
         "the extent is still there",
     );
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// The topology a real run walks, rather than one job on its own: several
@@ -865,7 +1121,7 @@ fn holders_shared_between_jobs_all_move() {
 
     let fs = Fs::new();
     let sectorsize = fs.sectorsize();
-    let data = fs.dir("data");
+    fs.dir("data");
 
     // One large extent per round, each sliced by every holder, so each holder
     // ends up referencing a sector of all of them.
@@ -876,8 +1132,7 @@ fn holders_shared_between_jobs_all_move() {
     for e in 0..EXTENTS {
         let big = fs.path(&format!("data/big{e}"));
         support::write_random_one_extent(&big, 128);
-        let biggest = btrealloc::kernel::file_extents(&big)
-            .expect("read the big file's extents")
+        let biggest = support::file_extents(&big)
             .into_iter()
             .max_by_key(|extent| extent.disk_bytes)
             .expect("the big file should hold an extent");
@@ -900,8 +1155,8 @@ fn holders_shared_between_jobs_all_move() {
     }
     support::sync_fs();
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     for address in &addresses {
         let extent = scan
@@ -915,11 +1170,11 @@ fn holders_shared_between_jobs_all_move() {
         );
     }
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     for address in &addresses {
         let left: Vec<_> = holders
             .iter()
@@ -931,7 +1186,7 @@ fn holders_shared_between_jobs_all_move() {
             "{address:#x} still there"
         );
     }
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// A large file keeping one sector of an extent it used to own outright, plus a
@@ -941,7 +1196,7 @@ fn holders_shared_between_jobs_all_move() {
 fn a_holder_deep_inside_a_large_file_moves_too() {
     let fs = Fs::with_options(4096, "");
     let sectorsize = fs.sectorsize();
-    let data = fs.dir("data");
+    fs.dir("data");
 
     // Big enough that btrfs gives it more than one extent, so the one we work
     // on starts well into the file and file offset and extent offset diverge.
@@ -949,8 +1204,7 @@ fn a_holder_deep_inside_a_large_file_moves_too() {
     support::write_random(&movie, 200);
     // Not the first extent: the point of the shape is a holder whose file
     // offset is nowhere near its offset inside the extent.
-    let biggest = btrealloc::kernel::file_extents(&movie)
-        .expect("read the movie's extents")
+    let biggest = support::file_extents(&movie)
         .into_iter()
         .filter(|extent| extent.file_offset > 0)
         .max_by_key(|extent| extent.disk_bytes)
@@ -975,8 +1229,8 @@ fn a_holder_deep_inside_a_large_file_moves_too() {
     support::punch_hole(&movie, base, kept);
     support::punch_hole(&movie, base + kept + sectorsize, size - kept - sectorsize);
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let extent = scan
         .extents
@@ -985,11 +1239,11 @@ fn a_holder_deep_inside_a_large_file_moves_too() {
     assert_eq!(extent.refs.len(), 2, "the movie and the photo hold it");
     assert!(support::on_worklist(&worklist, address), "almost all waste");
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     for holder in [&movie, &photo] {
         assert!(
             !support::physical_extents(holder).contains(&address),
@@ -1001,7 +1255,7 @@ fn a_holder_deep_inside_a_large_file_moves_too() {
         !after.extents.contains_key(&address),
         "the extent is still there"
     );
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// Holders at the offsets inside the extent that they really have.
@@ -1015,12 +1269,11 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
 
     let fs = Fs::with_options(4096, "");
     let sectorsize = fs.sectorsize();
-    let data = fs.dir("data");
+    fs.dir("data");
 
     let big = fs.path("data/big");
     support::write_random_one_extent(&big, 128);
-    let biggest = btrealloc::kernel::file_extents(&big)
-        .expect("read the big file's extents")
+    let biggest = support::file_extents(&big)
         .into_iter()
         .max_by_key(|extent| extent.disk_bytes)
         .expect("the big file should hold an extent");
@@ -1051,8 +1304,8 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
     std::fs::remove_file(&big).expect("remove the big file");
     support::sync_fs();
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let extent = scan
         .extents
@@ -1061,11 +1314,11 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
     assert_eq!(extent.refs.len(), OFFSETS.len(), "every sliver found");
     assert!(support::on_worklist(&worklist, address), "almost all waste");
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     let left: Vec<_> = holders
         .iter()
         .filter(|h| support::physical_extents(h).contains(&address))
@@ -1079,7 +1332,7 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
         !after.extents.contains_key(&address),
         "the extent is still there"
     );
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// Two holders whose references into the extent begin together and end apart.
@@ -1089,14 +1342,13 @@ fn holders_at_arbitrary_extent_offsets_all_move() {
 fn a_holder_whose_reference_is_shorter_than_the_stretch_moves() {
     let fs = Fs::new();
     let sectorsize = fs.sectorsize();
-    let data = fs.dir("data");
+    fs.dir("data");
 
     let big = fs.path("data/big");
     support::write_random_one_extent(&big, FILE_MIB);
     let address = support::single_extent(&big);
 
-    // "long" is reached first in path order, so its two sectors are what the
-    // stretch is cut to; "short" then holds only the first of them.
+    // "long" holds two sectors of the stretch, "short" only the first of them.
     let long = fs.path("data/long.jpg");
     let short = fs.path("data/short.jpg");
     support::sliver_of(&big, 8 * MIB, &long, MIB, 8192, 2 * sectorsize);
@@ -1104,24 +1356,24 @@ fn a_holder_whose_reference_is_shorter_than_the_stretch_moves() {
     std::fs::remove_file(&big).expect("remove the big file");
     support::sync_fs();
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let extent = scan
         .extents
         .get(&address)
         .expect("the extent should survive");
     assert_eq!(extent.refs.len(), 2, "both holders should be found");
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     assert!(
         !after.extents.contains_key(&address),
         "the extent is still there"
     );
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// A live stretch tens of MiB long, held through a single reference: all of it
@@ -1132,12 +1384,11 @@ fn a_holder_whose_reference_is_shorter_than_the_stretch_moves() {
 #[test]
 fn a_long_live_stretch_moves_whole() {
     let fs = Fs::with_options(4096, "");
-    let data = fs.dir("data");
+    fs.dir("data");
 
     let movie = fs.path("data/movie.mov");
     support::write_random_one_extent(&movie, 200);
-    let biggest = btrealloc::kernel::file_extents(&movie)
-        .expect("read the movie's extents")
+    let biggest = support::file_extents(&movie)
         .into_iter()
         .max_by_key(|extent| extent.disk_bytes)
         .expect("the movie should hold an extent");
@@ -1155,8 +1406,8 @@ fn a_long_live_stretch_moves_whole() {
     support::punch_hole(&movie, base, start);
     support::punch_hole(&movie, base + start + LIVE, size - start - LIVE);
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let extent = scan
         .extents
@@ -1172,11 +1423,11 @@ fn a_long_live_stretch_moves_whole() {
         "most of it is waste"
     );
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     assert!(
         !support::physical_extents(&movie).contains(&address),
         "the movie still references the extent",
@@ -1185,7 +1436,7 @@ fn a_long_live_stretch_moves_whole() {
         !after.extents.contains_key(&address),
         "the extent is still there"
     );
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// The same long stretch, with a deduplicator's sliver sitting one sector deep
@@ -1195,12 +1446,11 @@ fn a_long_live_stretch_moves_whole() {
 #[test]
 fn a_holder_deep_inside_a_long_stretch_moves() {
     let fs = Fs::with_options(4096, "");
-    let data = fs.dir("data");
+    fs.dir("data");
 
     let movie = fs.path("data/movie.mov");
     support::write_random_one_extent(&movie, 200);
-    let biggest = btrealloc::kernel::file_extents(&movie)
-        .expect("read the movie's extents")
+    let biggest = support::file_extents(&movie)
         .into_iter()
         .max_by_key(|extent| extent.disk_bytes)
         .expect("the movie should hold an extent");
@@ -1221,8 +1471,8 @@ fn a_holder_deep_inside_a_long_stretch_moves() {
     support::punch_hole(&movie, base, start);
     support::punch_hole(&movie, base + start + LIVE, size - start - LIVE);
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     let extent = scan
         .extents
@@ -1239,11 +1489,11 @@ fn a_holder_deep_inside_a_long_stretch_moves() {
         "most of it is waste"
     );
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     for holder in [&movie, &photo] {
         assert!(
             !support::physical_extents(holder).contains(&address),
@@ -1255,7 +1505,7 @@ fn a_holder_deep_inside_a_long_stretch_moves() {
         !after.extents.contains_key(&address),
         "the extent is still there"
     );
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// A file whose size is not a whole number of sectors. Its last reference runs
@@ -1264,7 +1514,7 @@ fn a_holder_deep_inside_a_long_stretch_moves() {
 #[test]
 fn a_holder_with_a_short_last_block_moves() {
     let fs = Fs::new();
-    let data = fs.dir("data");
+    fs.dir("data");
 
     let file = fs.path("data/ragged");
     support::write_random(&file, FILE_MIB);
@@ -1282,27 +1532,28 @@ fn a_holder_with_a_short_last_block_moves() {
     // ragged one.
     support::punch_hole(&file, MIB, (FILE_MIB - 4) * MIB);
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     assert!(
         support::job_for(&worklist, &file).is_some(),
         "the file should be worth rewriting"
     );
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     let (allocated, used) = support::file_totals(&after, &file);
     assert_eq!(allocated, used, "nothing should be wasted afterwards");
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
-/// A layout nobody designed: files, holes, reflinks, deduplicator slivers and
-/// ragged truncations, at random offsets in a random order, then the whole run
-/// over whatever came out.
+/// A layout nobody designed: files, holes, reflinks, deduplicator slivers,
+/// ragged truncations, read-only snapshots and reflinks into another
+/// subvolume, at random offsets in a random order, then the whole run over
+/// whatever came out.
 ///
 /// The hand-written shapes above each test one thing we already thought of.
 /// This one tests the thing we did not: every extent the run reports freed has
@@ -1342,17 +1593,16 @@ fn random_layouts_release_every_extent() {
                 _ => "autodefrag,compress=zstd:3",
             },
         );
-        let data = fs.dir("data");
-        support::random_layout(&data, &mut rng);
+        support::random_layout(&fs, &mut rng);
 
-        let before = support::checksums(&data);
+        let before = support::checksums(fs.root());
         // apply() re-reads every holder of every extent the report calls freed,
         // and fails if one still points at it.
-        let (_, report) = support::apply(&data);
+        let (_, report) = support::apply(&fs);
         assert!(
-            report.corrupted.is_empty(),
+            report.modified.is_empty(),
             "seed {seed:#x}: {:?}",
-            report.corrupted
+            report.modified
         );
         assert!(
             report.skipped.is_empty(),
@@ -1361,7 +1611,7 @@ fn random_layouts_release_every_extent() {
         );
         assert_eq!(
             before,
-            support::checksums(&data),
+            support::checksums(fs.root()),
             "seed {seed:#x}: contents changed"
         );
     }
@@ -1379,7 +1629,7 @@ fn random_layouts_release_every_extent() {
 fn a_holder_ending_mid_block_lets_go() {
     let fs = Fs::new();
     let sectorsize = fs.sectorsize();
-    let data = fs.dir("data");
+    fs.dir("data");
     let (long, short) = (fs.path("data/long"), fs.path("data/short"));
     support::write_random_one_extent(&long, 8);
     support::reflink(&long, &short);
@@ -1412,18 +1662,18 @@ fn a_holder_ending_mid_block_lets_go() {
         "fixture: the tail is a part sector"
     );
 
-    let before = support::checksums(&data);
-    let scan = support::scan(&data);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
     let worklist = support::worklist(&scan);
     assert!(
         support::on_worklist(&worklist, extent),
         "the hole is most of it"
     );
 
-    let (_, report) = support::apply(&data);
-    assert!(report.corrupted.is_empty(), "{:?}", report.corrupted);
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
 
-    let after = support::scan(&data);
+    let after = support::scan(&fs);
     for file in [&long, &short] {
         assert!(
             !support::physical_extents(file).contains(&extent),
@@ -1435,5 +1685,5 @@ fn a_holder_ending_mid_block_lets_go() {
         !after.extents.contains_key(&extent),
         "the extent is still there"
     );
-    assert_eq!(before, support::checksums(&data), "contents changed");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }

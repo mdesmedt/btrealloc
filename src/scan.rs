@@ -1,14 +1,9 @@
-use std::collections::HashSet;
-use std::fs::ReadDir;
 use std::io;
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::Options;
-use crate::extent::Extent;
+use crate::extent::{Extent, LeftAlone};
 use crate::format::human;
-use crate::kernel::{self, Filesystem, Resolved, Resolver};
+use crate::kernel::{ExtentWalk, Filesystem, Resolved};
 
 /// Extents of one size class, the class being a power of two: everything from
 /// that size up to the next one.
@@ -62,39 +57,66 @@ impl Totals {
     }
 }
 
+/// Extents with unreachable space in them that were not rewritten, and how
+/// much of that space they hold, by reason.
+pub struct LeftAloneStats {
+    /// Indexed by position in [`LeftAlone::ALL`].
+    pub reasons: [Bucket; LeftAlone::ALL.len()],
+}
+
+impl LeftAloneStats {
+    const ZERO: LeftAloneStats = LeftAloneStats {
+        reasons: [Bucket::ZERO; LeftAlone::ALL.len()],
+    };
+
+    /// Counts one extent left alone. An extent the walk could not resolve is
+    /// counted with no bytes: it is not in the totals either.
+    pub fn add(&mut self, reason: LeftAlone, extent: Option<&Extent>) {
+        let bucket = &mut self.reasons[reason as usize];
+        bucket.count += 1;
+        if let Some(extent) = extent {
+            bucket.allocated_bytes += extent.disk_bytes;
+            bucket.used_bytes += extent.disk_used_bytes();
+            bucket.unreachable_bytes += extent.disk_free_bytes();
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reasons.iter().all(|bucket| bucket.count == 0)
+    }
+
+    pub fn get(&self, reason: LeftAlone) -> &Bucket {
+        &self.reasons[reason as usize]
+    }
+}
+
 /// What the walk has seen so far, counted as it goes: every extent is counted
 /// once, when it is discovered, and nothing about it is kept afterwards.
 pub struct ScanStats {
-    pub files: u64,
-    pub file_bytes: u64,
     pub extents: u64,
-    /// Extents left alone: freed while we scanned, or shared with an inode
-    /// outside this subvolume.
+    /// Extents left alone: they changed while they were being read, or
+    /// looking them up failed.
     pub skipped: u64,
     pub totals: Totals,
+    /// Extents with unreachable space that were not rewritten, by reason.
+    pub left_alone: LeftAloneStats,
 }
 
 impl ScanStats {
     const ZERO: ScanStats = ScanStats {
-        files: 0,
-        file_bytes: 0,
         extents: 0,
         skipped: 0,
         totals: Totals::ZERO,
+        left_alone: LeftAloneStats::ZERO,
     };
 
     /// Prints what the scan found: the totals, then the same split by extent size class.
     pub fn report(&self) {
         let totals = &self.totals;
-        println!("files:              {}", self.files);
-        println!("file size:          {}", human(self.file_bytes));
         println!("extents:            {}", self.extents);
         println!("allocated:          {}", human(totals.allocated_bytes));
         println!("used:               {}", human(totals.used_bytes));
         println!("unreachable:        {}", human(totals.unreachable_bytes));
-        if self.skipped != 0 {
-            println!("left alone:         {} extents", self.skipped);
-        }
 
         println!();
         println!("extent size rounded down to a power of two:");
@@ -115,143 +137,61 @@ impl ScanStats {
                 human(bucket.unreachable_bytes),
             );
         }
+
+        if !self.left_alone.is_empty() {
+            println!();
+            println!("extents with unreachable space left alone:");
+            println!(
+                "{:>32}  {:>10}  {:>12}  {:>12}  {:>12}",
+                "reason", "count", "allocated", "used", "unreachable"
+            );
+            for reason in LeftAlone::ALL {
+                let bucket = self.left_alone.get(reason);
+                if bucket.count == 0 {
+                    continue;
+                }
+                println!(
+                    "{:>32}  {:>10}  {:>12}  {:>12}  {:>12}",
+                    reason.label(),
+                    bucket.count,
+                    human(bucket.allocated_bytes),
+                    human(bucket.used_bytes),
+                    human(bucket.unreachable_bytes),
+                );
+            }
+        }
     }
 }
 
-/// Walks a tree depth-first, yielding each extent it discovers, fully resolved,
-/// and then forgetting it.
-///
-/// The walk is lazy: nothing is read ahead of the extent asked for beyond the
-/// stretch of the current file it was looked up with, so whatever is done with
-/// one extent, rewriting it included, is done before the walk goes on.
-///
-/// Memory stays small however big the tree: what is kept is the directories
-/// still to read, the one being read, the file being resolved, the addresses of
-/// shared extents already handed out, and the inodes of hardlinked files
-/// already read.
+/// Every data extent on the filesystem, fully resolved, counted into the stats
+/// as it is handed over and then forgotten. See [`ExtentWalk`].
 pub struct Scanner {
-    /// Options
-    options: Options,
-    /// Handle to the filesystem for looking up extents and their references.
-    fs: Rc<Filesystem>,
-    /// The device being walked: entries on any other are skipped.
-    dev: u64,
-    /// Directories not read yet, taken from the end, so the walk is depth-first
-    /// and this stays about as long as the tree is deep.
-    queue: Vec<PathBuf>,
-    /// The directory being read.
-    dir: Option<ReadDir>,
-    /// The path to scan, when it is a single file rather than a directory.
-    root_file: Option<(PathBuf, u64)>,
-    /// The file whose extents are being resolved.
-    file: Option<(Rc<PathBuf>, Resolver)>,
-    /// Extents already dealt with that another file could lead us back to:
-    /// those with more than one reference, and those left alone. An extent
-    /// with a single reference can only be reached through the one file
-    /// holding it, so it is never recorded here.
-    handled: HashSet<u64>,
-    /// Hardlinked files already read, by (device, inode). A file with a
-    /// single link can only be reached once, so it is never recorded here.
-    hardlinks: HashSet<(u64, u64)>,
+    walk: ExtentWalk,
     pub stats: ScanStats,
+    /// Why the walk ended early, if it did.
+    pub error: Option<io::Error>,
 }
 
 impl Scanner {
-    pub fn new(options: Options, fs: Rc<Filesystem>) -> io::Result<Scanner> {
-        let path = &options.path;
-        let meta = std::fs::metadata(path)?;
-        let (queue, root_file) = if meta.is_dir() {
-            (vec![path.to_path_buf()], None)
-        } else {
-            (Vec::new(), Some((path.to_path_buf(), meta.size())))
-        };
+    pub fn new(fs: &Rc<Filesystem>) -> io::Result<Scanner> {
         Ok(Scanner {
-            options,
-            fs,
-            dev: meta.dev(),
-            queue,
-            dir: None,
-            root_file,
-            file: None,
-            handled: HashSet::new(),
-            hardlinks: HashSet::new(),
+            walk: fs.walk()?,
             stats: ScanStats::ZERO,
+            error: None,
         })
     }
+}
 
-    /// The next file to scan, with its size: the next regular file in the
-    /// directory being read, or in the next directory with one. Directories met
-    /// along the way are queued. `None` once the walk is complete.
-    fn next_file(&mut self) -> Option<(PathBuf, u64)> {
-        if let Some(file) = self.root_file.take() {
-            return Some(file);
-        }
+impl Iterator for Scanner {
+    type Item = Extent;
+
+    /// The next extent the walk discovers, with every reference to it,
+    /// wherever on the filesystem that reference is. Extents left alone are
+    /// counted and passed over.
+    fn next(&mut self) -> Option<Extent> {
         loop {
-            if let Some(dir) = &mut self.dir {
-                for entry in dir.flatten() {
-                    let path = entry.path();
-                    let Ok(meta) = entry.metadata() else { continue };
-
-                    if meta.dev() != self.dev {
-                        continue;
-                    }
-                    if meta.is_dir() {
-                        self.queue.push(path);
-                    } else if meta.is_file()
-                        && (meta.nlink() <= 1 || self.hardlinks.insert((meta.dev(), meta.ino())))
-                    {
-                        return Some((path, meta.size()));
-                    }
-                }
-                self.dir = None;
-            }
-
-            let dir = self.queue.pop()?;
-            match std::fs::read_dir(&dir) {
-                Ok(entries) => self.dir = Some(entries),
-                Err(e) => eprintln!("skipping {}: {e}", dir.display()),
-            }
-        }
-    }
-
-    /// Starts resolving the extents of a file, all but those already handled.
-    fn open_file(&mut self, path: PathBuf, size: u64) {
-        let refs = match kernel::file_extents(&path) {
-            Ok(refs) => refs,
-            Err(e) => {
-                eprintln!("skipping {}: {e}", path.display());
-                return;
-            }
-        };
-
-        if self.options.verbose {
-            println!(
-                "{}: {} bytes {} refs",
-                path.display(),
-                human(size),
-                refs.len()
-            );
-        }
-
-        self.stats.files += 1;
-        self.stats.file_bytes += size;
-        let refs = refs
-            .into_iter()
-            .filter(|r| !self.handled.contains(&r.disk_address))
-            .collect();
-        self.file = Some((Rc::new(path), self.fs.resolve_extents(refs)));
-    }
-
-    /// The next extent of the file being resolved, if there is one left.
-    /// Extents left alone are counted and passed over.
-    fn next_in_file(&mut self) -> Option<Extent> {
-        let (path, resolver) = self.file.as_mut()?;
-        for resolved in resolver {
-            match resolved {
+            match self.walk.next()? {
                 Ok(Resolved::Extent(extent)) => {
-                    if extent.refs.len() > 1 {
-                        self.handled.insert(extent.disk_address);
-                    }
                     self.stats.extents += 1;
                     self.stats.totals.add(&extent);
                     return Some(extent);
@@ -260,39 +200,15 @@ impl Scanner {
                     disk_address,
                     error,
                 }) => {
-                    match error {
-                        Some(e) => eprintln!("extent {disk_address:#x}: {e}"),
-                        None => eprintln!(
-                            "extent {disk_address:#x}: shared with a snapshot or otherwise \
-                             unresolvable, leaving it alone"
-                        ),
-                    }
-                    self.handled.insert(disk_address);
+                    eprintln!("extent {disk_address:#x}: {error}, leaving it alone");
                     self.stats.skipped += 1;
+                    self.stats.left_alone.add(LeftAlone::Unresolved, None);
                 }
                 Err(e) => {
-                    eprintln!("skipping the rest of {}: {e}", path.display());
-                    break;
+                    self.error = Some(e);
+                    return None;
                 }
             }
-        }
-        self.file = None;
-        None
-    }
-}
-
-impl Iterator for Scanner {
-    type Item = Extent;
-
-    /// The next extent the walk discovers, with every reference to it,
-    /// wherever on the filesystem that reference is.
-    fn next(&mut self) -> Option<Extent> {
-        loop {
-            if let Some(extent) = self.next_in_file() {
-                return Some(extent);
-            }
-            let (path, size) = self.next_file()?;
-            self.open_file(path, size);
         }
     }
 }

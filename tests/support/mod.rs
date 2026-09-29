@@ -1,12 +1,17 @@
 //! Building throwaway btrfs filesystems to test against, and reading them back.
 //!
 //! Every test gets its own filesystem: a tmpfs, an image inside it, and a loop
-//! mount of that image, all torn down when the [`Fs`] goes out of scope. Nothing
-//! is shared between tests, so no test depends on what another one applied.
+//! mount of that image's top-level subvolume, all torn down when the [`Fs`]
+//! goes out of scope. Nothing is shared between tests, so no test depends on
+//! what another one applied.
 //!
 //! The shapes below are the ones btrealloc distinguishes, built with the same
 //! operations the kernel sees from `dd`, `fallocate --punch-hole`,
 //! `cp --reflink` and `chattr +C`, done here as plain syscalls.
+//!
+//! What the tests read back about a file's extents, they read with their own
+//! code rather than the tool's: the two drifting apart then shows up as a
+//! failure rather than as agreement.
 
 #![allow(dead_code)] // each test uses a different corner of this
 
@@ -14,15 +19,24 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use linux_raw_sys::general::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FS_NOCOW_FL};
-use linux_raw_sys::ioctl::{FICLONE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS};
+use linux_raw_sys::btrfs::{
+    BTRFS_EXTENT_DATA_KEY, BTRFS_FILE_EXTENT_INLINE, BTRFS_FIRST_FREE_OBJECTID,
+    btrfs_file_extent_item, btrfs_ioctl_ino_lookup_args, btrfs_ioctl_search_header,
+    btrfs_ioctl_search_key,
+};
+use linux_raw_sys::general::{
+    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FS_NOCOW_FL, RLIMIT_NOFILE, rlimit, statfs,
+};
+use linux_raw_sys::ioctl::{
+    BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_TREE_SEARCH_V2, FICLONE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS,
+};
 use sha2::{Digest, Sha256};
 
 use btrealloc::Options;
@@ -36,7 +50,10 @@ pub const MIB: u64 = 1 << 20;
 unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> c_int;
     fn fallocate(fd: c_int, mode: c_int, offset: i64, len: i64) -> c_int;
+    fn fstatfs(fd: c_int, buf: *mut statfs) -> c_int;
     fn sync();
+    fn getrlimit(resource: c_int, rlim: *mut rlimit) -> c_int;
+    fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_int;
 }
 
 /// Runs a command, or fails the test with everything it said.
@@ -94,9 +111,10 @@ impl Fs {
             .expect("make the image file");
         must("mkfs.btrfs", &["-q", img.to_str().unwrap()]);
 
+        // The top-level subvolume, as btrealloc expects to be given.
         let opts = match mountopts {
-            "" => "loop".to_string(),
-            extra => format!("loop,{extra}"),
+            "" => "loop,subvolid=5".to_string(),
+            extra => format!("loop,subvolid=5,{extra}"),
         };
         must(
             "mount",
@@ -108,6 +126,11 @@ impl Fs {
     /// The mount point itself: everything a run could have touched is below it.
     pub fn root(&self) -> &Path {
         &self.mnt
+    }
+
+    /// The tmpfs the filesystem's image lives in, which is not btrfs.
+    pub fn tmpfs(&self) -> PathBuf {
+        self.base.join("tmpfs")
     }
 
     pub fn path(&self, rel: &str) -> PathBuf {
@@ -125,9 +148,19 @@ impl Fs {
     /// assumed: it is the page size at mkfs time, which is not 4096 on every
     /// architecture.
     pub fn sectorsize(&self) -> u64 {
-        kernel::Filesystem::open(&self.mnt)
-            .expect("open the fixture filesystem")
-            .sectorsize
+        sectorsize(&self.mnt)
+    }
+
+    /// The loop device the filesystem is on.
+    fn device(&self) -> String {
+        let source = Command::new("findmnt")
+            .args(["-no", "SOURCE", self.mnt.to_str().unwrap()])
+            .output()
+            .expect("run findmnt");
+        let source = String::from_utf8_lossy(&source.stdout);
+        // findmnt names a mount of a subvolume other than the top-level one as
+        // `device[/subvolume]`.
+        source.trim().split('[').next().unwrap().to_string()
     }
 
     /// The subvolume at `rel`, made new.
@@ -165,6 +198,19 @@ impl Fs {
         to
     }
 
+    /// Deletes the subvolume at `rel`, and waits for the deletion to be cleaned
+    /// up.
+    ///
+    /// The cleaner otherwise sleeps until the next periodic commit, 30 seconds
+    /// away by default. A filesystem sync wakes it, where a plain `sync` does not.
+    pub fn delete_subvolume(&self, rel: &str) {
+        let path = self.path(rel);
+        must("btrfs", &["subvolume", "delete", path.to_str().unwrap()]);
+        must("btrfs", &["filesystem", "sync", self.mnt.to_str().unwrap()]);
+        must("btrfs", &["subvolume", "sync", self.mnt.to_str().unwrap()]);
+        sync_fs();
+    }
+
     /// Snapshots the subvolume at `from` as `to`, then deletes `from` and waits
     /// for the deletion to be cleaned up.
     ///
@@ -173,34 +219,81 @@ impl Fs {
     /// subvolume: the data extents those leaves point at come out with shared
     /// data backreferences, as on any filesystem with snapshot history.
     pub fn snapshot_and_delete(&self, from: &str, to: &str) -> PathBuf {
-        let (from, to) = (self.path(from), self.path(to));
+        let path = self.path(to);
         sync_fs();
         must(
             "btrfs",
             &[
                 "subvolume",
                 "snapshot",
-                from.to_str().unwrap(),
-                to.to_str().unwrap(),
+                self.path(from).to_str().unwrap(),
+                path.to_str().unwrap(),
             ],
         );
-        must("btrfs", &["subvolume", "delete", from.to_str().unwrap()]);
-        must("btrfs", &["subvolume", "sync", self.mnt.to_str().unwrap()]);
-        sync_fs();
-        to
+        self.delete_subvolume(from);
+        path
+    }
+
+    /// Whether the subvolume at `rel` is read-only.
+    pub fn is_readonly(&self, rel: &str) -> bool {
+        let output = Command::new("btrfs")
+            .args([
+                "property",
+                "get",
+                "-ts",
+                self.path(rel).to_str().unwrap(),
+                "ro",
+            ])
+            .output()
+            .expect("run btrfs property get");
+        String::from_utf8_lossy(&output.stdout).trim() == "ro=true"
+    }
+
+    /// The subvolume at `rel` mounted again on its own, somewhere outside this
+    /// mount, as a system mounts its root or home subvolume.
+    pub fn mount_subvolume(&self, rel: &str) -> Mount {
+        let path = self.base.join(format!("subvol-{}", rel.replace('/', "-")));
+        std::fs::create_dir_all(&path).expect("make the mount point");
+        must(
+            "mount",
+            &[
+                "-o",
+                &format!("subvol={rel}"),
+                &self.device(),
+                path.to_str().unwrap(),
+            ],
+        );
+        Mount { path }
+    }
+
+    /// The top-level subvolume mounted again, read-only.
+    pub fn mount_readonly(&self) -> Mount {
+        let path = self.base.join("readonly");
+        std::fs::create_dir_all(&path).expect("make the mount point");
+        must(
+            "mount",
+            &["--bind", self.mnt.to_str().unwrap(), path.to_str().unwrap()],
+        );
+        let mount = Mount { path };
+        must(
+            "mount",
+            &["-o", "remount,bind,ro", mount.path.to_str().unwrap()],
+        );
+        mount
     }
 
     /// How many shared data backreferences the extent tree holds, read from
     /// the device with `btrfs inspect-internal dump-tree`.
     pub fn shared_data_backrefs(&self) -> usize {
         sync_fs();
-        let source = Command::new("findmnt")
-            .args(["-no", "SOURCE", self.mnt.to_str().unwrap()])
-            .output()
-            .expect("run findmnt");
-        let device = String::from_utf8_lossy(&source.stdout).trim().to_string();
         let dump = Command::new("btrfs")
-            .args(["inspect-internal", "dump-tree", "-t", "extent", &device])
+            .args([
+                "inspect-internal",
+                "dump-tree",
+                "-t",
+                "extent",
+                &self.device(),
+            ])
             .output()
             .expect("run btrfs inspect-internal dump-tree");
         assert!(
@@ -222,6 +315,27 @@ impl Drop for Fs {
         let _ = Command::new("umount").arg(self.base.join("tmpfs")).status();
         let _ = std::fs::remove_dir_all(&self.base);
     }
+}
+
+/// A second mount of an [`Fs`], unmounted when this is dropped.
+pub struct Mount {
+    pub path: PathBuf,
+}
+
+impl Drop for Mount {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.path).status();
+    }
+}
+
+/// The sector size of the btrfs filesystem `path` is on, which it reports as
+/// its block size.
+pub fn sectorsize(path: &Path) -> u64 {
+    let file = File::open(path).expect("open a path to statfs");
+    let mut buf: statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { fstatfs(file.as_raw_fd(), &raw mut buf) };
+    assert!(rc == 0, "statfs: {}", std::io::Error::last_os_error());
+    buf.f_bsize as u64
 }
 
 /// `mib` MiB of incompressible data, so compressed and uncompressed runs
@@ -295,6 +409,7 @@ pub fn bookend(path: &Path, mib: u64) {
 }
 
 /// A copy sharing the original's extents, as `cp --reflink=always` makes.
+/// The two can be in different subvolumes of the same mount.
 pub fn reflink(src: &Path, dest: &Path) {
     let src = File::open(src).expect("open the reflink source");
     let dest = File::create(dest).expect("create the reflink destination");
@@ -342,6 +457,47 @@ pub fn sync_fs() {
     unsafe { sync() };
 }
 
+/// Lowers the soft limit on files this process may have open to `soft`, until
+/// this is dropped and the limit it replaced comes back.
+pub struct OpenFilesLimit {
+    previous: rlimit,
+}
+
+impl OpenFilesLimit {
+    pub fn lower_to(soft: u64) -> OpenFilesLimit {
+        let mut previous = rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = unsafe { getrlimit(RLIMIT_NOFILE as c_int, &mut previous) };
+        assert!(rc == 0, "getrlimit: {}", std::io::Error::last_os_error());
+        let lowered = rlimit {
+            rlim_cur: soft.min(previous.rlim_cur),
+            rlim_max: previous.rlim_max,
+        };
+        let rc = unsafe { setrlimit(RLIMIT_NOFILE as c_int, &lowered) };
+        assert!(rc == 0, "setrlimit: {}", std::io::Error::last_os_error());
+        OpenFilesLimit { previous }
+    }
+
+    /// The soft limit now in force.
+    pub fn soft(&self) -> u64 {
+        let mut current = rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = unsafe { getrlimit(RLIMIT_NOFILE as c_int, &mut current) };
+        assert!(rc == 0, "getrlimit: {}", std::io::Error::last_os_error());
+        current.rlim_cur
+    }
+}
+
+impl Drop for OpenFilesLimit {
+    fn drop(&mut self) {
+        unsafe { setrlimit(RLIMIT_NOFILE as c_int, &self.previous) };
+    }
+}
+
 /// The SHA-256 of every file under `dir`, by path. Replaces the shell suite's
 /// `md5sum` pass: contents must never change under a rewrite.
 pub fn checksums(dir: &Path) -> BTreeMap<PathBuf, [u8; 32]> {
@@ -364,8 +520,9 @@ pub fn checksums(dir: &Path) -> BTreeMap<PathBuf, [u8; 32]> {
     sums
 }
 
-/// Every entry under `dir`, sorted. A temporary file left anywhere on the
-/// filesystem turns up here, not just one under a name we guessed.
+/// Every entry under `dir`, sorted, subvolumes and snapshots included. A
+/// temporary file left anywhere on the filesystem turns up here, not just one
+/// under a name we guessed.
 pub fn listing(dir: &Path) -> Vec<PathBuf> {
     let mut entries = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -382,11 +539,117 @@ pub fn listing(dir: &Path) -> Vec<PathBuf> {
     entries
 }
 
+/// One reference a file holds into an extent, as its file extent item records
+/// it.
+pub struct FileExtent {
+    pub disk_address: u64,
+    pub disk_bytes: u64,
+    pub file_offset: u64,
+    pub extent_offset: u64,
+    pub num_bytes: u64,
+}
+
+/// `struct btrfs_ioctl_search_args_v2` with room for a few hundred items.
+#[repr(C)]
+struct SearchArgs {
+    key: btrfs_ioctl_search_key,
+    buf_size: u64,
+    buf: [u8; SEARCH_BUF_SIZE],
+}
+
+const SEARCH_BUF_SIZE: usize = 64 * 1024;
+
+/// Every file extent item of inode `inode` in subvolume `tree_id`, searched for
+/// through `fd`: a tree id of zero means the subvolume `fd` is in. Holes and
+/// inline extents are left out; they occupy no extent of their own.
+fn search_file_extents(fd: c_int, tree_id: u64, inode: u64) -> Vec<FileExtent> {
+    const HEADER_SIZE: usize = size_of::<btrfs_ioctl_search_header>();
+    let mut args: Box<SearchArgs> = Box::new(unsafe { std::mem::zeroed() });
+    args.key.tree_id = tree_id;
+    args.key.min_objectid = inode;
+    args.key.max_objectid = inode;
+    args.key.min_type = BTRFS_EXTENT_DATA_KEY;
+    args.key.max_type = BTRFS_EXTENT_DATA_KEY;
+    args.key.max_offset = u64::MAX;
+    args.key.max_transid = u64::MAX;
+    args.buf_size = SEARCH_BUF_SIZE as u64;
+
+    let mut extents = Vec::new();
+    loop {
+        args.key.nr_items = u32::MAX;
+        let rc = unsafe {
+            ioctl(
+                fd,
+                BTRFS_IOC_TREE_SEARCH_V2 as c_ulong,
+                (&raw mut *args).cast(),
+            )
+        };
+        assert!(rc == 0, "tree search: {}", std::io::Error::last_os_error());
+        if args.key.nr_items == 0 {
+            return extents;
+        }
+
+        let mut pos = 0;
+        for _ in 0..args.key.nr_items {
+            let header: btrfs_ioctl_search_header =
+                unsafe { std::ptr::read_unaligned(args.buf[pos..].as_ptr().cast()) };
+            let item = &args.buf[pos + HEADER_SIZE..pos + HEADER_SIZE + header.len as usize];
+            pos += HEADER_SIZE + header.len as usize;
+            // The next search carries on past this item.
+            args.key.min_offset = header.offset + 1;
+
+            assert!(item.len() >= size_of::<btrfs_file_extent_item>());
+            let fe: btrfs_file_extent_item =
+                unsafe { std::ptr::read_unaligned(item.as_ptr().cast()) };
+            if fe.type_ as u32 == BTRFS_FILE_EXTENT_INLINE as u32 || fe.disk_bytenr == 0 {
+                continue;
+            }
+            extents.push(FileExtent {
+                disk_address: fe.disk_bytenr,
+                disk_bytes: fe.disk_num_bytes,
+                file_offset: header.offset,
+                extent_offset: fe.offset,
+                num_bytes: fe.num_bytes,
+            });
+        }
+    }
+}
+
+/// Every extent reference the file at `path` holds.
+pub fn file_extents(path: &Path) -> Vec<FileExtent> {
+    let file = File::open(path).expect("open the file to read its extents");
+    let inode = file.metadata().expect("stat the file").ino();
+    search_file_extents(file.as_raw_fd(), 0, inode)
+}
+
+/// Every extent reference inode `inode` of subvolume `root` holds, read
+/// through the top-level subvolume mounted at `mount`, with no path needed.
+pub fn file_extents_of(mount: &Path, root: u64, inode: u64) -> Vec<FileExtent> {
+    let dir = File::open(mount).expect("open the mount");
+    search_file_extents(dir.as_raw_fd(), root, inode)
+}
+
+/// The subvolume tree id and inode number of the file at `path`, which is how
+/// the tool names the files holding an extent.
+pub fn identity(path: &Path) -> (u64, u64) {
+    let file = File::open(path).expect("open the file to identify");
+    let mut args: btrfs_ioctl_ino_lookup_args = unsafe { std::mem::zeroed() };
+    args.objectid = BTRFS_FIRST_FREE_OBJECTID as u64;
+    let rc = unsafe {
+        ioctl(
+            file.as_raw_fd(),
+            BTRFS_IOC_INO_LOOKUP as c_ulong,
+            (&raw mut args).cast(),
+        )
+    };
+    assert!(rc == 0, "inode lookup: {}", std::io::Error::last_os_error());
+    (args.treeid, file.metadata().expect("stat the file").ino())
+}
+
 /// The physical addresses of a file's extents. Same answer `filefrag -v` gives,
 /// without parsing it: two files at the same address share one copy.
 pub fn physical_extents(path: &Path) -> Vec<u64> {
-    let mut addresses: Vec<u64> = kernel::file_extents(path)
-        .expect("read the file's extents")
+    let mut addresses: Vec<u64> = file_extents(path)
         .iter()
         .map(|extent| extent.disk_address)
         .collect();
@@ -413,12 +676,18 @@ pub fn single_extent(path: &Path) -> u64 {
     addresses[0]
 }
 
+/// Whether the file at `path` holds `extent`, going by what the scan found.
+fn holds(extent: &Extent, id: (u64, u64)) -> bool {
+    extent.refs.iter().any(|r| (r.root, r.inode) == id)
+}
+
 /// The extents holding `path`, each with the address it lives at.
 pub fn extents_of<'a>(scan: &'a Scan, path: &Path) -> Vec<(u64, &'a Extent)> {
+    let id = identity(path);
     let mut extents: Vec<(u64, &Extent)> = scan
         .extents
         .iter()
-        .filter(|(_, extent)| extent.refs.iter().any(|r| **r.path == *path))
+        .filter(|(_, extent)| holds(extent, id))
         .map(|(&address, extent)| (address, extent))
         .collect();
     extents.sort_by_key(|&(address, _)| address);
@@ -426,7 +695,7 @@ pub fn extents_of<'a>(scan: &'a Scan, path: &Path) -> Vec<(u64, &'a Extent)> {
 }
 
 /// What the extents holding `path` allocate, and how much of that anything
-/// under the scan still uses. Equal means nothing in them is wasted.
+/// on the filesystem still uses. Equal means nothing in them is wasted.
 pub fn file_totals(scan: &Scan, path: &Path) -> (u64, u64) {
     let mut allocated = 0;
     let mut used = 0;
@@ -461,26 +730,21 @@ pub fn on_worklist(worklist: &[&Extent], address: u64) -> bool {
 
 /// The extent on the worklist that `path` holds, if any.
 pub fn job_for<'a>(worklist: &[&'a Extent], path: &Path) -> Option<&'a Extent> {
-    worklist
-        .iter()
-        .copied()
-        .find(|extent| extent.refs.iter().any(|r| **r.path == *path))
+    let id = identity(path);
+    worklist.iter().copied().find(|extent| holds(extent, id))
 }
 
-fn options(path: &Path, apply: bool, dryrun: bool) -> Options {
+pub fn options(path: &Path, apply: bool, dryrun: bool) -> Options {
     Options {
         path: path.to_path_buf(),
         apply,
         dryrun,
-        // Hashing either side of every rewrite: the tests want the strictest
-        // check the tool can make of itself.
-        verify: apply,
         verbose: false,
     }
 }
 
-/// Every extent under a path, kept in memory at once so a test can look at the
-/// whole picture before and after a run.
+/// Every extent on the filesystem, kept in memory at once so a test can look
+/// at the whole picture before and after a run.
 pub struct Scan {
     pub extents: HashMap<u64, Extent>,
     pub stats: ScanStats,
@@ -494,16 +758,21 @@ impl Scan {
     }
 }
 
-/// Walks `dir` with the tool's own scanner and keeps every extent it hands
-/// over, where the tool would drop each one once dealt with.
-pub fn scan(dir: &Path) -> Scan {
-    let fs = kernel::Filesystem::open(dir).expect("open the fixture's filesystem");
-    let mut scanner =
-        Scanner::new(options(dir, false, false), Rc::new(fs)).expect("scan the fixture");
+/// Walks the filesystem with the tool's own scanner and keeps every extent it
+/// hands over, where the tool would drop each one once dealt with.
+pub fn scan(fs: &Fs) -> Scan {
+    let filesystem =
+        Rc::new(kernel::Filesystem::open(fs.root()).expect("open the fixture's filesystem"));
+    let mut scanner = Scanner::new(&filesystem).expect("start the walk");
     let extents = scanner
         .by_ref()
         .map(|extent| (extent.disk_address, extent))
         .collect();
+    assert!(
+        scanner.error.is_none(),
+        "the walk failed: {:?}",
+        scanner.error
+    );
     Scan {
         extents,
         stats: scanner.stats,
@@ -512,14 +781,14 @@ pub fn scan(dir: &Path) -> Scan {
 
 /// Scans, rewrites, and syncs, then returns the scan it worked from and what it
 /// did. Assert on the report; the same lines were printed as it went.
-pub fn apply(dir: &Path) -> (Scan, Report) {
-    let options = options(dir, true, false);
+pub fn apply(fs: &Fs) -> (Scan, Report) {
+    let options = options(fs.root(), true, false);
     // Scanned beforehand, so the check below knows which holders each
     // rewritten extent had.
-    let scan = scan(dir);
+    let scan = scan(fs);
     let (_, report) = btrealloc::run(&options).expect("run over the fixture");
     sync_fs();
-    assert_released(&scan, &report);
+    assert_released(fs, &scan, &report);
     (scan, report)
 }
 
@@ -530,7 +799,7 @@ pub fn apply(dir: &Path) -> (Scan, Report) {
 /// The run then counts the job done and its bytes freed, and nothing downstream
 /// notices: the extent stays allocated with a live reference into it. Checking
 /// it here makes every apply in the suite a test for that.
-fn assert_released(scan: &Scan, report: &Report) {
+fn assert_released(fs: &Fs, scan: &Scan, report: &Report) {
     use std::fmt::Write;
 
     let mut trouble = String::new();
@@ -539,10 +808,9 @@ fn assert_released(scan: &Scan, report: &Report) {
             continue;
         }
         let holders = extent.holders();
-        let mut stuck: Vec<(&Rc<PathBuf>, Vec<String>)> = Vec::new();
+        let mut stuck: Vec<((u64, u64), Vec<String>)> = Vec::new();
         for holder in &holders {
-            let left: Vec<String> = kernel::file_extents(holder.path)
-                .expect("re-read a holder's extents")
+            let left: Vec<String> = file_extents_of(fs.root(), holder.root, holder.inode)
                 .iter()
                 .filter(|e| e.disk_address == extent.disk_address)
                 .map(|e| {
@@ -553,7 +821,7 @@ fn assert_released(scan: &Scan, report: &Report) {
                 })
                 .collect();
             if !left.is_empty() {
-                stuck.push((holder.path, left));
+                stuck.push(((holder.root, holder.inode), left));
             }
         }
         if stuck.is_empty() {
@@ -576,12 +844,10 @@ fn assert_released(scan: &Scan, report: &Report) {
             copy_ranges(extent)
         );
         for holder in &holders {
-            let size = std::fs::metadata(&**holder.path).map(|m| m.len());
             let _ = writeln!(
                 trouble,
-                "  holder {} ({:?} bytes)",
-                holder.path.display(),
-                size,
+                "  holder: inode {} of subvolume {}",
+                holder.inode, holder.root,
             );
             for r in &holder.refs {
                 let _ = writeln!(
@@ -591,8 +857,8 @@ fn assert_released(scan: &Scan, report: &Report) {
                 );
             }
         }
-        for (path, left) in stuck {
-            let _ = writeln!(trouble, "  STILL HOLDS: {}", path.display());
+        for ((root, inode), left) in stuck {
+            let _ = writeln!(trouble, "  STILL HOLDS: inode {inode} of subvolume {root}");
             for line in left {
                 let _ = writeln!(trouble, "    {line}");
             }
@@ -625,9 +891,9 @@ fn copy_ranges(extent: &Extent) -> Vec<(u64, u64)> {
 
 /// The same walk with nothing written, which must leave the filesystem exactly
 /// as it was.
-pub fn dryrun(dir: &Path) -> (Scan, Report) {
-    let options = options(dir, false, true);
-    let scan = scan(dir);
+pub fn dryrun(fs: &Fs) -> (Scan, Report) {
+    let options = options(fs.root(), false, true);
+    let scan = scan(fs);
     let (_, report) = btrealloc::run(&options).expect("run over the fixture");
     (scan, report)
 }
@@ -683,9 +949,7 @@ pub fn sliver_of(
 /// Another sliver into a file that already has some: [`sliver`] builds the
 /// destination, this one only points one more of its sectors at `src`.
 pub fn sliver_into(src: &Path, src_offset: u64, dest: &Path, dest_offset: u64) {
-    let sectorsize = kernel::Filesystem::open(src)
-        .expect("open the fixture filesystem")
-        .sectorsize;
+    let sectorsize = sectorsize(src);
 
     let mut sector = vec![0u8; sectorsize as usize];
     let src_file = File::open(src).expect("open the sliver source");
@@ -772,21 +1036,23 @@ pub fn write_pattern(path: &Path, len: u64, rng: &mut Rng, compressible: bool) {
     sync_fs();
 }
 
-/// A filesystem laid out at random: a few files, then a run of the operations
-/// which leave the shapes btrealloc has to handle, in an order and at offsets no
-/// hand-written fixture would think of.
+/// A filesystem laid out at random: a few files in a `data` subvolume, then a
+/// run of the operations which leave the shapes btrealloc has to handle, in an
+/// order and at offsets no hand-written fixture would think of. Among them,
+/// read-only snapshots of `data`, and reflinks into a second subvolume, so an
+/// extent can end up held from several subvolumes at once.
 ///
 /// The shape is not the point, the oracle is: whatever comes out, every extent
 /// the run reports freed has to really be released, and no file may come back
 /// holding different bytes. Rebuilding a failure needs only the seed.
-pub fn random_layout(dir: &Path, rng: &mut Rng) -> Vec<PathBuf> {
-    let sectorsize = kernel::Filesystem::open(dir)
-        .expect("open the fixture filesystem")
-        .sectorsize;
+pub fn random_layout(fs: &Fs, rng: &mut Rng) -> Vec<PathBuf> {
+    let sectorsize = fs.sectorsize();
+    let data = fs.subvolume("data");
+    let other = fs.subvolume("other");
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut next = 0;
-    let name = |files: &mut Vec<PathBuf>, next: &mut u64| {
+    let name = |dir: &Path, files: &mut Vec<PathBuf>, next: &mut u64| {
         let path = dir.join(format!("f{next}"));
         *next += 1;
         files.push(path.clone());
@@ -802,7 +1068,7 @@ pub fn random_layout(dir: &Path, rng: &mut Rng) -> Vec<PathBuf> {
             rng.between(1, 8)
         };
         let compressible = rng.below(4) == 0;
-        let path = name(&mut files, &mut next);
+        let path = name(&data, &mut files, &mut next);
         write_pattern(&path, mib * MIB, rng, compressible);
     }
 
@@ -815,7 +1081,7 @@ pub fn random_layout(dir: &Path, rng: &mut Rng) -> Vec<PathBuf> {
         if size < 8 * sectorsize {
             continue;
         }
-        match rng.below(6) {
+        match rng.below(8) {
             // Drop a stretch of a file, which is what leaves an extent partly
             // unreachable in the first place.
             0 | 1 => {
@@ -827,14 +1093,14 @@ pub fn random_layout(dir: &Path, rng: &mut Rng) -> Vec<PathBuf> {
             }
             // A second file over the same extents.
             2 => {
-                let path = name(&mut files, &mut next);
+                let path = name(&data, &mut files, &mut next);
                 reflink(&victim, &path);
             }
             // What a block-level deduplicator leaves: one sector of a small file
             // pointed into the middle of a much larger extent.
             3 => {
                 let offset = rng.below(size - sectorsize) & !(sectorsize - 1);
-                let path = name(&mut files, &mut next);
+                let path = name(&data, &mut files, &mut next);
                 sliver(&victim, offset, &path, rng.between(1, 2) * MIB, sectorsize);
             }
             // A reference of more than one sector, so two holders can hold
@@ -842,18 +1108,29 @@ pub fn random_layout(dir: &Path, rng: &mut Rng) -> Vec<PathBuf> {
             4 => {
                 let offset = rng.below(size - 4 * sectorsize) & !(sectorsize - 1);
                 let len = rng.between(1, 4) * sectorsize;
-                let path = name(&mut files, &mut next);
+                let path = name(&data, &mut files, &mut next);
                 sliver_of(&victim, offset, &path, 4 * MIB, sectorsize, len);
             }
             // A size which is not a whole number of sectors, so the last
             // reference runs past the end of the data.
-            _ => {
+            5 => {
                 let to = rng.between(size / 2, size - 1) - rng.below(sectorsize - 1);
                 let _ = OpenOptions::new()
                     .write(true)
                     .open(&victim)
                     .and_then(|f| f.set_len(to));
                 sync_fs();
+            }
+            // The same extents held from another subvolume.
+            6 => {
+                let path = name(&other, &mut files, &mut next);
+                reflink(&victim, &path);
+            }
+            // A read-only snapshot of everything in `data` so far, which the
+            // operations after it leave behind.
+            _ => {
+                fs.snapshot("data", &format!("snapshot{next}"));
+                next += 1;
             }
         }
     }

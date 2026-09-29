@@ -11,8 +11,3 @@ pub fn human(bytes: u64) -> String {
     }
     format!("{value:.2} {}", UNITS[unit])
 }
-
-/// A digest as lowercase hex, for printing.
-pub fn hex(digest: &[u8; 32]) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
