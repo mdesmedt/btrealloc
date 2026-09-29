@@ -1013,6 +1013,8 @@ impl Iterator for ExtentWalk {
 /// of `objectid` from that subvolume's root.
 fn ino_lookup(fd: c_int, treeid: u64, objectid: u64) -> io::Result<PathBuf> {
     ino_lookup_args(fd, treeid, objectid).map(|args| {
+        // `name` is `c_char`: `i8` on x86_64, but already `u8` on aarch64.
+        #[allow(clippy::unnecessary_cast)]
         let name: Vec<u8> = args.name.iter().map(|&c| c as u8).collect();
         PathBuf::from(cstr_bytes(&name))
     })
