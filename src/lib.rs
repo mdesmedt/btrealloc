@@ -6,7 +6,7 @@ pub mod scan;
 
 use std::io;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use kernel::Filesystem;
 use run::{Report, Runner};
@@ -23,7 +23,7 @@ pub struct Options {
 
 /// Main entry point. Scans the filesystem and performs the reallocation operation.
 pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
-    let fs = Rc::new(Filesystem::open(&options.path)?);
+    let fs = Arc::new(Filesystem::open(&options.path)?);
     if options.apply && fs.read_only {
         return Err(io::Error::other(
             "mounted read-only: --apply needs the filesystem mounted read-write",

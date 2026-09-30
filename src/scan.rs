@@ -1,5 +1,5 @@
 use std::io;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::Options;
 use crate::extent::{Extent, LeftAlone};
@@ -170,7 +170,7 @@ impl ScanStats {
 /// Every data extent on the filesystem, fully resolved, counted into the stats
 /// as it is handed over and then forgotten. See [`ExtentWalk`].
 pub struct Scanner {
-    fs: Rc<Filesystem>,
+    fs: Arc<Filesystem>,
     walk: ExtentWalk,
     options: Options,
     pub stats: ScanStats,
@@ -179,9 +179,9 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    pub fn new(fs: &Rc<Filesystem>, options: &Options) -> io::Result<Scanner> {
+    pub fn new(fs: &Arc<Filesystem>, options: &Options) -> io::Result<Scanner> {
         Ok(Scanner {
-            fs: Rc::clone(fs),
+            fs: Arc::clone(fs),
             walk: fs.walk()?,
             options: options.clone(),
             stats: ScanStats::ZERO,

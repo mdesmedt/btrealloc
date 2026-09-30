@@ -23,7 +23,7 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use linux_raw_sys::btrfs::{
@@ -778,7 +778,7 @@ impl Scan {
 /// hands over, where the tool would drop each one once dealt with.
 pub fn scan(fs: &Fs) -> Scan {
     let filesystem =
-        Rc::new(kernel::Filesystem::open(fs.root()).expect("open the fixture's filesystem"));
+        Arc::new(kernel::Filesystem::open(fs.root()).expect("open the fixture's filesystem"));
     let mut scanner =
         Scanner::new(&filesystem, &options(fs.root(), false, false)).expect("start the walk");
     let extents = scanner

@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -25,6 +26,9 @@ struct Args {
     /// Perform a dry run without writing any data.
     #[arg(long)]
     dryrun: bool,
+    /// Threads to resolve extents on. Defaults to one per CPU.
+    #[arg(short, long, value_name = "N")]
+    jobs: Option<NonZeroUsize>,
 }
 
 fn parse_options() -> Options {
@@ -32,6 +36,14 @@ fn parse_options() -> Options {
     if args.apply && args.dryrun {
         eprintln!("Cannot specify both --apply and --dryrun");
         std::process::exit(1);
+    }
+    // Extents are resolved on rayon's global pool, which is one thread per CPU
+    // unless told otherwise here.
+    if let Some(jobs) = args.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(jobs.get())
+            .build_global()
+            .expect("the global thread pool is set up once, before anything uses it");
     }
     Options {
         apply: args.apply,
