@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::Options;
 use crate::extent::{Extent, ExtentRef, Holder, LeftAlone};
@@ -18,12 +18,12 @@ use crate::kernel::{self, Filesystem};
 /// in.
 pub struct Runner {
     options: Options,
-    fs: Rc<Filesystem>,
+    fs: Arc<Filesystem>,
     report: Report,
 }
 
 impl Runner {
-    pub fn new(options: Options, fs: &Rc<Filesystem>) -> Runner {
+    pub fn new(options: Options, fs: &Arc<Filesystem>) -> Runner {
         if options.apply {
             println!("rewriting extents as they are found");
         } else {
@@ -31,7 +31,7 @@ impl Runner {
         }
         Runner {
             options,
-            fs: Rc::clone(fs),
+            fs: Arc::clone(fs),
             report: Report::default(),
         }
     }

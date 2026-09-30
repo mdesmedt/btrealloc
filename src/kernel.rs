@@ -1,16 +1,16 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, c_int, c_long, c_ulong, c_void};
 use std::fmt;
 use std::fs::File;
 use std::io;
 use std::mem::size_of;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::vec;
 
 use linux_raw_sys::btrfs::{
@@ -34,6 +34,8 @@ use linux_raw_sys::ioctl::{
     BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
     BTRFS_IOC_TREE_SEARCH_V2, FIDEDUPERANGE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS,
 };
+
+use rayon::prelude::*;
 
 use crate::extent::{Extent, ExtentRef};
 
@@ -439,21 +441,45 @@ pub struct Filesystem {
     pub sectorsize: u64,
     /// Whether it is mounted read-only, which leaves nothing to rewrite with.
     pub read_only: bool,
-    /// One search buffer, reused for every search made through this handle.
-    searchargs: RefCell<Box<SearchArgs>>,
-    /// The buffer [`Filesystem::logical_ino`] hands the kernel, as `u64`s:
-    /// `struct btrfs_data_container`'s four `u32`s fill the first two. It
-    /// grows for the rare extent with more references than fit, and is kept
-    /// at that size, but each lookup only offers the kernel as much of it as
-    /// that lookup needs.
-    logicalino: RefCell<Vec<u64>>,
+    /// Search buffers not in use, reused for every search made through this
+    /// handle. There are as many as there have ever been searches at once:
+    /// about one per thread resolving extents. See [`Filesystem::searchargs`].
+    searchargs: Mutex<Vec<Box<SearchArgs>>>,
     /// Every subvolume looked up so far, by tree id, or `None` for one there
     /// is no path to.
-    subvolumes: RefCell<HashMap<u64, Option<Rc<Subvolume>>>>,
+    subvolumes: Mutex<HashMap<u64, Option<Arc<Subvolume>>>>,
     /// Each subvolume's last snapshot, by tree id, as read for the current
     /// batch of the walk. Forgotten with every batch, so a snapshot taken
     /// mid-run is not missed.
-    last_snapshots: RefCell<HashMap<u64, u64>>,
+    last_snapshots: Mutex<HashMap<u64, u64>>,
+}
+
+/// A search buffer on loan from [`Filesystem::searchargs`], handed back when
+/// dropped.
+struct SearchArgsGuard<'a> {
+    pool: &'a Mutex<Vec<Box<SearchArgs>>>,
+    args: Option<Box<SearchArgs>>,
+}
+
+impl Deref for SearchArgsGuard<'_> {
+    type Target = SearchArgs;
+    fn deref(&self) -> &SearchArgs {
+        self.args.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for SearchArgsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut SearchArgs {
+        self.args.as_mut().unwrap()
+    }
+}
+
+impl Drop for SearchArgsGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(args) = self.args.take() {
+            self.pool.lock().unwrap().push(args);
+        }
+    }
 }
 
 impl Filesystem {
@@ -515,23 +541,34 @@ impl Filesystem {
             mount: path.to_path_buf(),
             sectorsize,
             read_only: buf.f_flags as u64 & ST_RDONLY != 0,
-            searchargs: RefCell::new(SearchArgs::new(0)),
-            logicalino: RefCell::new(vec![0; LOGICAL_INO_START_SIZE / size_of::<u64>()]),
-            subvolumes: RefCell::new(HashMap::new()),
-            last_snapshots: RefCell::new(HashMap::new()),
+            searchargs: Mutex::new(Vec::new()),
+            subvolumes: Mutex::new(HashMap::new()),
+            last_snapshots: Mutex::new(HashMap::new()),
         })
     }
 
+    /// A search buffer to use until it is dropped. Reusing them matters: a
+    /// fresh buffer this size is mapped anew, and every page of it faults in
+    /// again as the kernel fills it.
+    fn searchargs(&self) -> SearchArgsGuard<'_> {
+        let args = self.searchargs.lock().unwrap().pop();
+        SearchArgsGuard {
+            pool: &self.searchargs,
+            args: Some(args.unwrap_or_else(|| SearchArgs::new(0))),
+        }
+    }
+
     /// Every data extent on the filesystem, in address order, each with every
-    /// reference to it. See [`ExtentWalk`].
-    pub fn walk(self: &Rc<Self>) -> io::Result<ExtentWalk> {
+    /// reference to it, resolved on rayon's global thread pool. See
+    /// [`ExtentWalk`].
+    pub fn walk(self: &Arc<Self>) -> io::Result<ExtentWalk> {
         // Commit what is pending first, so that everything allocated from here
         // on, our own copies included, is newer than the generation read next.
         if unsafe { syncfs(self.file.as_raw_fd()) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(ExtentWalk {
-            fs: Rc::clone(self),
+            fs: Arc::clone(self),
             next: Some(0),
             generation: self.generation()?,
             batch: Vec::new().into_iter(),
@@ -571,9 +608,9 @@ impl Filesystem {
         from: u64,
         generation: u64,
     ) -> io::Result<(Vec<Unresolved>, Option<u64>)> {
-        self.last_snapshots.borrow_mut().clear();
+        self.last_snapshots.lock().unwrap().clear();
 
-        let mut args = self.searchargs.borrow_mut();
+        let mut args = self.searchargs();
         args.key.tree_id = BTRFS_EXTENT_TREE_OBJECTID as u64;
         args.set_range(
             (from, BTRFS_EXTENT_ITEM_KEY, 0),
@@ -630,7 +667,7 @@ impl Filesystem {
 
     /// Everything the extent tree holds about the extent at `address`.
     fn tally(&self, address: u64) -> io::Result<Tally> {
-        let mut args = self.searchargs.borrow_mut();
+        let mut args = self.searchargs();
         args.key.tree_id = BTRFS_EXTENT_TREE_OBJECTID as u64;
         args.set_range(
             (address, BTRFS_EXTENT_ITEM_KEY, 0),
@@ -749,7 +786,7 @@ impl Filesystem {
             RefOffsets::Between(first, last) => (first, last),
         };
 
-        let mut args = self.searchargs.borrow_mut();
+        let mut args = self.searchargs();
         args.key.tree_id = data_ref.root;
         args.set_range(
             (data_ref.inode, BTRFS_EXTENT_DATA_KEY, start),
@@ -777,11 +814,11 @@ impl Filesystem {
     /// last made from a snapshot, from its root item. A tree block no newer
     /// than this may be shared with another tree; one written since cannot be.
     fn last_snapshot(&self, root: u64) -> io::Result<u64> {
-        if let Some(&generation) = self.last_snapshots.borrow().get(&root) {
+        if let Some(&generation) = self.last_snapshots.lock().unwrap().get(&root) {
             return Ok(generation);
         }
         const AT: usize = std::mem::offset_of!(btrfs_root_item, last_snapshot);
-        let mut args = self.searchargs.borrow_mut();
+        let mut args = self.searchargs();
         args.key.tree_id = BTRFS_ROOT_TREE_OBJECTID as u64;
         args.set_range(
             (root, BTRFS_ROOT_ITEM_KEY, 0),
@@ -794,7 +831,7 @@ impl Filesystem {
         })?;
         let generation =
             found.ok_or_else(|| io::Error::other(format!("subvolume {root} has no root item")))?;
-        self.last_snapshots.borrow_mut().insert(root, generation);
+        self.last_snapshots.lock().unwrap().insert(root, generation);
         Ok(generation)
     }
 
@@ -803,14 +840,13 @@ impl Filesystem {
     /// to the subvolumes holding them. Gathered into the same shape the extent
     /// tree gives when it names the files itself.
     fn logical_ino(&self, disk_address: u64) -> io::Result<Vec<DataRef>> {
-        let mut buf = self.logicalino.borrow_mut();
-        // Every lookup starts small, however large an earlier one grew the
-        // buffer: the kernel zeroes and copies as much as it is told it has.
+        // Every lookup starts small, and grows only for the rare extent with
+        // more references than fit: the kernel zeroes and copies as much as it
+        // is told it has. The buffer is `u64`s, and `struct
+        // btrfs_data_container`'s four `u32`s fill the first two.
         let mut size = LOGICAL_INO_START_SIZE;
         loop {
-            if buf.len() * size_of::<u64>() < size {
-                buf.resize(size.div_ceil(size_of::<u64>()), 0);
-            }
+            let mut buf = vec![0u64; size.div_ceil(size_of::<u64>())];
             let mut args = btrfs_ioctl_logical_ino_args {
                 logical: disk_address,
                 size: size as u64,
@@ -889,12 +925,14 @@ impl Filesystem {
     }
 
     /// The subvolume with tree id `root`, or `None` if there is no path to it.
-    fn subvolume(&self, root: u64) -> io::Result<Option<Rc<Subvolume>>> {
-        if let Some(known) = self.subvolumes.borrow().get(&root) {
+    fn subvolume(&self, root: u64) -> io::Result<Option<Arc<Subvolume>>> {
+        if let Some(known) = self.subvolumes.lock().unwrap().get(&root) {
             return Ok(known.clone());
         }
-        let found = self.find_subvolume(root)?.map(Rc::new);
-        self.subvolumes.borrow_mut().insert(root, found.clone());
+        // Not locked while looking: finding a subvolume finds its parent
+        // first. Threads looking for the same one at once find the same path.
+        let found = self.find_subvolume(root)?.map(Arc::new);
+        self.subvolumes.lock().unwrap().insert(root, found.clone());
         Ok(found)
     }
 
@@ -931,7 +969,7 @@ impl Filesystem {
     /// Where subvolume `root` sits: the subvolume holding it, the directory
     /// there, and its name in that directory.
     fn root_backref(&self, root: u64) -> io::Result<Option<(u64, u64, PathBuf)>> {
-        let mut args = self.searchargs.borrow_mut();
+        let mut args = self.searchargs();
         args.key.tree_id = BTRFS_ROOT_TREE_OBJECTID as u64;
         args.set_range(
             (root, BTRFS_ROOT_BACKREF_KEY, 0),
@@ -1096,7 +1134,14 @@ pub enum Resolved {
 /// Each extent is met once, however many files and snapshots reference it,
 /// and is handed over with every one of those references. Nothing is kept
 /// about it afterwards. An extent can be dealt with, rewritten even, before
-/// the next is read.
+/// the next batch is read.
+///
+/// A batch's extents are resolved all at once, in parallel, and handed over
+/// only when every one of them is. Nothing is resolved while a batch is being
+/// handed over, so whatever is done with an extent, a rewrite included, never
+/// runs alongside a backreference walk. The kernel can crash when a dedupe and
+/// a backreference walk meet on the same inode, and which inodes a walk will
+/// reach is not known ahead of it.
 ///
 /// The walk runs over a tree that changes under it, our own rewrites
 /// included. It resumes from an address rather than a place in the tree, so
@@ -1108,14 +1153,14 @@ pub enum Resolved {
 /// An `Err` is a search over the extent tree that failed outright. It ends the
 /// walk.
 pub struct ExtentWalk {
-    fs: Rc<Filesystem>,
+    fs: Arc<Filesystem>,
     /// The address the next batch starts from, or `None` once the extent tree
     /// is read to its end.
     next: Option<u64>,
     /// Extents allocated after this generation are passed over.
     generation: u64,
-    /// The batch read last, less the extents already handed over.
-    batch: vec::IntoIter<Unresolved>,
+    /// The batch resolved last, less the extents already handed over.
+    batch: vec::IntoIter<Resolved>,
 }
 
 impl Iterator for ExtentWalk {
@@ -1123,24 +1168,25 @@ impl Iterator for ExtentWalk {
 
     fn next(&mut self) -> Option<io::Result<Resolved>> {
         loop {
-            if let Some(Unresolved {
-                disk_address,
-                item,
-                backrefs,
-            }) = self.batch.next()
-            {
-                return Some(Ok(match self.fs.resolve(disk_address, &item, backrefs) {
-                    Ok(refs) => Resolved::Extent(Extent::from_refs(refs)),
-                    Err(error) => Resolved::LeftAlone {
-                        disk_address,
-                        error,
-                    },
-                }));
+            if let Some(resolved) = self.batch.next() {
+                return Some(Ok(resolved));
             }
 
             match self.fs.extent_batch(self.next?, self.generation) {
                 Ok((batch, next)) => {
-                    self.batch = batch.into_iter();
+                    let fs = &self.fs;
+                    // Collected in the order read, which is address order.
+                    let resolved: Vec<Resolved> = batch
+                        .into_par_iter()
+                        .map(|u| match fs.resolve(u.disk_address, &u.item, u.backrefs) {
+                            Ok(refs) => Resolved::Extent(Extent::from_refs(refs)),
+                            Err(error) => Resolved::LeftAlone {
+                                disk_address: u.disk_address,
+                                error,
+                            },
+                        })
+                        .collect();
+                    self.batch = resolved.into_iter();
                     self.next = next;
                 }
                 Err(e) => {
