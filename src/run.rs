@@ -164,6 +164,9 @@ fn locate_holders<'a>(
         let name = match fs.inode_path(holder.root, holder.inode) {
             Ok(Some(name)) => name,
             Ok(None) => return Err(Failure::other(&unnamed(&holder), "no path leads to it")),
+            // Deleted, perhaps still open somewhere. It cannot be opened, and
+            // its extents are freed once it is closed.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Err(LeftAlone::Deleted)),
             Err(e) => return Err(Failure::new(&unnamed(&holder), e)),
         };
         let path = fs.display_path(&name);

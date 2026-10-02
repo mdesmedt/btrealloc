@@ -1019,8 +1019,9 @@ impl Filesystem {
     }
 
     /// The path of inode `inode` in subvolume `root`, relative to the top-level
-    /// subvolume, or `None` if the subvolume cannot be reached, or `inode` has
-    /// no name any more (an orphan, unlinked but still open elsewhere).
+    /// subvolume, or `None` if the subvolume cannot be reached. An `inode` with
+    /// no name any more (an orphan, unlinked but perhaps still open elsewhere)
+    /// is a [`io::ErrorKind::NotFound`] error.
     ///
     /// An inode can have more than one name — hardlinks — in which case this
     /// takes the first the kernel returns. Any of them opens the same data,

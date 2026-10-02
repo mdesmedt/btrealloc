@@ -792,6 +792,33 @@ fn a_nodatacow_file_is_never_rewritten() {
     );
 }
 
+/// A file deleted while something still has it open keeps its extents but has
+/// no path left to open it by. The run skips it for that, not as a failure.
+#[test]
+fn a_deleted_file_still_open_is_skipped_as_deleted() {
+    let fs = Fs::new();
+    fs.dir("data");
+    let path = fs.path("data/deleted");
+    wasteful_file(&path);
+    let extent = support::single_extent(&path);
+    let scan = support::scan(&fs);
+    assert!(
+        support::on_worklist(&support::worklist(&scan), extent),
+        "fixture: the extent should look worth rewriting"
+    );
+
+    let open = std::fs::File::open(&path).expect("open the file");
+    std::fs::remove_file(&path).expect("delete the file");
+    support::sync_fs();
+
+    let options = support::options(fs.root(), true, false);
+    let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
+    assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(stats.left_alone.get(LeftAlone::Deleted).count, 1);
+    drop(open);
+}
+
 /// The run skips a nodatacow file for being nodatacow, not for some other
 /// reason that happens to leave it alone too.
 #[test]

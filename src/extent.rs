@@ -177,10 +177,12 @@ pub enum LeftAlone {
     Unresolved,
     /// Finding, opening or rewriting one of its holders failed.
     Failed,
+    /// One of its holders was deleted, though perhaps still open somewhere.
+    Deleted,
 }
 
 impl LeftAlone {
-    pub const ALL: [LeftAlone; 7] = [
+    pub const ALL: [LeftAlone; 8] = [
         LeftAlone::TooLittleToFree,
         LeftAlone::TooMuchToCopy,
         LeftAlone::NoDataCow,
@@ -188,6 +190,7 @@ impl LeftAlone {
         LeftAlone::Changed,
         LeftAlone::Unresolved,
         LeftAlone::Failed,
+        LeftAlone::Deleted,
     ];
 
     /// The reason, for the table at the end of a run.
@@ -200,6 +203,7 @@ impl LeftAlone {
             LeftAlone::Changed => "changed during the scan".to_string(),
             LeftAlone::Unresolved => "holders could not be looked up".to_string(),
             LeftAlone::Failed => "rewrite failed".to_string(),
+            LeftAlone::Deleted => "file was deleted".to_string(),
         }
     }
 }
