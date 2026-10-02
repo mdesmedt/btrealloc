@@ -1765,11 +1765,34 @@ fn a_stretch_with_a_gap_at_a_files_end_moves_whole() {
     assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
-/// Space reserved past a file's end holds the extent too, and no dedupe can
-/// reach past the end of a file to move it. The run cannot free the extent, so
-/// it must not say it did.
+/// Runs over an extent that space reserved past `file`'s end holds, which no
+/// dedupe can reach. It has to be left alone before anything is copied.
+fn assert_held_past_the_end_is_left_alone(fs: &Fs, file: &Path) {
+    let extent = support::single_extent(file);
+    let before = support::checksums(fs.root());
+    let scan = support::scan(fs);
+    assert!(
+        support::on_worklist(&support::worklist(&scan), extent),
+        "fixture: the extent should look worth rewriting"
+    );
+
+    let options = support::options(fs.root(), true, false);
+    let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
+    assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(stats.left_alone.get(LeftAlone::PastEnd).count, 1);
+    assert_eq!(
+        support::physical_extents(file),
+        vec![extent],
+        "nothing should have been copied"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// Space reserved wholly past a file's end, left of a reservation the file
+/// filled the start of.
 #[test]
-fn an_extent_held_past_a_files_end_is_not_counted_freed() {
+fn an_extent_held_past_a_files_end_is_left_alone() {
     let fs = Fs::new();
     fs.dir("data");
     let file = fs.path("data/reserved");
@@ -1777,29 +1800,42 @@ fn an_extent_held_past_a_files_end_is_not_counted_freed() {
     support::write_random_into(&file, MIB);
     // Most of the reservation goes, the last MiB of it stays.
     support::punch_hole(&file, MIB, (FILE_MIB - 2) * MIB);
-
-    let extent = support::single_extent(&file);
-    let refs = support::file_extents(&file);
+    let offsets: Vec<u64> = support::file_extents(&file)
+        .iter()
+        .map(|r| r.file_offset)
+        .collect();
     assert_eq!(
-        refs.iter().map(|r| r.file_offset).collect::<Vec<_>>(),
+        offsets,
         vec![0, (FILE_MIB - 1) * MIB],
         "fixture: the file should hold its first MiB and the last of the reservation"
     );
 
-    let before = support::checksums(fs.root());
-    let scan = support::scan(&fs);
+    assert_held_past_the_end_is_left_alone(&fs, &file);
+}
+
+/// A reservation the file has grown into only part of, so one reference runs
+/// from inside the file to past its end.
+#[test]
+fn an_extent_held_across_a_files_end_is_left_alone() {
+    let fs = Fs::new();
+    fs.dir("data");
+    let file = fs.path("data/reserved");
+    support::preallocate_past_end(&file, FILE_MIB * MIB);
+    // Two MiB of the reservation stays, and the file grows over the first.
+    support::punch_hole(&file, 2 * MIB, (FILE_MIB - 2) * MIB);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .and_then(|f| f.set_len(MIB))
+        .expect("grow the file");
+    support::sync_fs();
+    let refs = support::file_extents(&file);
     assert!(
-        support::on_worklist(&support::worklist(&scan), extent),
-        "fixture: the extent should look worth rewriting"
+        refs.len() == 1 && refs[0].num_bytes == 2 * MIB,
+        "fixture: one reference should run across the file's end"
     );
 
-    // apply() fails if the extent is reported freed but still held.
-    let (_, report) = support::apply(&fs);
-    assert!(
-        !report.rewritten.contains(&extent),
-        "reported freed, but the reservation still holds it"
-    );
-    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+    assert_held_past_the_end_is_left_alone(&fs, &file);
 }
 
 /// A single compressible sector left of a large extent, on a compressing mount.

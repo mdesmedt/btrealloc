@@ -40,18 +40,17 @@ impl Runner {
     /// Returns why it was left alone, if it was.
     pub fn process(&mut self, extent: &Extent) -> Option<LeftAlone> {
         let (options, report) = (&self.options, &mut self.report);
-        let holders = match locate(extent, &self.fs) {
-            Ok(Some(holders)) => holders,
-            // A nodatacow file is overwritten in place and cannot be deduped,
-            // so an extent one of them holds is never ours to rewrite.
-            Ok(None) => {
+        let holders = match locate_holders(extent, &self.fs) {
+            Ok(Ok(holders)) => holders,
+            Ok(Err(reason)) => {
                 if options.verbose {
                     println!(
-                        "extent {:#x}: held by a nodatacow file, leaving it alone",
-                        extent.disk_address
+                        "extent {:#x}: {}, leaving it alone",
+                        extent.disk_address,
+                        reason.label()
                     );
                 }
-                return Some(LeftAlone::NoDataCow);
+                return Some(reason);
             }
             Err(failure) => {
                 report.failed(failure);
@@ -154,9 +153,12 @@ impl Located<'_> {
     }
 }
 
-/// Finds a path to every file holding the extent. `None` if one of them is
-/// nodatacow.
-fn locate<'a>(extent: &'a Extent, fs: &'a Filesystem) -> Result<Option<Vec<Located<'a>>>, Failure> {
+/// Finds a path to every file holding the extent, or why one of them means it
+/// cannot be rewritten.
+fn locate_holders<'a>(
+    extent: &'a Extent,
+    fs: &'a Filesystem,
+) -> Result<Result<Vec<Located<'a>>, LeftAlone>, Failure> {
     let mut located = Vec::new();
     for holder in extent.holders() {
         let name = match fs.inode_path(holder.root, holder.inode) {
@@ -172,12 +174,26 @@ fn locate<'a>(extent: &'a Extent, fs: &'a Filesystem) -> Result<Option<Vec<Locat
             fs,
         };
         let file = holder.open()?;
-        if kernel::is_nocow(&file).map_err(|e| Failure::new(&holder.path, e))? {
-            return Ok(None);
+        let error = |e| Failure::new(&holder.path, e);
+        // A nodatacow file is overwritten in place and cannot be deduped.
+        if kernel::is_nocow(&file).map_err(error)? {
+            return Ok(Err(LeftAlone::NoDataCow));
+        }
+        // A dedupe stops at the file's last sector, so space reserved past it
+        // can never be moved.
+        let end = file.metadata().map_err(error)?.len();
+        let end = end.next_multiple_of(fs.sectorsize);
+        if holder
+            .holder
+            .refs
+            .iter()
+            .any(|r| r.file_offset + r.num_bytes > end)
+        {
+            return Ok(Err(LeftAlone::PastEnd));
         }
         located.push(holder);
     }
-    Ok(Some(located))
+    Ok(Ok(located))
 }
 
 /// What a holder there is no path to is called instead.

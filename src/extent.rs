@@ -169,6 +169,8 @@ pub enum LeftAlone {
     TooMuchToCopy,
     /// A nodatacow file holds it.
     NoDataCow,
+    /// Space reserved past a file's end holds it, and no dedupe reaches there.
+    PastEnd,
     /// It was freed or its references moved while the scan was reading it.
     Changed,
     /// Looking up who holds it failed, during the walk or just before acting.
@@ -178,10 +180,11 @@ pub enum LeftAlone {
 }
 
 impl LeftAlone {
-    pub const ALL: [LeftAlone; 6] = [
+    pub const ALL: [LeftAlone; 7] = [
         LeftAlone::TooLittleToFree,
         LeftAlone::TooMuchToCopy,
         LeftAlone::NoDataCow,
+        LeftAlone::PastEnd,
         LeftAlone::Changed,
         LeftAlone::Unresolved,
         LeftAlone::Failed,
@@ -193,6 +196,7 @@ impl LeftAlone {
             LeftAlone::TooLittleToFree => format!("frees under {}", human(MIN_RECLAIM_BYTES)),
             LeftAlone::TooMuchToCopy => format!("copies over {MAX_COPY_RATIO}x what it frees"),
             LeftAlone::NoDataCow => "held by a nodatacow file".to_string(),
+            LeftAlone::PastEnd => "held past a file's end".to_string(),
             LeftAlone::Changed => "changed during the scan".to_string(),
             LeftAlone::Unresolved => "holders could not be looked up".to_string(),
             LeftAlone::Failed => "rewrite failed".to_string(),
