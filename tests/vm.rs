@@ -792,6 +792,27 @@ fn a_nodatacow_file_is_never_rewritten() {
     );
 }
 
+/// The run skips a nodatacow file for being nodatacow, not for some other
+/// reason that happens to leave it alone too.
+#[test]
+fn a_nodatacow_file_is_skipped_as_nodatacow() {
+    let fs = Fs::new();
+    fs.dir("data");
+    let file = fs.path("data/nocow");
+    std::fs::File::create(&file).expect("create the file");
+    support::set_nocow(&file);
+    support::write_random(&file, FILE_MIB);
+    support::punch_hole(&file, MIB, (FILE_MIB - 2) * MIB);
+
+    let options = support::options(fs.root(), true, false);
+    let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
+    assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
+    assert!(
+        stats.left_alone.get(LeftAlone::NoDataCow).count > 0,
+        "the file was not skipped for being nodatacow"
+    );
+}
+
 /// A datacow file in a nodatacow directory, on a filesystem whose top
 /// directory, where the temporary copies are made, is nodatacow too. A copy
 /// inherits the flag, and btrfs will not dedupe between inodes that disagree
