@@ -203,7 +203,7 @@ fn realloc_extent(extent: &Extent, holders: &[Located], fs: &Filesystem) -> Resu
     // Iterate over live ranges
     for liverange in &liveranges {
         // Copy the live range into a temporary file
-        let temp = stage(&holders[0].path, liverange, fs)?;
+        let temp = stage(&holders[0].path, &liverange.bytes, fs)?;
         // Then point every holder at the newly allocated data
         for (holder, before) in holders.iter().zip(&before) {
             redirect_chunks(holder, &temp, liverange, before.filesize)?;
@@ -212,6 +212,25 @@ fn realloc_extent(extent: &Extent, holders: &[Located], fs: &Filesystem) -> Resu
 
     for (holder, before) in holders.iter().zip(&before) {
         finish_holder(holder, before, fs)?;
+    }
+
+    // A dedupe reports success whether or not it moved anything, so only the
+    // holders themselves can say the extent is free.
+    for holder in holders {
+        let refs = &holder.holder.refs;
+        let from = refs.iter().map(|r| r.file_offset).min().unwrap_or(0);
+        let to = refs
+            .iter()
+            .map(|r| r.file_offset + r.num_bytes - 1)
+            .max()
+            .unwrap_or(0);
+        let (root, inode) = (holder.holder.root, holder.holder.inode);
+        if fs
+            .inode_holds_extent(root, inode, from, to, extent.disk_address)
+            .map_err(|e| Failure::new(&holder.path, e))?
+        {
+            return Err(Failure::other(&holder.path, "still holds the extent"));
+        }
     }
     Ok(())
 }
@@ -224,8 +243,8 @@ fn realloc_extent(extent: &Extent, holders: &[Located], fs: &Filesystem) -> Resu
 /// of those at once is what runs into `RLIMIT_NOFILE` on the filesystems this
 /// tool is for.
 struct LiveRange {
-    /// `[start, end)` of the extent, which is what a staged temporary holds at
-    /// its own offset zero.
+    /// `[start, end)` of the extent, which is what a staged temporary holds
+    /// one sector in.
     bytes: Vec<u8>,
     start: u64,
     end: u64,
@@ -250,38 +269,31 @@ fn read_liveranges(
 
     let mut copies = Vec::new();
     for range in &extent.live_ranges {
-        let (start, end) = (range.start, range.end);
-        let mut bytes = vec![0u8; (end - start) as usize];
-        let end = fill(&refs, start, end, &mut bytes)?;
-        // Holders are pointed at whole sectors, so a part sector at the end of a
-        // stretch cut short by a file's end is one nothing can ever reference.
-        // Dropping it here keeps it from ever being written out; the holder it
-        // belongs to gets its last sector from [`redirect_tail`] instead.
-        let end = end / fs.sectorsize * fs.sectorsize;
-        if end > start {
-            bytes.truncate((end - start) as usize);
-            copies.push(LiveRange { bytes, start, end });
+        let mut start = range.start;
+        while start < range.end {
+            let mut bytes = vec![0u8; (range.end - start) as usize];
+            let read = fill(&refs, start, range.end, &mut bytes)?;
+            // Holders are pointed at whole sectors, so a part sector at the end
+            // of a stretch cut short by a file's end is one nothing can ever
+            // reference. Dropping it here keeps it from ever being written out;
+            // the holder it belongs to gets its last sector from
+            // [`redirect_tail`] instead.
+            let end = read / fs.sectorsize * fs.sectorsize;
+            if end > start {
+                bytes.truncate((end - start) as usize);
+                copies.push(LiveRange { bytes, start, end });
+            }
+            // A file's end can leave a gap in the stretch. What follows it
+            // starts with the next reference past the gap.
+            start = refs
+                .iter()
+                .map(|(r, _)| r.extent_offset)
+                .filter(|&offset| offset > read)
+                .min()
+                .unwrap_or(range.end);
         }
     }
     Ok(copies)
-}
-
-fn copy_range(
-    src: &File,
-    src_offset: u64,
-    dest: &File,
-    dest_offset: u64,
-    len: u64,
-) -> io::Result<()> {
-    let mut buf = vec![0u8; 1 << 20];
-    let mut done = 0;
-    while done < len {
-        let n = ((len - done) as usize).min(buf.len());
-        src.read_exact_at(&mut buf[..n], src_offset + done)?;
-        dest.write_all_at(&buf[..n], dest_offset + done)?;
-        done += n as u64;
-    }
-    Ok(())
 }
 
 /// A rewrite that did not happen, and the file it is charged to.
@@ -332,15 +344,21 @@ impl HolderBefore {
     }
 }
 
-/// Writes one stretch out to a temporary of its own, ready to be deduped from
-/// and dropped again.
+/// Writes `bytes` out to a temporary of its own, ready to be deduped from and
+/// dropped again. A failure is charged to `path`.
 ///
 /// The temporary is made at the top of the mount, which is writable wherever
-/// the holders are: a read-only snapshot has no room for one. A failure is
-/// charged to `path`, the first holder.
-fn stage(path: &Path, range: &LiveRange, fs: &Filesystem) -> Result<File, Failure> {
+/// the holders are: a read-only snapshot has no room for one.
+///
+/// The bytes sit one sector in, with a hole before them. A file of a sector or
+/// less can be written into the metadata leaf instead of an extent of its own,
+/// and a dedupe from an inline extent shares nothing: it rewrites the holder's
+/// page, which keeps the old extent until writeback. At over a sector long the
+/// temporary is never inlined, and still ends exactly where the bytes do, which
+/// [`redirect_tail`] needs. The hole costs nothing.
+fn stage(path: &Path, bytes: &[u8], fs: &Filesystem) -> Result<File, Failure> {
     let temp = fs.temp_file().map_err(|e| Failure::new(path, e))?;
-    temp.write_all_at(&range.bytes, 0)
+    temp.write_all_at(bytes, fs.sectorsize)
         .map_err(|e| Failure::new(path, e))?;
     Ok(temp)
 }
@@ -388,7 +406,8 @@ fn fill(
 /// unaligned length only where the range ends at the end of the file it is
 /// replacing, and extends it to the sector boundary only where the source range
 /// ends at the source file's own end. The shared copy runs on past that point,
-/// so it cannot serve as the source; a temporary cut to exactly this tail can.
+/// so it cannot serve as the source; a temporary staged with exactly this tail
+/// can.
 ///
 /// The sector it leaves behind is that holder's alone. Two files can share a
 /// partial sector only if they end at the same offset, which is not something a
@@ -400,34 +419,12 @@ fn redirect_tail(
     size: u64,
     fs: &Filesystem,
 ) -> Result<(), Failure> {
-    let len = size - from;
-    let temp = fs.temp_file().map_err(|e| Failure::new(path, e))?;
-    // The tail sits a sector into the temporary, with a hole before it, rather
-    // than at its start.
-    //
-    // Two things have to hold at once, and the obvious arrangement cannot manage
-    // both. The kernel rounds a sub-sector request up to a whole sector only when
-    // the source range ends at the source file's end, so the temporary has to
-    // end exactly where the tail does. But a file that short is written into the
-    // metadata leaf instead of an extent of its own, and an inline extent has
-    // nothing to share: the dedupe compares equal, reports every byte, and
-    // leaves the sector where it was. Writing a whole sector and truncating back
-    // does not help either, because the truncate inlines it again.
-    //
-    // Holding the data one sector in satisfies both. The file still ends at the
-    // tail, and at over a sector long it is never a candidate for inlining. The
-    // hole costs nothing.
-    copy_range(file, from, &temp, fs.sectorsize, len).map_err(|e| Failure::new(path, e))?;
-    temp.sync_all().map_err(|e| Failure::new(path, e))?;
-
-    let deduped =
-        kernel::dedupe(&temp, fs.sectorsize, len, file, from).map_err(|e| Failure::new(path, e))?;
-    if deduped != len {
-        return Err(Failure::other(
-            path,
-            &format!("the last sector moved {deduped} of {len} bytes"),
-        ));
-    }
+    let mut tail = vec![0u8; (size - from) as usize];
+    file.read_exact_at(&mut tail, from)
+        .map_err(|e| Failure::new(path, e))?;
+    let temp = stage(path, &tail, fs)?;
+    kernel::dedupe(&temp, fs.sectorsize, size - from, file, from)
+        .map_err(|e| Failure::new(path, e))?;
     Ok(())
 }
 
@@ -464,7 +461,8 @@ fn redirect_chunks(
             }
             let len = (to - at).min(end - cursor);
             // Call FIDEDUPERANGE
-            let deduped = kernel::dedupe(temp, at - liverange.start, len, &file, cursor)
+            let src_offset = holder.fs.sectorsize + at - liverange.start;
+            let deduped = kernel::dedupe(temp, src_offset, len, &file, cursor)
                 .map_err(|e| Failure::new(path, e))?;
             if deduped != len {
                 eprintln!("Warning {}: deduped != len", path.display());

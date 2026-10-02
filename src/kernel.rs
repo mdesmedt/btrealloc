@@ -810,6 +810,29 @@ impl Filesystem {
         )
     }
 
+    /// Whether inode `inode` of subvolume `root` has a file extent item at file
+    /// offsets `from..=to` pointing into the extent at `disk_address`.
+    pub fn inode_holds_extent(
+        &self,
+        root: u64,
+        inode: u64,
+        from: u64,
+        to: u64,
+        disk_address: u64,
+    ) -> io::Result<bool> {
+        let mut args = self.searchargs();
+        args.key.tree_id = root;
+        args.set_range(
+            (inode, BTRFS_EXTENT_DATA_KEY, from),
+            (inode, BTRFS_EXTENT_DATA_KEY, to),
+        );
+        let mut found = false;
+        search_extent_refs(&mut args, self.file.as_raw_fd(), root, inode, |r| {
+            found |= r.disk_address == disk_address;
+        })?;
+        Ok(found)
+    }
+
     /// The generation in which subvolume `root` was last snapshotted, or was
     /// last made from a snapshot, from its root item. A tree block no newer
     /// than this may be shared with another tree; one written since cannot be.
@@ -1371,7 +1394,8 @@ fn set_flags(file: &File, flags: u32) -> io::Result<()> {
 /// bytes in. The kernel re-checks that equality under lock, so a file changing
 /// underneath us fails here rather than corrupting anything.
 ///
-/// Returns the bytes actually redirected, which can be short of `len`.
+/// Returns the bytes the kernel reports deduped. That is `len` whenever it
+/// succeeds, even if it quietly moved less, so it proves nothing on its own.
 pub fn dedupe(
     src: &File,
     src_offset: u64,

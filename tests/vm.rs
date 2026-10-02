@@ -1723,3 +1723,119 @@ fn a_holder_ending_mid_block_lets_go() {
     );
     assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
+
+/// A file ending mid-sector, and a second file whose reference starts at the
+/// next sector of the same extent. The stretch the two make together has a gap
+/// at the first file's end that neither can be read through, and what lies past
+/// it has to be copied all the same.
+#[test]
+fn a_stretch_with_a_gap_at_a_files_end_moves_whole() {
+    let fs = Fs::new();
+    let sectorsize = fs.sectorsize();
+    fs.dir("data");
+    let (short, other) = (fs.path("data/short"), fs.path("data/other"));
+    support::write_random_one_extent(&short, FILE_MIB);
+    support::reflink(&short, &other);
+
+    // `short` keeps two sectors of the extent, only part of the second readable.
+    support::truncate(&short, sectorsize + 1000);
+    // `other` takes over from the third sector, up to the first MiB.
+    support::punch_hole(&other, 0, 2 * sectorsize);
+    support::punch_hole(&other, MIB, (FILE_MIB - 1) * MIB);
+
+    let extent = support::single_extent(&short);
+    assert_eq!(
+        support::single_extent(&other),
+        extent,
+        "fixture: the two files should hold one extent between them"
+    );
+
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
+    assert_eq!(
+        scan.extents[&extent].live_ranges,
+        vec![0..MIB],
+        "fixture: the two references should make one stretch"
+    );
+
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(report.rewritten.contains(&extent), "it was not rewritten");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// Space reserved past a file's end holds the extent too, and no dedupe can
+/// reach past the end of a file to move it. The run cannot free the extent, so
+/// it must not say it did.
+#[test]
+fn an_extent_held_past_a_files_end_is_not_counted_freed() {
+    let fs = Fs::new();
+    fs.dir("data");
+    let file = fs.path("data/reserved");
+    support::preallocate_past_end(&file, FILE_MIB * MIB);
+    support::write_random_into(&file, MIB);
+    // Most of the reservation goes, the last MiB of it stays.
+    support::punch_hole(&file, MIB, (FILE_MIB - 2) * MIB);
+
+    let extent = support::single_extent(&file);
+    let refs = support::file_extents(&file);
+    assert_eq!(
+        refs.iter().map(|r| r.file_offset).collect::<Vec<_>>(),
+        vec![0, (FILE_MIB - 1) * MIB],
+        "fixture: the file should hold its first MiB and the last of the reservation"
+    );
+
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
+    assert!(
+        support::on_worklist(&support::worklist(&scan), extent),
+        "fixture: the extent should look worth rewriting"
+    );
+
+    // apply() fails if the extent is reported freed but still held.
+    let (_, report) = support::apply(&fs);
+    assert!(
+        !report.rewritten.contains(&extent),
+        "reported freed, but the reservation still holds it"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// A single compressible sector left of a large extent, on a compressing mount.
+/// Its copy compresses small enough to be stored inline, and an inline extent
+/// is not something a holder can be pointed at.
+#[test]
+fn a_compressible_sector_alone_in_its_extent_moves() {
+    let fs = Fs::with_options(2048, "compress=zstd:3");
+    let sectorsize = fs.sectorsize();
+    fs.dir("data");
+    let file = fs.path("data/sector");
+
+    let mut data = vec![0u8; (FILE_MIB * MIB) as usize];
+    support::Rng::new(1).fill(&mut data);
+    let kept = 8 * MIB;
+    data[kept as usize..(kept + sectorsize) as usize].fill(b'a');
+    // Written into a reservation, which is never compressed: one extent.
+    support::write_one_extent(&file, &data);
+    support::punch_hole(&file, 0, kept);
+    support::punch_hole(&file, kept + sectorsize, FILE_MIB * MIB - kept - sectorsize);
+    let extent = support::single_extent(&file);
+
+    let before = support::checksums(fs.root());
+    let scan = support::scan(&fs);
+    assert!(
+        support::on_worklist(&support::worklist(&scan), extent),
+        "fixture: the extent should be worth rewriting"
+    );
+
+    let (_, report) = support::apply(&fs);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(report.rewritten.contains(&extent), "it was not rewritten");
+    assert!(
+        !support::physical_extents(&file).contains(&extent),
+        "the file still references the extent"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}

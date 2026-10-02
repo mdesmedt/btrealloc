@@ -392,6 +392,52 @@ pub fn write_random_one_extent(path: &Path, mib: u64) {
     sync_fs();
 }
 
+/// `data` in a single extent, the way [`write_random_one_extent`] makes one.
+pub fn write_one_extent(path: &Path, data: &[u8]) {
+    let file = File::create(path).expect("create the file");
+    let rc = unsafe { fallocate(file.as_raw_fd(), 0, 0, data.len() as i64) };
+    assert!(rc == 0, "fallocate: {}", std::io::Error::last_os_error());
+    file.write_all_at(data, 0).expect("write the file");
+    file.sync_all().expect("sync the file");
+    sync_fs();
+}
+
+/// An empty file with `len` bytes reserved past its end, as `fallocate
+/// --keep-size` leaves it.
+pub fn preallocate_past_end(path: &Path, len: u64) {
+    let file = File::create(path).expect("create the file");
+    let mode = FALLOC_FL_KEEP_SIZE as c_int;
+    let rc = unsafe { fallocate(file.as_raw_fd(), mode, 0, len as i64) };
+    assert!(rc == 0, "fallocate: {}", std::io::Error::last_os_error());
+    file.sync_all().expect("sync the file");
+    sync_fs();
+}
+
+/// `len` random bytes over the start of an existing file, which fill whatever
+/// it has reserved there in place.
+pub fn write_random_into(path: &Path, len: u64) {
+    let mut data = vec![0u8; len as usize];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut data))
+        .expect("read /dev/urandom");
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open the file");
+    file.write_all_at(&data, 0).expect("write the file");
+    file.sync_all().expect("sync the file");
+    sync_fs();
+}
+
+pub fn truncate(path: &Path, len: u64) {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_len(len))
+        .expect("truncate the file");
+    sync_fs();
+}
+
 /// `mib` MiB that zstd will squeeze, for the compressed-mount case.
 pub fn write_compressible(path: &Path, mib: u64) {
     let mut file = File::create(path).expect("create the file");
