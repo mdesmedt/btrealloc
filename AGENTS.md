@@ -11,6 +11,8 @@ cargo fmt
 cargo clippy
 ```
 
+Never git commit without being specifically instructed by the developer to do so.
+
 ## The VM test suite
 
 `tests/vm.rs` is the end-to-end suite. It needs root (btrfs ioctls, loop mounts) so `cargo test` skips it. This end-to-end suite can conveniently be run inside a VM where it has root-access using Nix. On any system with Nix run:
