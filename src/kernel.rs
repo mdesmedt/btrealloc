@@ -1184,9 +1184,11 @@ pub enum Resolved {
 /// A batch's extents are resolved all at once, in parallel, and handed over
 /// only when every one of them is. Nothing is resolved while a batch is being
 /// handed over, so whatever is done with an extent, a rewrite included, never
-/// runs alongside a backreference walk. The kernel can crash when a dedupe and
-/// a backreference walk meet on the same inode, and which inodes a walk will
-/// reach is not known ahead of it.
+/// runs alongside a backreference walk. The kernel can hang when a dedupe and
+/// a backreference walk meet on the same inode or extent, and which inodes a
+/// walk will reach is not known ahead of it. The hang is unfixed on every
+/// kernel so far: see "Hangs with concurrent `LOGICAL_INO` and dedupe/clone"
+/// in <https://github.com/Zygo/bees/blob/master/docs/btrfs-kernel.md>.
 ///
 /// The walk runs over a tree that changes under it, our own rewrites
 /// included. It resumes from an address rather than a place in the tree, so
