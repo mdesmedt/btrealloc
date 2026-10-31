@@ -180,6 +180,41 @@ impl Fs {
         }
     }
 
+    /// Writes a file at `rel` until the filesystem has no room left for data.
+    ///
+    /// A write is refused once the space it reserves runs out, and a commit
+    /// can hand back some of what was reserved and not used, so it is filled
+    /// in shrinking pieces, with a commit after each, until a sector no longer
+    /// fits.
+    pub fn fill(&self, rel: &str) {
+        let mut file = File::create(self.path(rel)).expect("create the file to fill with");
+        let mut urandom = File::open("/dev/urandom").expect("open /dev/urandom");
+        let mut piece = MIB as usize;
+        while piece >= self.sectorsize() as usize {
+            let mut buf = vec![0u8; piece];
+            loop {
+                urandom.read_exact(&mut buf).expect("read /dev/urandom");
+                match file.write_all(&buf).and_then(|()| file.sync_all()) {
+                    Ok(()) => continue,
+                    Err(e) if e.raw_os_error() == Some(28) => break,
+                    Err(e) => panic!("fill the filesystem: {e}"),
+                }
+            }
+            must("btrfs", &["filesystem", "sync", self.mnt.to_str().unwrap()]);
+            piece /= 2;
+        }
+    }
+
+    /// Turns quotas on and caps what the top-level subvolume may hold at
+    /// `limit`, as `btrfs qgroup limit` does.
+    pub fn limit_quota(&self, limit: &str) {
+        let mnt = self.mnt.to_str().unwrap();
+        must("btrfs", &["quota", "enable", mnt]);
+        must("btrfs", &["quota", "rescan", "-w", mnt]);
+        must("btrfs", &["qgroup", "limit", limit, mnt]);
+        sync_fs();
+    }
+
     /// A read-only snapshot of the subvolume at `from`, as `to`, kept alongside it.
     pub fn snapshot(&self, from: &str, to: &str) -> PathBuf {
         let (from, to) = (self.path(from), self.path(to));

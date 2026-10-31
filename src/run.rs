@@ -37,36 +37,34 @@ impl Runner {
     }
 
     /// Reallocates one extent, or on a dry run says what doing so would do.
-    /// Returns why it was left alone, if it was.
-    pub fn process(&mut self, extent: &Extent) -> Option<LeftAlone> {
-        let (options, report) = (&self.options, &mut self.report);
+    /// Returns why it was left alone, if it was, or an error if the run cannot
+    /// go on: see [`kernel::fatal`].
+    pub fn process(&mut self, extent: &Extent) -> io::Result<Option<LeftAlone>> {
         let holders = match locate_holders(extent, &self.fs) {
             Ok(Ok(holders)) => holders,
             Ok(Err(reason)) => {
-                if options.verbose {
+                if self.options.verbose {
                     println!(
                         "extent {:#x}: {}, leaving it alone",
                         extent.disk_address,
                         reason.label()
                     );
                 }
-                return Some(reason);
+                return Ok(Some(reason));
             }
-            Err(failure) => {
-                report.failed(failure);
-                return Some(LeftAlone::Failed);
-            }
+            Err(failure) => return self.report.failed(failure),
         };
 
-        if options.apply {
+        if self.options.apply {
             // Reallocate the extent for real
             let result = realloc_extent(extent, &holders, self.fs.as_ref());
             // Check for failure, and move on to the next extent if it failed
             if let Err(failure) = result {
-                report.failed(failure);
-                return Some(LeftAlone::Failed);
+                return self.report.failed(failure);
             }
         }
+
+        let (options, report) = (&self.options, &mut self.report);
 
         println!("{}", describe(extent, &holders, options));
 
@@ -91,7 +89,7 @@ impl Runner {
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Prints the summary of the whole run and returns its account.
@@ -556,8 +554,20 @@ pub struct Report {
 }
 
 impl Report {
-    /// Prints a failure and files it under what it means.
-    fn failed(&mut self, failure: Failure) {
+    /// Prints a failure and files it under what it means, leaving the extent
+    /// alone, or hands it back as the error that ends the run if nothing after
+    /// it could succeed either.
+    fn failed(&mut self, failure: Failure) -> io::Result<Option<LeftAlone>> {
+        if let Some(hint) = kernel::fatal(&failure.error) {
+            return Err(io::Error::new(
+                failure.error.kind(),
+                format!(
+                    "stopped at {}: {}: {hint}",
+                    failure.path.display(),
+                    failure.error
+                ),
+            ));
+        }
         let entry = (failure.path, failure.error.to_string());
         if failure.error.kind() == io::ErrorKind::InvalidData {
             eprintln!("warning: modified {}: {}", entry.0.display(), entry.1);
@@ -566,6 +576,7 @@ impl Report {
             eprintln!("skipped {}: {}", entry.0.display(), entry.1);
             self.skipped.push(entry);
         }
+        Ok(Some(LeftAlone::Failed))
     }
 }
 

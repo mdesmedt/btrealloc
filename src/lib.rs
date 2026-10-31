@@ -8,6 +8,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use extent::LeftAlone;
 use kernel::Filesystem;
 use run::{Report, Runner};
 use scan::{ScanStats, Scanner};
@@ -51,9 +52,22 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
         if extent.disk_free_bytes() == 0 {
             continue;
         }
-        let reason = extent
-            .not_worth_rewriting()
-            .or_else(|| runner.process(&extent));
+        let reason = match extent.not_worth_rewriting() {
+            Some(reason) => Some(reason),
+            None => match runner.process(&extent) {
+                Ok(reason) => reason,
+                // Nothing after this extent could be rewritten either. The
+                // walk ends here, and the run with it.
+                Err(e) => {
+                    scanner
+                        .stats
+                        .left_alone
+                        .add(LeftAlone::Failed, Some(&extent));
+                    scanner.error = Some(e);
+                    break;
+                }
+            },
+        };
         if let Some(reason) = reason {
             scanner.stats.left_alone.add(reason, Some(&extent));
         }

@@ -196,7 +196,7 @@ impl Scanner {
         match self.fs.resolve_again(extent) {
             Ok(extent) => Some(extent),
             Err(error) => {
-                self.leave_unresolved(extent.disk_address, &error, Some(extent));
+                self.leave_unresolved(extent.disk_address, error, Some(extent));
                 None
             }
         }
@@ -205,8 +205,16 @@ impl Scanner {
     /// Counts an extent whose holders could not be resolved, and says why,
     /// unless it merely changed under us: on a filesystem in use that is
     /// routine, and the table at the end counts it.
-    fn leave_unresolved(&mut self, disk_address: u64, error: &io::Error, extent: Option<&Extent>) {
-        let reason = if kernel::is_changed(error) {
+    ///
+    /// An error that means the filesystem is failing ends the walk instead:
+    /// see [`kernel::fatal`].
+    fn leave_unresolved(&mut self, disk_address: u64, error: io::Error, extent: Option<&Extent>) {
+        if let Some(hint) = kernel::fatal(&error) {
+            let message = format!("stopped at extent {disk_address:#x}: {error}: {hint}");
+            self.error = Some(io::Error::new(error.kind(), message));
+            return;
+        }
+        let reason = if kernel::is_changed(&error) {
             LeftAlone::Changed
         } else {
             LeftAlone::Unresolved
@@ -223,9 +231,13 @@ impl Iterator for Scanner {
 
     /// The next extent the walk discovers, with every reference to it,
     /// wherever on the filesystem that reference is. Extents left alone are
-    /// counted and passed over.
+    /// counted and passed over. Nothing more once the walk has ended in
+    /// [`Scanner::error`].
     fn next(&mut self) -> Option<Extent> {
         loop {
+            if self.error.is_some() {
+                return None;
+            }
             match self.walk.next()? {
                 Ok(Resolved::Extent(extent)) => {
                     self.stats.extents += 1;
@@ -236,7 +248,7 @@ impl Iterator for Scanner {
                     disk_address,
                     error,
                 }) => {
-                    self.leave_unresolved(disk_address, &error, None);
+                    self.leave_unresolved(disk_address, error, None);
                 }
                 Err(e) => {
                     self.error = Some(e);

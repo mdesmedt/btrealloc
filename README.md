@@ -113,6 +113,7 @@ unreachable:        2.45 GiB
     - The bytes in the source range and the destination range are identical
   - Release the anonymous temp file
   - If all goes well, the original extents (with unreachable bytes) are now no longer referenced and can be garbage-collected
+- A failure that concerns one extent leaves it alone and moves on. One that means no rewrite after it can succeed ends the run with an error: the filesystem is out of space, over a quota, has gone read-only, or reports I/O errors or corruption
 
 ## Effects on the filesystem
 

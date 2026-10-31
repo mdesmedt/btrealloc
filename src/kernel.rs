@@ -24,6 +24,7 @@ use linux_raw_sys::btrfs::{
     btrfs_ioctl_logical_ino_args, btrfs_ioctl_search_header, btrfs_ioctl_search_key,
     btrfs_root_item, btrfs_root_ref,
 };
+use linux_raw_sys::errno::{EDQUOT, EIO, ENOSPC, EROFS, EUCLEAN};
 use linux_raw_sys::general::{
     __IncompleteArrayField, __NR_open_tree, __NR_openat2, AT_EMPTY_PATH, BTRFS_SUPER_MAGIC,
     FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_NOATIME, O_RDONLY, O_RDWR,
@@ -1146,6 +1147,22 @@ pub fn is_changed(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|e| e.is::<Changed>())
 }
 
+/// What to do about `error`, if it means the filesystem cannot take any more
+/// rewrites: it is out of space, has gone read-only, or is failing. Every
+/// extent after this one would fail the same way, and pressing on with a full
+/// or damaged filesystem only makes it worse. `None` for an error that
+/// concerns the extent at hand alone.
+pub fn fatal(error: &io::Error) -> Option<&'static str> {
+    let errno = error.raw_os_error()? as u32;
+    match errno {
+        ENOSPC => Some("the filesystem is out of space for the copies"),
+        EDQUOT => Some("a quota leaves no room for the copies"),
+        EROFS => Some("the filesystem went read-only, see the kernel log"),
+        EIO | EUCLEAN => Some("the filesystem is failing, see the kernel log and run a scrub"),
+        _ => None,
+    }
+}
+
 /// One extent, as [`ExtentWalk`] resolves it.
 pub enum Resolved {
     /// The extent, with every reference to it, wherever on the filesystem.
@@ -1435,6 +1452,12 @@ pub fn dedupe(
     };
     if rc < 0 {
         return Err(io::Error::last_os_error());
+    }
+    // The call as a whole succeeds even when the dedupe into `dest` fails: a
+    // failure there, running out of space included, is a negative errno in
+    // its status.
+    if args.info.status < 0 {
+        return Err(io::Error::from_raw_os_error(-args.info.status));
     }
     if args.info.status != FILE_DEDUPE_RANGE_SAME as i32 {
         return Err(io::Error::other(format!(

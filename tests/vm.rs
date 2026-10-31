@@ -1016,6 +1016,43 @@ fn a_rewrite_leaves_atime_alone() {
     assert_eq!(after.expect("read the file's atime"), atime, "atime moved");
 }
 
+/// With no room left for the copies, every extent would fail the same way, and
+/// a filesystem that full is one to stop writing to. The run ends at the first
+/// failure, as an error, rather than skipping its way through the rest.
+#[test]
+fn a_full_filesystem_stops_the_run() {
+    let fs = Fs::with_options(512, "");
+    fs.dir("data");
+    for name in ["first", "second"] {
+        support::bookend(&fs.path(&format!("data/{name}")), FILE_MIB);
+    }
+    fs.fill("filler");
+
+    let before = support::checksums(fs.root());
+    let error = btrealloc::run(&support::options(fs.root(), true, false))
+        .err()
+        .expect("the run should stop");
+    assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// A quota with no room under it refuses the copies just as a full filesystem
+/// does, and stops the run the same way.
+#[test]
+fn a_full_quota_stops_the_run() {
+    let fs = Fs::new();
+    fs.dir("data");
+    support::bookend(&fs.path("data/bookend"), FILE_MIB);
+    fs.limit_quota("1M");
+
+    let before = support::checksums(fs.root());
+    let error = btrealloc::run(&support::options(fs.root(), true, false))
+        .err()
+        .expect("the run should stop");
+    assert_eq!(error.kind(), std::io::ErrorKind::QuotaExceeded, "{error}");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
 /// A dry run walks the same worklist in the same order and writes nothing,
 /// in a read-only snapshot or anywhere else.
 #[test]
