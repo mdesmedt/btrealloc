@@ -26,9 +26,9 @@ use linux_raw_sys::btrfs::{
 };
 use linux_raw_sys::general::{
     __IncompleteArrayField, __NR_open_tree, __NR_openat2, AT_EMPTY_PATH, BTRFS_SUPER_MAGIC,
-    FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_RDONLY, O_RDWR, O_TMPFILE,
-    OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV,
-    file_dedupe_range, file_dedupe_range_info, open_how, statfs,
+    FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_NOATIME, O_RDONLY, O_RDWR,
+    O_TMPFILE, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS,
+    RESOLVE_NO_XDEV, file_dedupe_range, file_dedupe_range_info, open_how, statfs,
 };
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
@@ -1082,8 +1082,12 @@ impl Filesystem {
     /// making sure it is still inode `inode` of subvolume `root`. A path is only
     /// ever a way to reach an inode: one renamed or replaced since it was found
     /// leads somewhere else.
+    ///
+    /// Opened `O_NOATIME`, which root may use on any file: the copy reads every
+    /// live byte through it, and without the flag those reads move the file's
+    /// atime on any mount without `noatime`.
     pub fn open_inode(&self, path: &Path, root: u64, inode: u64) -> io::Result<File> {
-        let file = open_beneath(self.file.as_raw_fd(), path, O_RDONLY)?;
+        let file = open_beneath(self.file.as_raw_fd(), path, O_RDONLY | O_NOATIME)?;
         if file.metadata()?.ino() != inode || own_root_id(file.as_raw_fd())? != root {
             return Err(io::Error::other("no longer the file the extent tree names"));
         }

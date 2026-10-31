@@ -991,6 +991,31 @@ fn no_temporary_file_is_left_behind() {
     );
 }
 
+/// A rewrite reads every live byte of a holder, and on a mount that keeps
+/// atime those reads would move it. Mounted `strictatime`, so any read through
+/// an ordinary descriptor would show.
+#[test]
+fn a_rewrite_leaves_atime_alone() {
+    let fs = Fs::with_options(2048, "strictatime");
+    fs.dir("data");
+    let file = fs.path("data/bookend");
+    support::bookend(&file, FILE_MIB);
+    // Well in the past, so a read would have something to move it to.
+    let atime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .and_then(|f| f.set_times(std::fs::FileTimes::new().set_accessed(atime)))
+        .expect("set the file's atime");
+
+    let (_, report) = support::apply(&fs);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(!report.rewritten.is_empty(), "nothing was rewritten");
+
+    let after = std::fs::metadata(&file).and_then(|m| m.accessed());
+    assert_eq!(after.expect("read the file's atime"), atime, "atime moved");
+}
+
 /// A dry run walks the same worklist in the same order and writes nothing,
 /// in a read-only snapshot or anywhere else.
 #[test]
