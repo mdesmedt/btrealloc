@@ -1,7 +1,6 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::Options;
 use crate::extent::{Extent, LeftAlone};
 use crate::format::human;
 use crate::kernel::{self, ExtentWalk, Filesystem, Resolved};
@@ -172,18 +171,16 @@ impl ScanStats {
 pub struct Scanner {
     fs: Arc<Filesystem>,
     walk: ExtentWalk,
-    options: Options,
     pub stats: ScanStats,
     /// Why the walk ended early, if it did.
     pub error: Option<io::Error>,
 }
 
 impl Scanner {
-    pub fn new(fs: &Arc<Filesystem>, options: &Options) -> io::Result<Scanner> {
+    pub fn new(fs: &Arc<Filesystem>) -> io::Result<Scanner> {
         Ok(Scanner {
             fs: Arc::clone(fs),
             walk: fs.walk()?,
-            options: options.clone(),
             stats: ScanStats::ZERO,
             error: None,
         })
@@ -202,9 +199,9 @@ impl Scanner {
         }
     }
 
-    /// Counts an extent whose holders could not be resolved, and says why,
+    /// Counts an extent whose holders could not be resolved, and warns why,
     /// unless it merely changed under us: on a filesystem in use that is
-    /// routine, and the table at the end counts it.
+    /// routine, and the table at the end counts it, so it is only an info.
     ///
     /// An error that means the filesystem is failing ends the walk instead:
     /// see [`kernel::fatal`].
@@ -215,13 +212,12 @@ impl Scanner {
             return;
         }
         let reason = if kernel::is_changed(&error) {
+            log::info!("extent {disk_address:#x}: {error}, leaving it alone");
             LeftAlone::Changed
         } else {
+            log::warn!("extent {disk_address:#x}: {error}, leaving it alone");
             LeftAlone::Unresolved
         };
-        if self.options.verbose || reason == LeftAlone::Unresolved {
-            eprintln!("extent {disk_address:#x}: {error}, leaving it alone");
-        }
         self.stats.left_alone.add(reason, extent);
     }
 }

@@ -19,7 +19,6 @@ pub struct Options {
     pub path: PathBuf,
     pub dryrun: bool,
     pub apply: bool,
-    pub verbose: bool,
 }
 
 /// Main entry point. Scans the filesystem and performs the reallocation operation.
@@ -30,7 +29,7 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
             "mounted read-only: --apply needs the filesystem mounted read-write",
         ));
     }
-    let mut scanner = Scanner::new(&fs, options)?;
+    let mut scanner = Scanner::new(&fs)?;
     let mut runner = (options.dryrun || options.apply).then(|| Runner::new(options.clone(), &fs));
 
     while let Some(extent) = scanner.next() {

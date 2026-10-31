@@ -43,7 +43,7 @@ Arguments:
 
 Options:
       --apply     Actually perform the extent reallocation operation, writing changes to the filesystem
-  -v, --verbose   Increase logging verbosity
+  -v, --verbose   Also say why each extent was left alone, and list every file holding each rewritten extent
       --dryrun    Perform a dry run without writing any data
   -j, --jobs <N>  Threads to resolve extents on. Defaults to one per CPU
   -h, --help      Print help

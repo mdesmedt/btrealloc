@@ -43,13 +43,11 @@ impl Runner {
         let holders = match locate_holders(extent, &self.fs) {
             Ok(Ok(holders)) => holders,
             Ok(Err(reason)) => {
-                if self.options.verbose {
-                    println!(
-                        "extent {:#x}: {}, leaving it alone",
-                        extent.disk_address,
-                        reason.label()
-                    );
-                }
+                log::info!(
+                    "extent {:#x}: {}, leaving it alone",
+                    extent.disk_address,
+                    reason.label()
+                );
                 return Ok(Some(reason));
             }
             Err(failure) => return self.report.failed(failure),
@@ -64,29 +62,26 @@ impl Runner {
             }
         }
 
-        let (options, report) = (&self.options, &mut self.report);
+        println!("{}", describe(extent, &holders, self.options.apply));
 
-        println!("{}", describe(extent, &holders, options));
-
+        let report = &mut self.report;
         report.copied_bytes += extent.live_uncompressed_bytes();
         report.freed_bytes += extent.disk_free_bytes();
         report.rewritten.push(extent.disk_address);
 
-        if options.verbose {
-            println!(
-                "    extent {:#x}, {} on disk",
-                extent.disk_address,
-                human(extent.disk_bytes),
-            );
-            for holder in &holders {
-                for r in &holder.holder.refs {
-                    println!(
-                        "    {} at offset {} in {}",
-                        human(r.num_bytes),
-                        r.file_offset,
-                        holder.path.display(),
-                    );
-                }
+        log::info!(
+            "    extent {:#x}, {} on disk",
+            extent.disk_address,
+            human(extent.disk_bytes),
+        );
+        for holder in &holders {
+            for r in &holder.holder.refs {
+                log::info!(
+                    "    {} at offset {} in {}",
+                    human(r.num_bytes),
+                    r.file_offset,
+                    holder.path.display(),
+                );
             }
         }
         Ok(None)
@@ -481,10 +476,8 @@ fn redirect_chunks(
             let src_offset = holder.fs.sectorsize + at - liverange.start;
             let deduped = kernel::dedupe(temp, src_offset, len, &file, cursor)
                 .map_err(|e| Failure::new(path, e))?;
-            if deduped != len {
-                eprintln!("Warning {}: deduped != len", path.display());
-            }
-            // A deduped of 0 should never happen? Report it.
+            // The kernel may dedupe less than asked, and this carries on from
+            // where it stopped. Nothing at all would never finish.
             if deduped == 0 {
                 return Err(Failure::other(
                     path,
@@ -569,11 +562,10 @@ impl Report {
             ));
         }
         let entry = (failure.path, failure.error.to_string());
+        log::warn!("{}: {}, leaving it alone", entry.0.display(), entry.1);
         if failure.error.kind() == io::ErrorKind::InvalidData {
-            eprintln!("warning: modified {}: {}", entry.0.display(), entry.1);
             self.modified.push(entry);
         } else {
-            eprintln!("skipped {}: {}", entry.0.display(), entry.1);
             self.skipped.push(entry);
         }
         Ok(Some(LeftAlone::Failed))
@@ -581,23 +573,21 @@ impl Report {
 }
 
 /// The head line for one extent: the file it is named after, what its rewrite
-/// copies, and what it frees.
-fn describe(extent: &Extent, holders: &[Located], options: &Options) -> String {
+/// copies, and what it frees, as done or, on a dry run, as it would be.
+fn describe(extent: &Extent, holders: &[Located], applied: bool) -> String {
     let shared_with = match holders.len() - 1 {
         0 => String::new(),
         1 => " (shared with 1 other file)".to_string(),
         n => format!(" (shared with {n} other files)"),
     };
-    format!(
-        "{}: {} {}, {} {}{shared_with}",
-        holders[0].path.display(),
-        if options.apply { "copied" } else { "copying" },
+    let (copied, freed) = (
         human(extent.live_uncompressed_bytes()),
-        if options.apply {
-            "freed part of"
-        } else {
-            "frees part of"
-        },
         human(extent.disk_free_bytes()),
-    )
+    );
+    let path = holders[0].path.display();
+    if applied {
+        format!("{path}: copied {copied}, freed {freed}{shared_with}")
+    } else {
+        format!("{path}: would copy {copied} to free {freed}{shared_with}")
+    }
 }

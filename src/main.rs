@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use log::{Level, LevelFilter, Metadata, Record};
 
 use btrealloc::Options;
 
@@ -26,7 +27,8 @@ struct Args {
     /// Actually perform the extent reallocation operation, writing changes to the filesystem.
     #[arg(long, conflicts_with = "dryrun")]
     apply: bool,
-    /// Increase logging verbosity.
+    /// Also say why each extent was left alone, and list every file holding
+    /// each rewritten extent.
     #[arg(short, long)]
     verbose: bool,
     /// Perform a dry run without writing any data.
@@ -37,8 +39,42 @@ struct Args {
     jobs: Option<NonZeroUsize>,
 }
 
+/// Writes btrealloc's diagnostics to stderr, at the level `-v` asks
+/// for: errors and warnings named as such, more detail as it is. What a run
+/// finds and does is its result, printed to stdout, and does not come through
+/// here.
+struct Logger;
+
+impl log::Log for Logger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= log::max_level() && metadata.target().starts_with("btrealloc")
+    }
+
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        match record.level() {
+            Level::Error => eprintln!("error: {}", record.args()),
+            Level::Warn => eprintln!("warning: {}", record.args()),
+            Level::Info | Level::Debug | Level::Trace => eprintln!("{}", record.args()),
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: Logger = Logger;
+
 fn parse_options() -> Options {
     let args = Args::parse();
+    let level = if args.verbose {
+        LevelFilter::Info
+    } else {
+        LevelFilter::Warn
+    };
+    log::set_logger(&LOGGER).expect("the logger is set once, before anything logs");
+    log::set_max_level(level);
     // Extents are resolved on rayon's global pool, which is one thread per CPU
     // unless told otherwise here.
     if let Some(jobs) = args.jobs {
@@ -50,7 +86,6 @@ fn parse_options() -> Options {
     Options {
         apply: args.apply,
         dryrun: args.dryrun,
-        verbose: args.verbose,
         path: args.path,
     }
 }
@@ -58,15 +93,10 @@ fn parse_options() -> Options {
 fn main() -> ExitCode {
     let options = parse_options();
 
-    // Warning
-    println!(
-        "WARNING: This tool is experimental and modifies your filesystem as root. Use at your own risk."
-    );
-
     // btrfs tree-search and dedupe ioctls are root-only; without them the tool
     // silently does nothing useful, so refuse to start.
     if unsafe { geteuid() } != 0 {
-        eprintln!("Error: btrealloc must be run as root, it relies on btrfs ioctls");
+        log::error!("btrealloc must be run as root, it relies on btrfs ioctls");
         return ExitCode::FAILURE;
     }
 
@@ -76,7 +106,7 @@ fn main() -> ExitCode {
     let (stats, _) = match btrealloc::run(&options) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("{}: {e}", options.path.display());
+            log::error!("{}: {e}", options.path.display());
             return ExitCode::FAILURE;
         }
     };
