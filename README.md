@@ -1,17 +1,10 @@
-# Warning
-
-- **This code is a prototype and not extensively tested or validated!**
-- **Running this tool modifies your filesystem. It might cause data loss or corruption.**
-- **Do not use it unless you are sure you know what you're doing.**
-- **Do not use it on data you care about unless you have backups.**
-- **This code comes with no warranty or support.**
-- **Use at your own risk.**
-
 # Btrealloc - Btrfs extent reallocator to reclaim disk space
 
-Btrfs is a Copy-on-Write filesystem which, in short, stores files on-disk using *extents*. For example, a 100MiB file could precisely be stored as 100x 1MiB extents without wasting bytes. The COW part of Btrfs means that if a write takes place inside the file, it does not modify these bytes in-place. A 1kB write likely triggers the allocation of a new extent to store it on disk. The file's metadata would now reflect it pointing to the 100 original extents for the majority of its data, and one new extent holding this 1kB write. However, this means that 1kB of the previously full 1MiB extent has now become "unreachable". This wastes a small amount of space.
+Btrfs is a Copy-on-Write filesystem which stores files on-disk using extents. For example, a 100MiB file could precisely be stored as 100x 1MiB extents. However, Copy-on-Write means that if a write takes place inside the file it does not modify these bytes in-place. A small 1kB write inside the file will likely trigger the allocation of a new extent to store these bytes on disk. The file's metadata would now reflect it pointing to the 100 original extents for the majority of its data, and one new extent holding 1kB. However, this means that 1kB of the previously full 1MiB extent has now become "unreachable". This wastes a small amount of space.
 
-However with repeated writes, worst-case situations can occur where files hold on to a sliver of a large extent, wasting the rest of its space. This can grow to gigabytes with enough churn. [btdu](https://github.com/CyberShadow/btdu) is a powerful sampling profiler for Btrfs filesystems which can quickly visualize this amount of "unreachable" space.
+With repeated writes, worst-case situations can occur where a file holds on to only a sliver of a large extent, wasting the rest of its space. This can grow to gigabytes with enough churn.
+
+[btdu](https://github.com/CyberShadow/btdu) is a powerful sampling profiler for Btrfs filesystems which can quickly visualize this amount of "unreachable" space.
 
 There are some ways to attempt to reclaim unreachable space:
 
@@ -20,9 +13,9 @@ There are some ways to attempt to reclaim unreachable space:
 
 Both of the above operations also unshare any deduplication which was established with tools like `bees` or `duperemove`.
 
-This tool is specifically designed to give the filesystem an opportunity to reallocate extents with unreachable data, in-place, without modifying the original file's contents or metadata, and preserving any existing deduplication.
+This tool is specifically designed to give the filesystem an opportunity to reallocate extents with unreachable data, in-place, without modifying the original file's contents or metadata, and preserving existing deduplication.
 
-Btrealloc works on a whole filesystem at once, every subvolume and snapshot included, read-only snapshots too. An extent is only freed once every file holding it lets go, so an extent shared with a snapshot is rewritten in the snapshot as well.
+Btrealloc works on a whole filesystem at once, every subvolume and snapshot included, read-only snapshots too.
 
 # Usage
 
@@ -130,6 +123,7 @@ unreachable:        2.45 GiB
 - The files touched should only have had their extents reallocated. Their contents and metadata should remain untouched.
 - Files in read-only snapshots are rewritten too. The snapshot stays read-only and its contents and times do not change, but its extents do. If a `btrfs send` of a snapshot is running the kernel refuses to dedupe into it and those extents are skipped for that run.
 - Rewriting an extent that many snapshots share writes to the metadata of every one of them, and unshares metadata the snapshots shared until then. With many snapshots, the metadata this costs can outweigh the data freed.
+- Compressed extents are read, decompressed and written back, where btrfs may compress the data again. Existing deduplication between files is preserved. However wshich on-disk bytes of a compressed extent belong to which part of its data cannot be known, so for compressed extents "used" and "unreachable" are estimated in proportion to the data still referenced. A live range compressed on its own may also compress worse than it did as part of the whole extent so the space actually freed can be less than reported.
 - Currently each live range gets allocated a new extent. This can create more extents and more metadata. Coalescing live ranges into a single extent could be a future improvement.
 
 # Test infrastructure
