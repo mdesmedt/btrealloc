@@ -565,15 +565,22 @@ impl Filesystem {
     pub fn walk(self: &Arc<Self>) -> io::Result<ExtentWalk> {
         // Commit what is pending first, so that everything allocated from here
         // on, our own copies included, is newer than the generation read next.
-        if unsafe { syncfs(self.file.as_raw_fd()) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        self.sync()?;
         Ok(ExtentWalk {
             fs: Arc::clone(self),
             next: Some(0),
             generation: self.generation()?,
             batch: Vec::new().into_iter(),
         })
+    }
+
+    /// Writes out everything pending and commits the running transaction, as
+    /// `syncfs` does on btrfs.
+    pub fn sync(&self) -> io::Result<()> {
+        if unsafe { syncfs(self.file.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// The filesystem's current generation: the transaction last committed,

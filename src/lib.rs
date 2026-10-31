@@ -73,8 +73,15 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
     }
 
     let report = runner.map(Runner::finish).unwrap_or_default();
+
     if let Some(e) = scanner.error.take() {
         return Err(e);
     }
+
+    // Commit pending fs operations with a sync.
+    if options.apply {
+        fs.sync()?;
+    }
+
     Ok((scanner.stats, report))
 }
