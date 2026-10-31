@@ -40,11 +40,6 @@ Options:
       --dryrun    Perform a dry run without writing any data
   -j, --jobs <N>  Threads to resolve extents on. Defaults to one per CPU
   -h, --help      Print help
-
-Exit status:
-  0  the run finished, even if some extents were left alone
-  1  the run could not finish
-  2  invalid arguments
 ```
 
 A run that finishes exits 0 even when some extents were left alone, including ones whose rewrite failed: on a filesystem in use files change or get deleted, and each one is reported as it happens and in the table at the end. It exits 1 when it cannot finish, including when it stops because the filesystem is out of space, over a quota, read-only or failing.
