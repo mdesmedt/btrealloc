@@ -12,13 +12,7 @@ unsafe extern "C" {
 }
 
 #[derive(Parser)]
-#[command(
-    about = "Reclaim unreachable space on btrfs by rewriting live data into compact extents",
-    after_help = "Exit status:\n  \
-        0  the run finished, even if some extents were left alone\n  \
-        1  the run could not finish\n  \
-        2  invalid arguments"
-)]
+#[command(about = "Reclaim unreachable space on btrfs by rewriting live data into compact extents")]
 struct Args {
     /// Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`).
     /// Every subvolume and snapshot on it is scanned from there.
