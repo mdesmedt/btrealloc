@@ -39,14 +39,22 @@ By default the tool generates a report only and does not make any changes:
 Usage: btrealloc [OPTIONS] <MOUNT>
 
 Arguments:
-  <MOUNT>  Where the filesystem's top-level subvolume is mounted
+  <MOUNT>  Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`). Every subvolume and snapshot on it is scanned from there
 
 Options:
-      --apply    Actually perform the extent reallocation operation, writing changes to the filesystem
-  -v, --verbose  Increase logging verbosity
-      --dryrun   Perform a dry run without writing any data
-  -h, --help     Print help
+      --apply     Actually perform the extent reallocation operation, writing changes to the filesystem
+  -v, --verbose   Increase logging verbosity
+      --dryrun    Perform a dry run without writing any data
+  -j, --jobs <N>  Threads to resolve extents on. Defaults to one per CPU
+  -h, --help      Print help
+
+Exit status:
+  0  the run finished, even if some extents were left alone
+  1  the run could not finish
+  2  invalid arguments
 ```
+
+A run that finishes exits 0 even when some extents were left alone, including ones whose rewrite failed: on a filesystem in use files change or get deleted, and each one is reported as it happens and in the table at the end. It exits 1 when it cannot finish, including when it stops because the filesystem is out of space, over a quota, read-only or failing.
 
 # Example
 

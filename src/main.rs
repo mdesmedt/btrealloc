@@ -11,14 +11,20 @@ unsafe extern "C" {
 }
 
 #[derive(Parser)]
-#[command(about = "Reclaim unreachable space on btrfs by rewriting live data into compact extents")]
+#[command(
+    about = "Reclaim unreachable space on btrfs by rewriting live data into compact extents",
+    after_help = "Exit status:\n  \
+        0  the run finished, even if some extents were left alone\n  \
+        1  the run could not finish\n  \
+        2  invalid arguments"
+)]
 struct Args {
     /// Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`).
     /// Every subvolume and snapshot on it is scanned from there.
     #[arg(value_name = "MOUNT")]
     path: PathBuf,
     /// Actually perform the extent reallocation operation, writing changes to the filesystem.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "dryrun")]
     apply: bool,
     /// Increase logging verbosity.
     #[arg(short, long)]
@@ -33,10 +39,6 @@ struct Args {
 
 fn parse_options() -> Options {
     let args = Args::parse();
-    if args.apply && args.dryrun {
-        eprintln!("Cannot specify both --apply and --dryrun");
-        std::process::exit(1);
-    }
     // Extents are resolved on rayon's global pool, which is one thread per CPU
     // unless told otherwise here.
     if let Some(jobs) = args.jobs {
