@@ -36,7 +36,7 @@ Arguments:
 
 Options:
       --apply     Actually perform the extent reallocation operation, writing changes to the filesystem
-  -v, --verbose   Also say why each extent was left alone, and list each extent rewritten, or that would be without --apply, with every file holding it
+  -v, --verbose   Prints information about each extent during the scan or apply
   -j, --jobs <N>  Threads to resolve extents on. Defaults to one per CPU
   -h, --help      Print help
 ```
@@ -50,12 +50,16 @@ Generate a report:
 ```
 sudo btrealloc /mnt/filesystem
 Scanning: /mnt/filesystem
+
 extents:            2723877
 allocated:          1010.22 GiB
 used:               957.03 GiB
 unreachable:        46.50 GiB
-  reclaimable:      44.07 GiB, copying 18.85 GiB from 6058 extents
+  reclaimable:      44.07 GiB
   left alone:       2.43 GiB
+  bytes to copy:    18.85 GiB
+
+Extent size rounded down to a power of two:
 ...
 
 Nothing written. Run with --apply to reallocate extents.
@@ -76,10 +80,12 @@ Generating the report again:
 ```
 sudo btrealloc /mnt/filesystem
 Scanning: /mnt/filesystem
+
 extents:            2756285
 allocated:          964.73 GiB
 used:               955.57 GiB
 unreachable:        2.45 GiB
+...
 ```
 
 # How it works
