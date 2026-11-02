@@ -202,7 +202,7 @@ impl LeftAlone {
             LeftAlone::PastEnd => "held past a file's end".to_string(),
             LeftAlone::Changed => "changed during the scan".to_string(),
             LeftAlone::Unresolved => "holders could not be looked up".to_string(),
-            LeftAlone::Failed => "rewrite failed".to_string(),
+            LeftAlone::Failed => "failed to access or rewrite".to_string(),
             LeftAlone::Deleted => "file was deleted".to_string(),
         }
     }

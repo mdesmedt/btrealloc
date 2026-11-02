@@ -19,15 +19,11 @@ struct Args {
     #[arg(value_name = "MOUNT")]
     path: PathBuf,
     /// Actually perform the extent reallocation operation, writing changes to the filesystem.
-    #[arg(long, conflicts_with = "dryrun")]
+    #[arg(long)]
     apply: bool,
-    /// Also say why each extent was left alone, and list every file holding
-    /// each rewritten extent.
+    /// Prints information about each extent during the scan or apply.
     #[arg(short, long)]
     verbose: bool,
-    /// Perform a dry run without writing any data.
-    #[arg(long)]
-    dryrun: bool,
     /// Threads to resolve extents on. Defaults to one per CPU.
     #[arg(short, long, value_name = "N")]
     jobs: Option<NonZeroUsize>,
@@ -79,7 +75,6 @@ fn parse_options() -> Options {
     }
     Options {
         apply: args.apply,
-        dryrun: args.dryrun,
         path: args.path,
     }
 }
@@ -97,7 +92,7 @@ fn main() -> ExitCode {
     // Scan, and rewrite along the way if asked to
 
     println!("Scanning: {}", options.path.display());
-    let (stats, _) = match btrealloc::run(&options) {
+    let (stats, report) = match btrealloc::run(&options) {
         Ok(result) => result,
         Err(e) => {
             log::error!("{}: {e}", options.path.display());
@@ -110,14 +105,9 @@ fn main() -> ExitCode {
         stats.report_left_alone();
     } else {
         println!();
-        stats.report();
-    }
-
-    if !options.dryrun && !options.apply {
+        stats.report(&report);
         println!();
-        println!(
-            "Nothing done. Specify --dryrun to see what would be done, or --apply to rewrite extents."
-        );
+        println!("Nothing written. Run with --apply to reallocate extents.");
     }
 
     ExitCode::SUCCESS

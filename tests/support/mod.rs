@@ -831,11 +831,10 @@ pub fn job_for<'a>(worklist: &[&'a Extent], path: &Path) -> Option<&'a Extent> {
     worklist.iter().copied().find(|extent| holds(extent, id))
 }
 
-pub fn options(path: &Path, apply: bool, dryrun: bool) -> Options {
+pub fn options(path: &Path, apply: bool) -> Options {
     Options {
         path: path.to_path_buf(),
         apply,
-        dryrun,
     }
 }
 
@@ -878,7 +877,7 @@ pub fn scan(fs: &Fs) -> Scan {
 /// Scans, rewrites, and syncs, then returns the scan it worked from and what it
 /// did. Assert on the report; the same lines were printed as it went.
 pub fn apply(fs: &Fs) -> (Scan, Report) {
-    let options = options(fs.root(), true, false);
+    let options = options(fs.root(), true);
     // Scanned beforehand, so the check below knows which holders each
     // rewritten extent had.
     let scan = scan(fs);
@@ -988,7 +987,7 @@ fn copy_ranges(extent: &Extent) -> Vec<(u64, u64)> {
 /// The same walk with nothing written, which must leave the filesystem exactly
 /// as it was.
 pub fn dryrun(fs: &Fs) -> (Scan, Report) {
-    let options = options(fs.root(), false, true);
+    let options = options(fs.root(), false);
     let scan = scan(fs);
     let (_, report) = btrealloc::run(&options).expect("run over the fixture");
     (scan, report)

@@ -669,7 +669,7 @@ fn only_the_top_level_subvolume_is_accepted() {
     ];
     for (path, expected) in &refused {
         for apply in [false, true] {
-            let error = btrealloc::run(&support::options(path, apply, false))
+            let error = btrealloc::run(&support::options(path, apply))
                 .err()
                 .unwrap_or_else(|| panic!("{} was accepted", path.display()));
             assert!(
@@ -680,14 +680,14 @@ fn only_the_top_level_subvolume_is_accepted() {
         }
     }
 
-    let error = btrealloc::run(&support::options(&readonly.path, true, false))
+    let error = btrealloc::run(&support::options(&readonly.path, true))
         .err()
         .expect("--apply through a read-only mount was accepted");
     assert!(
         error.to_string().contains("read-only"),
         "said {error:?}, which should mention the mount is read-only"
     );
-    let (_, report) = btrealloc::run(&support::options(&readonly.path, false, true))
+    let (_, report) = btrealloc::run(&support::options(&readonly.path, false))
         .expect("a dry run through a read-only mount");
     assert!(!report.rewritten.is_empty(), "the dry run should find work");
 
@@ -811,7 +811,7 @@ fn a_deleted_file_still_open_is_skipped_as_deleted() {
     std::fs::remove_file(&path).expect("delete the file");
     support::sync_fs();
 
-    let options = support::options(fs.root(), true, false);
+    let options = support::options(fs.root(), true);
     let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
     assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
@@ -831,7 +831,7 @@ fn a_nodatacow_file_is_skipped_as_nodatacow() {
     support::write_random(&file, FILE_MIB);
     support::punch_hole(&file, MIB, (FILE_MIB - 2) * MIB);
 
-    let options = support::options(fs.root(), true, false);
+    let options = support::options(fs.root(), true);
     let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
     assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
     assert!(
@@ -1029,7 +1029,7 @@ fn a_full_filesystem_stops_the_run() {
     fs.fill("filler");
 
     let before = support::checksums(fs.root());
-    let error = btrealloc::run(&support::options(fs.root(), true, false))
+    let error = btrealloc::run(&support::options(fs.root(), true))
         .err()
         .expect("the run should stop");
     assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
@@ -1046,7 +1046,7 @@ fn a_full_quota_stops_the_run() {
     fs.limit_quota("1M");
 
     let before = support::checksums(fs.root());
-    let error = btrealloc::run(&support::options(fs.root(), true, false))
+    let error = btrealloc::run(&support::options(fs.root(), true))
         .err()
         .expect("the run should stop");
     assert_eq!(error.kind(), std::io::ErrorKind::QuotaExceeded, "{error}");
@@ -1084,6 +1084,47 @@ fn a_dry_run_changes_nothing() {
             file.display()
         );
     }
+}
+
+/// The report splits the unreachable space into what an --apply would free and
+/// what it leaves alone. The two have to add up to the whole, everything a
+/// holder rules out has to be left alone, not reclaimable, and the --apply then
+/// has to free what was reclaimable.
+#[test]
+fn reclaimable_and_left_alone_add_up_to_unreachable() {
+    let fs = Fs::new();
+    fs.dir("data");
+    support::bookend(&fs.path("data/bookend"), FILE_MIB);
+    let tiny = fs.path("data/tiny");
+    support::write_random(&tiny, 1);
+    support::punch_hole(&tiny, 64 * 1024, 8 * 1024);
+    let nocow = fs.path("data/nocow");
+    std::fs::File::create(&nocow).expect("create the file");
+    support::set_nocow(&nocow);
+    support::write_random(&nocow, FILE_MIB);
+    support::punch_hole(&nocow, MIB, (FILE_MIB - 2) * MIB);
+
+    let options = support::options(fs.root(), false);
+    let (stats, dryrun) = btrealloc::run(&options).expect("run over the fixture");
+    for reason in [LeftAlone::TooLittleToFree, LeftAlone::NoDataCow] {
+        assert!(
+            stats.left_alone.get(reason).count > 0,
+            "fixture: nothing was left alone as {}",
+            reason.label()
+        );
+    }
+    assert!(
+        dryrun.freed_bytes > 0,
+        "fixture: something should be reclaimable"
+    );
+    assert_eq!(
+        dryrun.freed_bytes + stats.left_alone.total().unreachable_bytes,
+        stats.totals.unreachable_bytes
+    );
+
+    let (_, applied) = support::apply(&fs);
+    assert_eq!(dryrun.freed_bytes, applied.freed_bytes);
+    assert_eq!(dryrun.copied_bytes, applied.copied_bytes);
 }
 
 /// On a compressed filesystem an extent's on-disk size is not its uncompressed
@@ -1886,7 +1927,7 @@ fn assert_held_past_the_end_is_left_alone(fs: &Fs, file: &Path) {
         "fixture: the extent should look worth rewriting"
     );
 
-    let options = support::options(fs.root(), true, false);
+    let options = support::options(fs.root(), true);
     let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
     assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);

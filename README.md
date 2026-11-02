@@ -36,8 +36,7 @@ Arguments:
 
 Options:
       --apply     Actually perform the extent reallocation operation, writing changes to the filesystem
-  -v, --verbose   Also say why each extent was left alone, and list every file holding each rewritten extent
-      --dryrun    Perform a dry run without writing any data
+  -v, --verbose   Also say why each extent was left alone, and list each extent rewritten, or that would be without --apply, with every file holding it
   -j, --jobs <N>  Threads to resolve extents on. Defaults to one per CPU
   -h, --help      Print help
 ```
@@ -55,6 +54,11 @@ extents:            2723877
 allocated:          1010.22 GiB
 used:               957.03 GiB
 unreachable:        46.50 GiB
+  reclaimable:      44.07 GiB, copying 18.85 GiB from 6058 extents
+  left alone:       2.43 GiB
+...
+
+Nothing written. Run with --apply to reallocate extents.
 ```
 
 Reallocating the extents with `btrealloc --apply`:

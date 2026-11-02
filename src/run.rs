@@ -26,8 +26,6 @@ impl Runner {
     pub fn new(options: Options, fs: &Arc<Filesystem>) -> Runner {
         if options.apply {
             println!("rewriting extents as they are found");
-        } else {
-            println!("dry run: nothing will be written");
         }
         Runner {
             options,
@@ -62,7 +60,13 @@ impl Runner {
             }
         }
 
-        println!("{}", describe(extent, &holders, self.options.apply));
+        // Rewrites are the progress of an --apply. On a dry run they are
+        // detail, for -v: the report at the end sums them up.
+        if self.options.apply {
+            println!("{}", describe(extent, &holders, true));
+        } else {
+            log::info!("{}", describe(extent, &holders, false));
+        }
 
         let report = &mut self.report;
         report.copied_bytes += extent.live_uncompressed_bytes();
@@ -87,24 +91,22 @@ impl Runner {
         Ok(None)
     }
 
-    /// Prints the summary of the whole run and returns its account.
+    /// Prints the summary of an --apply and returns its account. A dry run's
+    /// account goes into the report instead: see [`ScanStats::report`].
+    ///
+    /// [`ScanStats::report`]: crate::scan::ScanStats::report
     pub fn finish(self) -> Report {
         let report = self.report;
-        let extents = report.rewritten.len();
-        println!();
-        if self.options.apply {
-            println!(
-                "copied {} to free {} from {extents} extents",
-                human(report.copied_bytes),
-                human(report.freed_bytes),
-            );
-        } else {
-            println!(
-                "would copy {} to free {} from {extents} extents",
-                human(report.copied_bytes),
-                human(report.freed_bytes),
-            );
+        if !self.options.apply {
+            return report;
         }
+        println!();
+        println!(
+            "copied {} to free {} from {} extents",
+            human(report.copied_bytes),
+            human(report.freed_bytes),
+            report.rewritten.len(),
+        );
         if !report.skipped.is_empty() {
             println!("{} extents could not be rewritten", report.skipped.len());
         }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::extent::{Extent, LeftAlone};
 use crate::format::human;
 use crate::kernel::{self, ExtentWalk, Filesystem, Resolved};
+use crate::run::Report;
 
 /// Extents of one size class, the class being a power of two: everything from
 /// that size up to the next one.
@@ -88,6 +89,18 @@ impl LeftAloneStats {
     pub fn get(&self, reason: LeftAlone) -> &Bucket {
         &self.reasons[reason as usize]
     }
+
+    /// Every reason added together.
+    pub fn total(&self) -> Bucket {
+        let mut total = Bucket::ZERO;
+        for bucket in &self.reasons {
+            total.count += bucket.count;
+            total.allocated_bytes += bucket.allocated_bytes;
+            total.used_bytes += bucket.used_bytes;
+            total.unreachable_bytes += bucket.unreachable_bytes;
+        }
+        total
+    }
 }
 
 /// What the walk has seen so far, counted as it goes: every extent is counted
@@ -106,16 +119,24 @@ impl ScanStats {
         left_alone: LeftAloneStats::ZERO,
     };
 
-    /// Prints what the scan found: the totals, then the same split by extent size class.
-    pub fn report(&self) {
+    /// Prints what the scan found: the totals, then the same split by extent
+    /// size class. `run` is the dry run that went with it, for what of the
+    /// unreachable space it would free; the rest is left alone.
+    pub fn report(&self, run: &Report) {
         let totals = &self.totals;
         println!("extents:            {}", self.extents);
         println!("allocated:          {}", human(totals.allocated_bytes));
         println!("used:               {}", human(totals.used_bytes));
         println!("unreachable:        {}", human(totals.unreachable_bytes));
+        println!("  reclaimable:      {}", human(run.freed_bytes));
+        println!(
+            "  left alone:       {}",
+            human(self.left_alone.total().unreachable_bytes)
+        );
+        println!("  bytes to copy:    {}", human(run.copied_bytes));
 
         println!();
-        println!("extent size rounded down to a power of two:");
+        println!("Extent size rounded down to a power of two:");
         println!(
             "{:>12}  {:>10}  {:>12}  {:>12}  {:>12}",
             "size", "count", "allocated", "used", "unreachable"
@@ -143,7 +164,7 @@ impl ScanStats {
     pub fn report_left_alone(&self) {
         if !self.left_alone.is_empty() {
             println!();
-            println!("extents with unreachable space left alone:");
+            println!("Extents with unreachable space left alone:");
             println!(
                 "{:>32}  {:>10}  {:>12}  {:>12}  {:>12}",
                 "reason", "count", "allocated", "used", "unreachable"
@@ -162,6 +183,15 @@ impl ScanStats {
                     human(bucket.unreachable_bytes),
                 );
             }
+            let total = self.left_alone.total();
+            println!(
+                "{:>32}  {:>10}  {:>12}  {:>12}  {:>12}",
+                "total",
+                total.count,
+                human(total.allocated_bytes),
+                human(total.used_bytes),
+                human(total.unreachable_bytes),
+            );
         }
     }
 }
