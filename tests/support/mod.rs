@@ -40,7 +40,7 @@ use linux_raw_sys::ioctl::{
 use sha2::{Digest, Sha256};
 
 use btrealloc::Options;
-use btrealloc::extent::Extent;
+use btrealloc::extent::{Extent, WorthChecks};
 use btrealloc::kernel;
 use btrealloc::run::Report;
 use btrealloc::scan::{ScanStats, Scanner, Totals};
@@ -814,7 +814,7 @@ pub fn worklist(scan: &Scan) -> Vec<&Extent> {
     let mut extents: Vec<&Extent> = scan
         .extents
         .values()
-        .filter(|extent| extent.worth_rewriting())
+        .filter(|extent| extent.worth_rewriting(WorthChecks::default()))
         .collect();
     extents.sort_by_key(|extent| extent.disk_address);
     extents
@@ -835,6 +835,7 @@ pub fn options(path: &Path, apply: bool) -> Options {
     Options {
         path: path.to_path_buf(),
         apply,
+        worth_checks: WorthChecks::default(),
     }
 }
 

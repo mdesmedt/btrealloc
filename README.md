@@ -35,10 +35,12 @@ Arguments:
   <MOUNT>  Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`). Every subvolume and snapshot on it is scanned from there
 
 Options:
-      --apply     Actually perform the extent reallocation operation, writing changes to the filesystem
-  -v, --verbose   Prints information about each extent during the scan or apply
-  -j, --jobs <N>  Threads to resolve extents on. Defaults to one per CPU
-  -h, --help      Print help
+      --apply          Actually perform the extent reallocation operation, writing changes to the filesystem
+  -v, --verbose        Prints information about each extent during the scan or apply
+  -j, --jobs <N>       Threads to resolve extents on. Defaults to one per CPU
+      --no-min-free    Also rewrite extents that free under 64 KiB each. Reclaims more, at the cost of more small rewrites
+      --no-copy-limit  Also rewrite extents that copy over 4x the space they free. Reclaims more, at the cost of copying more data
+  -h, --help           Print help
 ```
 
 A run that finishes exits 0 even when some extents were left alone, including ones whose rewrite failed: on a filesystem in use files change or get deleted, and each one is reported as it happens and in the table at the end. It exits 1 when it cannot finish, including when it stops because the filesystem is out of space, over a quota, read-only or failing.
@@ -103,8 +105,8 @@ unreachable:        2.45 GiB
 ## Selection
 
 - Each extent found is checked against a set of criteria, and skipped:
-  - With small amounts of reclaimable space (currently <64kb)
-  - Which require a large copy to free up a relatively small amount of space (currently >4:1 ratio)
+  - With small amounts of reclaimable space (currently <64kb), unless `--no-min-free` is set
+  - Which require a large copy to free up a relatively small amount of space (currently >4:1 ratio), unless `--no-copy-limit` is set
   - Held by a nodatacow file, which cannot be deduped
 
 ## Applying

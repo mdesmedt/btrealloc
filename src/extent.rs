@@ -139,24 +139,45 @@ impl Extent {
     }
 
     /// Whether reallocating this extent is worth what it costs.
-    pub fn worth_rewriting(&self) -> bool {
-        self.not_worth_rewriting().is_none()
+    pub fn worth_rewriting(&self, checks: WorthChecks) -> bool {
+        self.not_worth_rewriting(checks).is_none()
     }
 
     /// Why reallocating this extent is not worth what it costs, if it isn't.
-    pub fn not_worth_rewriting(&self) -> Option<LeftAlone> {
+    pub fn not_worth_rewriting(&self, checks: WorthChecks) -> Option<LeftAlone> {
         let free_bytes = self.disk_free_bytes();
 
         // Check if the extent has at least MIN_RECLAIM_BYTES reclaimable bytes
-        if free_bytes < MIN_RECLAIM_BYTES {
+        if checks.min_free && free_bytes < MIN_RECLAIM_BYTES {
             return Some(LeftAlone::TooLittleToFree);
         }
 
         // Check that we're not going to copy much to reclaim little
-        if free_bytes * MAX_COPY_RATIO < self.live_uncompressed_bytes() {
+        if checks.copy_ratio && free_bytes * MAX_COPY_RATIO < self.live_uncompressed_bytes() {
             return Some(LeftAlone::TooMuchToCopy);
         }
         None
+    }
+}
+
+/// Which of the cost heuristics leave an extent alone. Both are on by default;
+/// turning one off rewrites the extents it would have passed over, to reclaim
+/// more at a higher cost.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WorthChecks {
+    /// Leave alone extents that free less than [`MIN_RECLAIM_BYTES`].
+    pub min_free: bool,
+    /// Leave alone extents that copy more than [`MAX_COPY_RATIO`] times what
+    /// they free.
+    pub copy_ratio: bool,
+}
+
+impl Default for WorthChecks {
+    fn default() -> WorthChecks {
+        WorthChecks {
+            min_free: true,
+            copy_ratio: true,
+        }
     }
 }
 
@@ -292,21 +313,39 @@ mod tests {
     #[test]
     fn mostly_dead_extent_is_worth_rewriting() {
         let e = Extent::new(0, 1 << 20, 1 << 20, vec![extent_ref(0, 4096)]);
-        assert_eq!(e.not_worth_rewriting(), None);
+        assert_eq!(e.not_worth_rewriting(WorthChecks::default()), None);
     }
 
     #[test]
     fn small_gap_frees_too_little() {
         assert_eq!(
-            extent(&[(0, 1000)]).not_worth_rewriting(),
+            extent(&[(0, 1000)]).not_worth_rewriting(WorthChecks::default()),
             Some(LeftAlone::TooLittleToFree)
         );
     }
 
     #[test]
+    fn small_extent_is_rewritten_without_min_free() {
+        let checks = WorthChecks {
+            min_free: false,
+            ..WorthChecks::default()
+        };
+        // Half of it is free, so only its size keeps it from being rewritten.
+        let e = extent(&[(0, 512)]);
+        assert_eq!(
+            e.not_worth_rewriting(WorthChecks::default()),
+            Some(LeftAlone::TooLittleToFree)
+        );
+        assert_eq!(e.not_worth_rewriting(checks), None);
+    }
+
+    #[test]
     fn mostly_live_extent_copies_too_much() {
         let e = Extent::new(0, 1 << 20, 1 << 20, vec![extent_ref(0, 900 << 10)]);
-        assert_eq!(e.not_worth_rewriting(), Some(LeftAlone::TooMuchToCopy));
+        assert_eq!(
+            e.not_worth_rewriting(WorthChecks::default()),
+            Some(LeftAlone::TooMuchToCopy)
+        );
     }
 
     #[test]

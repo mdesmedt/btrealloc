@@ -8,7 +8,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use extent::LeftAlone;
+use extent::{LeftAlone, WorthChecks};
 use kernel::Filesystem;
 use run::{Report, Runner};
 use scan::{ScanStats, Scanner};
@@ -18,6 +18,8 @@ pub struct Options {
     /// Where the filesystem's top-level subvolume is mounted.
     pub path: PathBuf,
     pub apply: bool,
+    /// Which cost heuristics leave extents alone.
+    pub worth_checks: WorthChecks,
 }
 
 /// Main entry point. Scans the filesystem and performs the reallocation operation.
@@ -36,7 +38,7 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
         if extent.disk_free_bytes() == 0 {
             continue;
         }
-        if let Some(reason) = extent.not_worth_rewriting() {
+        if let Some(reason) = extent.not_worth_rewriting(options.worth_checks) {
             scanner.stats.left_alone.add(reason, Some(&extent));
             continue;
         }
@@ -47,7 +49,7 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
         if extent.disk_free_bytes() == 0 {
             continue;
         }
-        let reason = match extent.not_worth_rewriting() {
+        let reason = match extent.not_worth_rewriting(options.worth_checks) {
             Some(reason) => Some(reason),
             None => match runner.process(&extent) {
                 Ok(reason) => reason,

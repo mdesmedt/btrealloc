@@ -6,6 +6,7 @@ use clap::Parser;
 use log::{Level, LevelFilter, Metadata, Record};
 
 use btrealloc::Options;
+use btrealloc::extent::WorthChecks;
 
 unsafe extern "C" {
     fn geteuid() -> u32;
@@ -27,6 +28,14 @@ struct Args {
     /// Threads to resolve extents on. Defaults to one per CPU.
     #[arg(short, long, value_name = "N")]
     jobs: Option<NonZeroUsize>,
+    /// Also rewrite extents that free under 64 KiB each. Reclaims more, at the
+    /// cost of more small rewrites.
+    #[arg(long)]
+    no_min_free: bool,
+    /// Also rewrite extents that copy over 4x the space they free. Reclaims
+    /// more, at the cost of copying more data.
+    #[arg(long)]
+    no_copy_limit: bool,
 }
 
 /// Writes btrealloc's diagnostics to stderr, at the level `-v` asks
@@ -76,6 +85,10 @@ fn parse_options() -> Options {
     Options {
         apply: args.apply,
         path: args.path,
+        worth_checks: WorthChecks {
+            min_free: !args.no_min_free,
+            copy_ratio: !args.no_copy_limit,
+        },
     }
 }
 
