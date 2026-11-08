@@ -1,17 +1,15 @@
-# Btrealloc - Btrfs extent reallocator to reclaim disk space
+# Btrealloc - Btrfs tool to reclaim "unreachable" space
 
-Btrfs is a Copy-on-Write filesystem which stores files on-disk using extents. For example, a 100MiB file could precisely be stored as 100x 1MiB extents. However, Copy-on-Write means that if a write takes place inside the file it does not modify these bytes in-place. A small 1kB write inside the file will likely trigger the allocation of a new extent to store these bytes on disk. The file's metadata would now reflect it pointing to the 100 original extents for the majority of its data, and one new extent holding 1kB. However, this means that 1kB of the previously full 1MiB extent has now become "unreachable". This wastes a small amount of space.
+Btrfs is a filesystem which stores files on-disk using extents. For example, a 100MiB file could precisely be stored as 100x 1MiB extents. It is a Copy-on-Write filesystem which means that a write to a file does not modify bytes on disk in-place. For example, a small 1kB write inside this 100MiB file may require the allocation of a new extent to store the bytes. The file's metadata would now reflect it pointing to the 100 original extents for the majority of its data, and one new extent holding the 1kB write. However, this means that 1kB of a previously full 1MiB extent has now become "unreachable". This wastes a small amount of space.
 
-With repeated writes, worst-case situations can occur where a file holds on to only a sliver of a large extent, wasting the rest of its space. This can grow to gigabytes with enough churn.
+With repeated writes, worst-case situations can occur where a file holds on to only a sliver of a large extent, wasting the rest of its space. With enough churn the amount of unreachable space on a volume can grow to gigabytes.
 
-[btdu](https://github.com/CyberShadow/btdu) is a powerful sampling profiler for Btrfs filesystems which can quickly visualize this amount of "unreachable" space.
+[btdu](https://github.com/CyberShadow/btdu) is a powerful sampling profiler for Btrfs filesystems which can quickly visualize this.
 
 There are some ways to attempt to reclaim unreachable space:
 
-1. `btrfs filesystem defragment`: The defragmentation operation does not specifically reallocate extents with "unreachable" space but it might do some of this as a side-effect. A problem is that it's more likely to do this when specifying large extent sizes, e.g. `-t 128M` but reallocating with large extent sizes as a target also carries a higher likelihood of forming more unreachable allocations down the line.
-2. `cp --reflink=never`: By copying files with `--reflink=never` new, most likely better fitting, extents are allocated for the file. Removing the old file then releases its ownership of possibly large extents with unreachable space, which the filesystem could garbage collect once they are no longer referenced. This method can work but it is not an in-place operation and requires possibly a large amount of free space to temporarily copy the files to.
-
-Both of the above operations also unshare any deduplication which was established with tools like `bees` or `duperemove`.
+1. `btrfs filesystem defragment`: The defragmentation operation does not specifically reallocate extents with unreachable space but it might do some of this as a side-effect. A problem is that it's more likely to do this when specifying large extent sizes, e.g. `-t 128M` but reallocating with large extent sizes as a target also carries a higher likelihood of forming more unreachable allocations in the future.
+2. `cp --reflink=never`: By copying files with `--reflink=never` new, most likely better fitting, extents are allocated for the file. Removing the old file then releases its ownership of possibly large extents with unreachable space, which the filesystem could garbage collect once they are no longer referenced. This method can work but it is not an in-place operation and may require a large amount of free space to temporarily copy the files to before moving them back.
 
 This tool is specifically designed to give the filesystem an opportunity to reallocate extents with unreachable data, in-place, without modifying the original file's contents or metadata, and preserving existing deduplication.
 
