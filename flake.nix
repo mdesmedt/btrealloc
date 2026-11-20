@@ -13,35 +13,52 @@
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
-      packages = forAll (pkgs: {
-        btrealloc = pkgs.callPackage ./package.nix { };
-        default = self.packages.${pkgs.stdenv.hostPlatform.system}.btrealloc;
-      });
+      packages = forAll (pkgs: rec {
+        btrealloc = pkgs.rustPlatform.buildRustPackage {
+          pname = "btrealloc";
+          version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
 
-      # Adds btrealloc to a NixOS config's own nixpkgs.
-      overlays.default = final: prev: {
-        btrealloc = final.callPackage ./package.nix { };
-      };
-
-      devShells = forAll (
-        pkgs: with pkgs; {
-          default = mkShell {
-            packages = [
-              cargo
-              rustc
-              rust-analyzer
-              clippy
-              rustfmt
+          # Only what cargo needs, so edits to docs or Nix files don't rebuild
+          # the package or rerun the VM suite.
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./src
+              ./tests
             ];
           };
-        }
-      );
+          cargoLock.lockFile = ./Cargo.lock;
+
+          meta = {
+            description = "Reclaim unreachable space on btrfs by rewriting live data into compact extents";
+            homepage = "https://github.com/mdesmedt/btrealloc";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "btrealloc";
+            platforms = pkgs.lib.platforms.linux;
+          };
+        };
+        default = btrealloc;
+      });
+
+      devShells = forAll (pkgs: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            cargo
+            rustc
+            rust-analyzer
+            clippy
+            rustfmt
+          ];
+        };
+      });
 
       checks = forAll (pkgs: {
         # The end to end suite, in a VM of its own. `nix flake check` runs it.
         vm = import ./nix/vmtest.nix {
           inherit pkgs;
-          src = self;
+          inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) btrealloc;
         };
       });
     };

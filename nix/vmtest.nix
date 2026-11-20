@@ -2,20 +2,17 @@
 # root: the search ioctl btrealloc reads extents through, and the mkfs and loop
 # mount behind every test's own filesystem.
 #
-# `src` is the flake source, which is both what the tests are built from and
-# what they test.
-{ pkgs, src }:
+# `btrealloc` is the flake's package; the suite is built from its source and
+# tests that same code.
+{ pkgs, btrealloc }:
 
 let
   # The suite built as a binary, so the VM can run it without a toolchain or a
   # source tree. `cargo test` leaves this target alone, so it has to be asked
   # for by name.
-  vmtest = pkgs.rustPlatform.buildRustPackage {
+  vmtest = btrealloc.overrideAttrs (old: {
     pname = "btrealloc-vmtest";
-    version = "0.1.0";
-    inherit src;
-    cargoLock.lockFile = ../Cargo.lock;
-    nativeBuildInputs = [ pkgs.jq ];
+    nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.jq ];
     buildPhase = ''
       runHook preBuild
       cargo test --release --test vm --no-run --message-format=json \
@@ -31,7 +28,7 @@ let
         $out/bin/btrealloc-vmtest
       runHook postInstall
     '';
-  };
+  });
 in
 pkgs.testers.runNixOSTest {
   name = "btrealloc";
