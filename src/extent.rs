@@ -7,7 +7,7 @@ use crate::format::human;
 /// Minimum amount of bytes to reclaim in an extent.
 const MIN_RECLAIM_BYTES: u64 = 65536;
 
-/// Move at most this many bytes to free one. We currently choose to skip copying 100MB to reclaim 1MB.
+/// Move at most this many bytes to free one. E.g. we skip copying more than 4 MiB to reclaim 1 MiB.
 const MAX_COPY_RATIO: u64 = 4;
 
 /// One reference from a file into a physical extent.

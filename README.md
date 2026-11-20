@@ -1,6 +1,6 @@
 # Btrealloc - Btrfs tool to reclaim "unreachable" space
 
-Btrfs is a filesystem which stores files on-disk using extents. For example, a 100MiB file could precisely be stored as 100x 1MiB extents. It is a Copy-on-Write filesystem which means that a write to a file does not modify bytes on disk in-place. For example, a small 1kB write inside this 100MiB file may require the allocation of a new extent to store the bytes. The file's metadata would now reflect it pointing to the 100 original extents for the majority of its data, and one new extent holding the 1kB write. However, this means that 1kB of a previously full 1MiB extent has now become "unreachable". This wastes a small amount of space.
+Btrfs is a filesystem which stores files on-disk using extents. For example, a 100 MiB file could precisely be stored as 100x 1 MiB extents. It is a Copy-on-Write filesystem which means that a write to a file does not modify bytes on disk in-place. For example, a small 1 KiB write inside this 100 MiB file may require the allocation of a new extent to store the bytes. The file's metadata would now reflect it pointing to the 100 original extents for the majority of its data, and one new extent holding the 1 KiB write. However, this means that 1 KiB of a previously full 1 MiB extent has now become "unreachable". This wastes a small amount of space.
 
 With repeated writes, worst-case situations can occur where a file holds on to only a sliver of a large extent, wasting the rest of its space. With enough churn the amount of unreachable space on a volume can grow to gigabytes.
 
@@ -103,7 +103,7 @@ unreachable:        2.45 GiB
 ## Selection
 
 - Each extent found is checked against a set of criteria, and skipped:
-  - With small amounts of reclaimable space (currently <64kb), unless `--no-min-free` is set
+  - With small amounts of reclaimable space (currently <64 KiB), unless `--no-min-free` is set
   - Which require a large copy to free up a relatively small amount of space (currently >4:1 ratio), unless `--no-copy-limit` is set
   - Held by a nodatacow file, which cannot be deduped
 
