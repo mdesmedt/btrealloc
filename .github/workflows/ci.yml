@@ -34,6 +34,20 @@ jobs:
       - name: cargo test
         run: nix develop --command cargo test
 
+  # Advisories, licenses and sources of the dependencies. This is not a flake
+  # check because it fetches the RustSec advisory database, and the Nix sandbox
+  # has no network. Cargo.lock is the same on every system, so one run will do.
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: cargo deny check
+        run: nix develop --command cargo deny check
+
   # The VM suite run straight on the runner, as root, with no VM around it.
   # aarch64 runners have no /dev/kvm, so a VM there crawls under software
   # emulation, and this is the only end to end run it gets. On x86_64 it tests

@@ -50,6 +50,7 @@
             rust-analyzer
             clippy
             rustfmt
+            cargo-deny
           ];
         };
       });

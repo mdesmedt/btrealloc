@@ -9,6 +9,7 @@ cargo build
 cargo test
 cargo fmt
 cargo clippy
+cargo deny check   # dependency advisories, licenses and sources (deny.toml)
 ```
 
 Never git commit without being specifically instructed by the developer to do so.
