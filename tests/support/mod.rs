@@ -23,6 +23,7 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -40,6 +41,7 @@ use linux_raw_sys::ioctl::{
 use sha2::{Digest, Sha256};
 
 use btrealloc::Options;
+use btrealloc::console::Console;
 use btrealloc::extent::{Extent, WorthChecks};
 use btrealloc::kernel;
 use btrealloc::run::Report;
@@ -831,6 +833,12 @@ pub fn job_for<'a>(worklist: &[&'a Extent], path: &Path) -> Option<&'a Extent> {
     worklist.iter().copied().find(|extent| holds(extent, id))
 }
 
+/// What a run under test writes to: its results and warnings, without the
+/// `-v` detail or a progress line, which would bury them in the VM's log.
+pub fn console() -> Rc<Console> {
+    Rc::new(Console::new(false, false))
+}
+
 pub fn options(path: &Path, apply: bool) -> Options {
     Options {
         path: path.to_path_buf(),
@@ -859,7 +867,7 @@ impl Scan {
 pub fn scan(fs: &Fs) -> Scan {
     let filesystem =
         Arc::new(kernel::Filesystem::open(fs.root()).expect("open the fixture's filesystem"));
-    let mut scanner = Scanner::new(&filesystem).expect("start the walk");
+    let mut scanner = Scanner::new(&filesystem, &console()).expect("start the walk");
     let extents = scanner
         .by_ref()
         .map(|extent| (extent.disk_address, extent))
@@ -882,7 +890,7 @@ pub fn apply(fs: &Fs) -> (Scan, Report) {
     // Scanned beforehand, so the check below knows which holders each
     // rewritten extent had.
     let scan = scan(fs);
-    let (_, report) = btrealloc::run(&options).expect("run over the fixture");
+    let (_, report) = btrealloc::run(&options, &console()).expect("run over the fixture");
     sync_fs();
     assert_released(fs, &scan, &report);
     (scan, report)
@@ -990,7 +998,7 @@ fn copy_ranges(extent: &Extent) -> Vec<(u64, u64)> {
 pub fn dryrun(fs: &Fs) -> (Scan, Report) {
     let options = options(fs.root(), false);
     let scan = scan(fs);
-    let (_, report) = btrealloc::run(&options).expect("run over the fixture");
+    let (_, report) = btrealloc::run(&options, &console()).expect("run over the fixture");
     (scan, report)
 }
 

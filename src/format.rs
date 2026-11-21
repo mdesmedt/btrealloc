@@ -11,3 +11,17 @@ pub fn human(bytes: u64) -> String {
     }
     format!("{value:.2} {}", UNITS[unit])
 }
+
+/// A duration to the second, in hours, minutes and seconds, leaving out the
+/// larger units it does not reach.
+pub fn duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}

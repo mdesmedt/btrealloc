@@ -1,6 +1,8 @@
 use std::io;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::console::Console;
 use crate::extent::{Extent, LeftAlone};
 use crate::format::human;
 use crate::kernel::{self, ExtentWalk, Filesystem, Resolved};
@@ -122,76 +124,82 @@ impl ScanStats {
     /// Prints what the scan found: the totals, then the same split by extent
     /// size class. `run` is the dry run that went with it, for what of the
     /// unreachable space it would free; the rest is left alone.
-    pub fn report(&self, run: &Report) {
+    pub fn report(&self, run: &Report, console: &Console) {
         let totals = &self.totals;
-        println!("extents:            {}", self.extents);
-        println!("allocated:          {}", human(totals.allocated_bytes));
-        println!("used:               {}", human(totals.used_bytes));
-        println!("unreachable:        {}", human(totals.unreachable_bytes));
-        println!("  reclaimable:      {}", human(run.freed_bytes));
-        println!(
+        console.print(format!("extents:            {}", self.extents));
+        console.print(format!(
+            "allocated:          {}",
+            human(totals.allocated_bytes)
+        ));
+        console.print(format!("used:               {}", human(totals.used_bytes)));
+        console.print(format!(
+            "unreachable:        {}",
+            human(totals.unreachable_bytes)
+        ));
+        console.print(format!("  reclaimable:      {}", human(run.freed_bytes)));
+        console.print(format!(
             "  left alone:       {}",
             human(self.left_alone.total().unreachable_bytes)
-        );
-        println!("  bytes to copy:    {}", human(run.copied_bytes));
+        ));
+        console.print(format!("  bytes to copy:    {}", human(run.copied_bytes)));
 
-        println!();
-        println!("Extent size rounded down to a power of two:");
-        println!(
+        console.print("");
+        console.print("Extent size rounded down to a power of two:");
+        console.print(format!(
             "{:>12}  {:>10}  {:>12}  {:>12}  {:>12}",
             "size", "count", "allocated", "used", "unreachable"
-        );
+        ));
         for (log2, bucket) in totals.buckets.iter().enumerate() {
             if bucket.count == 0 {
                 continue;
             }
-            println!(
+            console.print(format!(
                 "{:>12}  {:>10}  {:>12}  {:>12}  {:>12}",
                 human(1 << log2),
                 bucket.count,
                 human(bucket.allocated_bytes),
                 human(bucket.used_bytes),
                 human(bucket.unreachable_bytes),
-            );
+            ));
         }
 
-        self.report_left_alone();
+        self.report_left_alone(console);
     }
 
     /// Prints the extents with unreachable space that were not rewritten, by
     /// reason. Unlike the totals, this still holds after an `--apply`: these
     /// are the extents the run did not rewrite.
-    pub fn report_left_alone(&self) {
+    pub fn report_left_alone(&self, console: &Console) {
         if !self.left_alone.is_empty() {
-            println!();
-            println!("Extents with unreachable space left alone:");
-            println!(
+            console.print("");
+            console.print("Extents with unreachable space left alone:");
+            console.print(format!(
                 "{:>32}  {:>10}  {:>12}  {:>12}  {:>12}",
                 "reason", "count", "allocated", "used", "unreachable"
-            );
+            ));
             for reason in LeftAlone::ALL {
                 let bucket = self.left_alone.get(reason);
                 if bucket.count == 0 {
                     continue;
                 }
-                println!(
+                console.print(format!(
                     "{:>32}  {:>10}  {:>12}  {:>12}  {:>12}",
                     reason.label(),
                     bucket.count,
                     human(bucket.allocated_bytes),
                     human(bucket.used_bytes),
                     human(bucket.unreachable_bytes),
-                );
+                ));
             }
             let total = self.left_alone.total();
-            println!(
+            console.print(format!(
                 "{:>32}  {:>10}  {:>12}  {:>12}  {:>12}",
                 "total",
                 total.count,
                 human(total.allocated_bytes),
                 human(total.used_bytes),
                 human(total.unreachable_bytes),
-            );
+            ));
         }
     }
 }
@@ -200,6 +208,7 @@ impl ScanStats {
 /// as it is handed over and then forgotten. See [`ExtentWalk`].
 pub struct Scanner {
     fs: Arc<Filesystem>,
+    console: Rc<Console>,
     walk: ExtentWalk,
     pub stats: ScanStats,
     /// Why the walk ended early, if it did.
@@ -207,9 +216,10 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    pub fn new(fs: &Arc<Filesystem>) -> io::Result<Scanner> {
+    pub fn new(fs: &Arc<Filesystem>, console: &Rc<Console>) -> io::Result<Scanner> {
         Ok(Scanner {
             fs: Arc::clone(fs),
+            console: Rc::clone(console),
             walk: fs.walk()?,
             stats: ScanStats::ZERO,
             error: None,
@@ -242,10 +252,14 @@ impl Scanner {
             return;
         }
         let reason = if kernel::is_changed(&error) {
-            log::info!("extent {disk_address:#x}: {error}, leaving it alone");
+            self.console.info(format_args!(
+                "extent {disk_address:#x}: {error}, leaving it alone"
+            ));
             LeftAlone::Changed
         } else {
-            log::warn!("extent {disk_address:#x}: {error}, leaving it alone");
+            self.console.warn(format!(
+                "extent {disk_address:#x}: {error}, leaving it alone"
+            ));
             LeftAlone::Unresolved
         };
         self.stats.left_alone.add(reason, extent);

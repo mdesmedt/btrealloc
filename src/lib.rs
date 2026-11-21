@@ -1,3 +1,4 @@
+pub mod console;
 pub mod extent;
 pub mod format;
 pub mod kernel;
@@ -6,8 +7,10 @@ pub mod scan;
 
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use console::Console;
 use extent::{LeftAlone, WorthChecks};
 use kernel::Filesystem;
 use run::{Report, Runner};
@@ -23,17 +26,26 @@ pub struct Options {
 }
 
 /// Main entry point. Scans the filesystem and performs the reallocation operation.
-pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
+pub fn run(options: &Options, console: &Rc<Console>) -> io::Result<(ScanStats, Report)> {
     let fs = Arc::new(Filesystem::open(&options.path)?);
     if options.apply && fs.read_only {
         return Err(io::Error::other(
             "mounted read-only: --apply needs the filesystem mounted read-write",
         ));
     }
-    let mut scanner = Scanner::new(&fs)?;
-    let mut runner = Runner::new(options.clone(), &fs);
+    let mut scanner = Scanner::new(&fs, console)?;
+    let mut runner = Runner::new(options.clone(), &fs, console);
+    // The total is only for the progress line, and the run goes on without it.
+    if console.interactive() {
+        let total = fs.data_used().unwrap_or_else(|e| {
+            console.info(format_args!("no total for the progress line: {e}"));
+            None
+        });
+        console.start_progress(total);
+    }
 
     while let Some(extent) = scanner.next() {
+        console.update_progress(scanner.stats.totals.allocated_bytes, scanner.stats.extents);
         // Nothing to reclaim, so nothing is being left behind.
         if extent.disk_free_bytes() == 0 {
             continue;
@@ -70,6 +82,7 @@ pub fn run(options: &Options) -> io::Result<(ScanStats, Report)> {
         }
     }
 
+    console.end_progress();
     let report = runner.finish();
 
     if let Some(e) = scanner.error.take() {

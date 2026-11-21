@@ -1,10 +1,13 @@
+use std::fmt::{self, Display};
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::Options;
+use crate::console::Console;
 use crate::extent::{Extent, ExtentRef, Holder, LeftAlone};
 use crate::format::human;
 use crate::kernel::{self, Filesystem};
@@ -19,17 +22,19 @@ use crate::kernel::{self, Filesystem};
 pub struct Runner {
     options: Options,
     fs: Arc<Filesystem>,
+    console: Rc<Console>,
     report: Report,
 }
 
 impl Runner {
-    pub fn new(options: Options, fs: &Arc<Filesystem>) -> Runner {
+    pub fn new(options: Options, fs: &Arc<Filesystem>, console: &Rc<Console>) -> Runner {
         if options.apply {
-            println!("rewriting extents as they are found");
+            console.print("rewriting extents as they are found");
         }
         Runner {
             options,
             fs: Arc::clone(fs),
+            console: Rc::clone(console),
             report: Report::default(),
         }
     }
@@ -41,14 +46,14 @@ impl Runner {
         let holders = match locate_holders(extent, &self.fs) {
             Ok(Ok(holders)) => holders,
             Ok(Err(reason)) => {
-                log::info!(
+                self.console.info(format_args!(
                     "extent {:#x}: {}, leaving it alone",
                     extent.disk_address,
                     reason.label()
-                );
+                ));
                 return Ok(Some(reason));
             }
-            Err(failure) => return self.report.failed(failure),
+            Err(failure) => return self.report.failed(failure, &self.console),
         };
 
         if self.options.apply {
@@ -56,16 +61,16 @@ impl Runner {
             let result = realloc_extent(extent, &holders, self.fs.as_ref());
             // Check for failure, and move on to the next extent if it failed
             if let Err(failure) = result {
-                return self.report.failed(failure);
+                return self.report.failed(failure, &self.console);
             }
         }
 
         // Rewrites are the progress of an --apply. On a dry run they are
         // detail, for -v: the report at the end sums them up.
         if self.options.apply {
-            println!("{}", describe(extent, &holders, true));
+            self.console.print(describe(extent, &holders, true));
         } else {
-            log::info!("{}", describe(extent, &holders, false));
+            self.console.info(describe(extent, &holders, false));
         }
 
         let report = &mut self.report;
@@ -73,19 +78,19 @@ impl Runner {
         report.freed_bytes += extent.disk_free_bytes();
         report.rewritten.push(extent.disk_address);
 
-        log::info!(
+        self.console.info(format_args!(
             "    extent {:#x}, {} on disk",
             extent.disk_address,
             human(extent.disk_bytes),
-        );
+        ));
         for holder in &holders {
             for r in &holder.holder.refs {
-                log::info!(
+                self.console.info(format_args!(
                     "    {} at offset {} in {}",
                     human(r.num_bytes),
                     r.file_offset,
                     holder.path.display(),
-                );
+                ));
             }
         }
         Ok(None)
@@ -100,21 +105,25 @@ impl Runner {
         if !self.options.apply {
             return report;
         }
-        println!();
-        println!(
+        let console = &self.console;
+        console.print("");
+        console.print(format!(
             "copied {} to free {} from {} extents",
             human(report.copied_bytes),
             human(report.freed_bytes),
             report.rewritten.len(),
-        );
+        ));
         if !report.skipped.is_empty() {
-            println!("{} extents could not be rewritten", report.skipped.len());
+            console.print(format!(
+                "{} extents could not be rewritten",
+                report.skipped.len()
+            ));
         }
         if !report.modified.is_empty() {
-            println!(
+            console.print(format!(
                 "{} files were modified by something else while they were being rewritten",
                 report.modified.len()
-            );
+            ));
         }
         report
     }
@@ -552,7 +561,7 @@ impl Report {
     /// Prints a failure and files it under what it means, leaving the extent
     /// alone, or hands it back as the error that ends the run if nothing after
     /// it could succeed either.
-    fn failed(&mut self, failure: Failure) -> io::Result<Option<LeftAlone>> {
+    fn failed(&mut self, failure: Failure, console: &Console) -> io::Result<Option<LeftAlone>> {
         if let Some(hint) = kernel::fatal(&failure.error) {
             return Err(io::Error::new(
                 failure.error.kind(),
@@ -564,7 +573,11 @@ impl Report {
             ));
         }
         let entry = (failure.path, failure.error.to_string());
-        log::warn!("{}: {}, leaving it alone", entry.0.display(), entry.1);
+        console.warn(format!(
+            "{}: {}, leaving it alone",
+            entry.0.display(),
+            entry.1
+        ));
         if failure.error.kind() == io::ErrorKind::InvalidData {
             self.modified.push(entry);
         } else {
@@ -576,20 +589,26 @@ impl Report {
 
 /// The head line for one extent: the file it is named after, what its rewrite
 /// copies, and what it frees, as done or, on a dry run, as it would be.
-fn describe(extent: &Extent, holders: &[Located], applied: bool) -> String {
-    let shared_with = match holders.len() - 1 {
-        0 => String::new(),
-        1 => " (shared with 1 other file)".to_string(),
-        n => format!(" (shared with {n} other files)"),
-    };
-    let (copied, freed) = (
-        human(extent.live_uncompressed_bytes()),
-        human(extent.disk_free_bytes()),
-    );
-    let path = holders[0].path.display();
-    if applied {
-        format!("{path}: copied {copied}, freed {freed}{shared_with}")
-    } else {
-        format!("{path}: would copy {copied} to free {freed}{shared_with}")
-    }
+/// Formatted only when it is shown.
+fn describe(extent: &Extent, holders: &[Located], applied: bool) -> impl Display {
+    fmt::from_fn(move |f| {
+        let shared_with = match holders.len() - 1 {
+            0 => String::new(),
+            1 => " (shared with 1 other file)".to_string(),
+            n => format!(" (shared with {n} other files)"),
+        };
+        let (copied, freed) = (
+            human(extent.live_uncompressed_bytes()),
+            human(extent.disk_free_bytes()),
+        );
+        let path = holders[0].path.display();
+        if applied {
+            write!(f, "{path}: copied {copied}, freed {freed}{shared_with}")
+        } else {
+            write!(
+                f,
+                "{path}: would copy {copied} to free {freed}{shared_with}"
+            )
+        }
+    })
 }

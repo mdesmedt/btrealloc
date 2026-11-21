@@ -669,7 +669,7 @@ fn only_the_top_level_subvolume_is_accepted() {
     ];
     for (path, expected) in &refused {
         for apply in [false, true] {
-            let error = btrealloc::run(&support::options(path, apply))
+            let error = btrealloc::run(&support::options(path, apply), &support::console())
                 .err()
                 .unwrap_or_else(|| panic!("{} was accepted", path.display()));
             assert!(
@@ -680,15 +680,18 @@ fn only_the_top_level_subvolume_is_accepted() {
         }
     }
 
-    let error = btrealloc::run(&support::options(&readonly.path, true))
+    let error = btrealloc::run(&support::options(&readonly.path, true), &support::console())
         .err()
         .expect("--apply through a read-only mount was accepted");
     assert!(
         error.to_string().contains("read-only"),
         "said {error:?}, which should mention the mount is read-only"
     );
-    let (_, report) = btrealloc::run(&support::options(&readonly.path, false))
-        .expect("a dry run through a read-only mount");
+    let (_, report) = btrealloc::run(
+        &support::options(&readonly.path, false),
+        &support::console(),
+    )
+    .expect("a dry run through a read-only mount");
     assert!(!report.rewritten.is_empty(), "the dry run should find work");
 
     assert_eq!(before, support::checksums(fs.root()), "contents changed");
@@ -812,7 +815,8 @@ fn a_deleted_file_still_open_is_skipped_as_deleted() {
     support::sync_fs();
 
     let options = support::options(fs.root(), true);
-    let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
+    let (stats, report) =
+        btrealloc::run(&options, &support::console()).expect("run over the fixture");
     assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     assert_eq!(stats.left_alone.get(LeftAlone::Deleted).count, 1);
@@ -832,7 +836,8 @@ fn a_nodatacow_file_is_skipped_as_nodatacow() {
     support::punch_hole(&file, MIB, (FILE_MIB - 2) * MIB);
 
     let options = support::options(fs.root(), true);
-    let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
+    let (stats, report) =
+        btrealloc::run(&options, &support::console()).expect("run over the fixture");
     assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
     assert!(
         stats.left_alone.get(LeftAlone::NoDataCow).count > 0,
@@ -1029,7 +1034,7 @@ fn a_full_filesystem_stops_the_run() {
     fs.fill("filler");
 
     let before = support::checksums(fs.root());
-    let error = btrealloc::run(&support::options(fs.root(), true))
+    let error = btrealloc::run(&support::options(fs.root(), true), &support::console())
         .err()
         .expect("the run should stop");
     assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
@@ -1046,7 +1051,7 @@ fn a_full_quota_stops_the_run() {
     fs.limit_quota("1M");
 
     let before = support::checksums(fs.root());
-    let error = btrealloc::run(&support::options(fs.root(), true))
+    let error = btrealloc::run(&support::options(fs.root(), true), &support::console())
         .err()
         .expect("the run should stop");
     assert_eq!(error.kind(), std::io::ErrorKind::QuotaExceeded, "{error}");
@@ -1105,7 +1110,8 @@ fn reclaimable_and_left_alone_add_up_to_unreachable() {
     support::punch_hole(&nocow, MIB, (FILE_MIB - 2) * MIB);
 
     let options = support::options(fs.root(), false);
-    let (stats, dryrun) = btrealloc::run(&options).expect("run over the fixture");
+    let (stats, dryrun) =
+        btrealloc::run(&options, &support::console()).expect("run over the fixture");
     for reason in [LeftAlone::TooLittleToFree, LeftAlone::NoDataCow] {
         assert!(
             stats.left_alone.get(reason).count > 0,
@@ -1928,7 +1934,8 @@ fn assert_held_past_the_end_is_left_alone(fs: &Fs, file: &Path) {
     );
 
     let options = support::options(fs.root(), true);
-    let (stats, report) = btrealloc::run(&options).expect("run over the fixture");
+    let (stats, report) =
+        btrealloc::run(&options, &support::console()).expect("run over the fixture");
     assert!(report.rewritten.is_empty(), "{:x?}", report.rewritten);
     assert!(report.skipped.is_empty(), "{:?}", report.skipped);
     assert_eq!(stats.left_alone.get(LeftAlone::PastEnd).count, 1);

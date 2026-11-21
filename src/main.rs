@@ -1,11 +1,13 @@
+use std::io::{self, IsTerminal};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::rc::Rc;
 
 use clap::Parser;
-use log::{Level, LevelFilter, Metadata, Record};
 
 use btrealloc::Options;
+use btrealloc::console::Console;
 use btrealloc::extent::WorthChecks;
 
 unsafe extern "C" {
@@ -38,42 +40,8 @@ struct Args {
     no_copy_limit: bool,
 }
 
-/// Writes btrealloc's diagnostics to stderr, at the level `-v` asks
-/// for: errors and warnings named as such, more detail as it is. What a run
-/// finds and does is its result, printed to stdout, and does not come through
-/// here.
-struct Logger;
-
-impl log::Log for Logger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= log::max_level() && metadata.target().starts_with("btrealloc")
-    }
-
-    fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) {
-            return;
-        }
-        match record.level() {
-            Level::Error => eprintln!("error: {}", record.args()),
-            Level::Warn => eprintln!("warning: {}", record.args()),
-            Level::Info | Level::Debug | Level::Trace => eprintln!("{}", record.args()),
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-static LOGGER: Logger = Logger;
-
-fn parse_options() -> Options {
+fn parse_options() -> (Options, Console) {
     let args = Args::parse();
-    let level = if args.verbose {
-        LevelFilter::Info
-    } else {
-        LevelFilter::Warn
-    };
-    log::set_logger(&LOGGER).expect("the logger is set once, before anything logs");
-    log::set_max_level(level);
     // Extents are resolved on rayon's global pool, which is one thread per CPU
     // unless told otherwise here.
     if let Some(jobs) = args.jobs {
@@ -82,45 +50,48 @@ fn parse_options() -> Options {
             .build_global()
             .expect("the global thread pool is set up once, before anything uses it");
     }
-    Options {
+    let options = Options {
         apply: args.apply,
         path: args.path,
         worth_checks: WorthChecks {
             min_free: !args.no_min_free,
             copy_ratio: !args.no_copy_limit,
         },
-    }
+    };
+    let interactive = io::stderr().is_terminal();
+    (options, Console::new(args.verbose, interactive))
 }
 
 fn main() -> ExitCode {
-    let options = parse_options();
+    let (options, console) = parse_options();
+    let console = Rc::new(console);
 
     // btrfs tree-search and dedupe ioctls are root-only; without them the tool
     // silently does nothing useful, so refuse to start.
     if unsafe { geteuid() } != 0 {
-        log::error!("btrealloc must be run as root, it relies on btrfs ioctls");
+        console.error("btrealloc must be run as root, it relies on btrfs ioctls");
         return ExitCode::FAILURE;
     }
 
     // Scan, and rewrite along the way if asked to
 
-    println!("Scanning: {}", options.path.display());
-    let (stats, report) = match btrealloc::run(&options) {
+    console.print(format!("Scanning: {}", options.path.display()));
+    let (stats, report) = match btrealloc::run(&options, &console) {
         Ok(result) => result,
         Err(e) => {
-            log::error!("{}: {e}", options.path.display());
+            console.error(format!("{}: {e}", options.path.display()));
             return ExitCode::FAILURE;
         }
     };
     // The totals are counted as the walk finds each extent, before it is
     // rewritten, so after --apply they describe the filesystem as it was.
     if options.apply {
-        stats.report_left_alone();
+        stats.report_left_alone(&console);
     } else {
-        println!();
-        stats.report(&report);
-        println!();
-        println!("Nothing written. Run with --apply to reallocate extents.");
+        console.print("");
+        stats.report(&report, &console);
+        console.print("");
+        console.print("Nothing written. Run with --apply to reallocate extents.");
     }
 
     ExitCode::SUCCESS

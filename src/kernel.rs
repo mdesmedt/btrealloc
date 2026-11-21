@@ -14,26 +14,28 @@ use std::sync::{Arc, Mutex};
 use std::vec;
 
 use linux_raw_sys::btrfs::{
-    BTRFS_EXTENT_DATA_KEY, BTRFS_EXTENT_DATA_REF_KEY, BTRFS_EXTENT_FLAG_DATA,
-    BTRFS_EXTENT_ITEM_KEY, BTRFS_EXTENT_OWNER_REF_KEY, BTRFS_EXTENT_TREE_OBJECTID,
-    BTRFS_FILE_EXTENT_INLINE, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_INFO_FLAG_GENERATION,
-    BTRFS_FS_TREE_OBJECTID, BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET, BTRFS_ROOT_BACKREF_KEY,
-    BTRFS_ROOT_ITEM_KEY, BTRFS_ROOT_TREE_OBJECTID, BTRFS_SHARED_DATA_REF_KEY,
-    btrfs_extent_data_ref, btrfs_extent_item, btrfs_extent_owner_ref, btrfs_file_extent_item,
-    btrfs_ioctl_fs_info_args, btrfs_ioctl_ino_lookup_args, btrfs_ioctl_ino_path_args,
-    btrfs_ioctl_logical_ino_args, btrfs_ioctl_search_header, btrfs_ioctl_search_key,
-    btrfs_root_item, btrfs_root_ref,
+    BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA, BTRFS_EXTENT_DATA_KEY,
+    BTRFS_EXTENT_DATA_REF_KEY, BTRFS_EXTENT_FLAG_DATA, BTRFS_EXTENT_ITEM_KEY,
+    BTRFS_EXTENT_OWNER_REF_KEY, BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FILE_EXTENT_INLINE,
+    BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_INFO_FLAG_GENERATION, BTRFS_FS_TREE_OBJECTID,
+    BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET, BTRFS_ROOT_BACKREF_KEY, BTRFS_ROOT_ITEM_KEY,
+    BTRFS_ROOT_TREE_OBJECTID, BTRFS_SHARED_DATA_REF_KEY, btrfs_extent_data_ref, btrfs_extent_item,
+    btrfs_extent_owner_ref, btrfs_file_extent_item, btrfs_ioctl_fs_info_args,
+    btrfs_ioctl_ino_lookup_args, btrfs_ioctl_ino_path_args, btrfs_ioctl_logical_ino_args,
+    btrfs_ioctl_search_header, btrfs_ioctl_search_key, btrfs_ioctl_space_args,
+    btrfs_ioctl_space_info, btrfs_root_item, btrfs_root_ref,
 };
 use linux_raw_sys::errno::{EDQUOT, EIO, ENOSPC, EROFS, EUCLEAN};
 use linux_raw_sys::general::{
     __IncompleteArrayField, __NR_open_tree, __NR_openat2, AT_EMPTY_PATH, BTRFS_SUPER_MAGIC,
     FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_NOATIME, O_RDONLY, O_RDWR,
     O_TMPFILE, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS,
-    RESOLVE_NO_XDEV, file_dedupe_range, file_dedupe_range_info, open_how, statfs,
+    RESOLVE_NO_XDEV, file_dedupe_range, file_dedupe_range_info, open_how, statfs, winsize,
 };
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
-    BTRFS_IOC_TREE_SEARCH_V2, FIDEDUPERANGE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS,
+    BTRFS_IOC_SPACE_INFO, BTRFS_IOC_TREE_SEARCH_V2, FIDEDUPERANGE, FS_IOC_GETFLAGS,
+    FS_IOC_SETFLAGS, TIOCGWINSZ,
 };
 
 use rayon::prelude::*;
@@ -605,6 +607,47 @@ impl Filesystem {
             ));
         }
         Ok(args.generation)
+    }
+
+    /// Bytes held by data extents, as the block groups account for them: what
+    /// the walk will add up to once it has read every extent. Logical bytes,
+    /// counted once however many copies the profile keeps.
+    ///
+    /// `None` on a filesystem with mixed block groups (`mkfs.btrfs -M`), where
+    /// data and metadata share the same space and the used bytes cannot be told
+    /// apart.
+    pub fn data_used(&self) -> io::Result<Option<u64>> {
+        let mut args: SpaceArgs = unsafe { std::mem::zeroed() };
+        args.args.space_slots = args.spaces.len() as u64;
+        let rc = unsafe {
+            ioctl(
+                self.file.as_raw_fd(),
+                BTRFS_IOC_SPACE_INFO as c_ulong,
+                (&raw mut args).cast(),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let filled = (args.args.total_spaces as usize).min(args.spaces.len());
+        let spaces = &args.spaces[..filled];
+        let (data, metadata) = (
+            BTRFS_BLOCK_GROUP_DATA as u64,
+            BTRFS_BLOCK_GROUP_METADATA as u64,
+        );
+        if spaces
+            .iter()
+            .any(|space| space.flags & data != 0 && space.flags & metadata != 0)
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            spaces
+                .iter()
+                .filter(|space| space.flags & data != 0)
+                .map(|space| space.used_bytes)
+                .sum(),
+        ))
     }
 
     /// The data extents from address `from` on, as many as one search returns,
@@ -1366,6 +1409,29 @@ fn search_extent_refs(
         });
         Ok(())
     })
+}
+
+/// How many columns wide the terminal `file` is on, or `None` if it is not a
+/// terminal or does not say.
+pub fn terminal_width(file: &impl AsRawFd) -> Option<usize> {
+    let mut size: winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        ioctl(
+            file.as_raw_fd(),
+            TIOCGWINSZ as c_ulong,
+            (&raw mut size).cast(),
+        )
+    };
+    (rc == 0 && size.ws_col > 0).then_some(size.ws_col as usize)
+}
+
+/// `struct btrfs_ioctl_space_args` with its trailing `spaces` array given a
+/// fixed size. There is one entry per kind of block group and profile, a few
+/// on any filesystem, more only while a balance converts between profiles.
+#[repr(C)]
+struct SpaceArgs {
+    args: btrfs_ioctl_space_args,
+    spaces: [btrfs_ioctl_space_info; 64],
 }
 
 /// `struct file_dedupe_range` with its single `info` entry inlined, which is
