@@ -171,7 +171,7 @@ impl Progress {
         );
         if fraction > 0.0 {
             let left = elapsed.as_secs_f64() * (1.0 - fraction) / fraction;
-            text += &format!("  {} left", duration(Duration::from_secs_f64(left)));
+            text += &format!("  ~{} left", duration(Duration::from_secs_f64(left)));
         }
         text
     }
