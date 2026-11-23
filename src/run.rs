@@ -131,9 +131,8 @@ impl Runner {
 
 /// A file holding the extent, and the path it was found at.
 struct Located<'a> {
-    /// Relative to the top-level subvolume, which is how it is opened.
-    name: PathBuf,
-    /// Where it is under the mount the tool was pointed at, for naming it.
+    /// Where it is under the mount the tool was pointed at, for naming it. It
+    /// is opened by handle, never by this path.
     path: PathBuf,
     holder: Holder<'a>,
     fs: &'a Filesystem,
@@ -152,13 +151,14 @@ impl Located<'_> {
     /// each of them is what runs into `RLIMIT_NOFILE`.
     fn open(&self) -> Result<File, Failure> {
         self.fs
-            .open_inode(&self.name, self.holder.root, self.holder.inode)
+            .open_inode(self.holder.root, self.holder.inode)
             .map_err(|e| Failure::new(&self.path, e))
     }
 }
 
-/// Finds a path to every file holding the extent, or why one of them means it
-/// cannot be rewritten.
+/// Finds a path to every file holding the extent, to name it by, or why one of
+/// them means it cannot be rewritten. Holders are opened by handle, but one
+/// with no name is still not rewritten: see below.
 fn locate_holders<'a>(
     extent: &'a Extent,
     fs: &'a Filesystem,
@@ -168,18 +168,14 @@ fn locate_holders<'a>(
         let name = match fs.inode_path(holder.root, holder.inode) {
             Ok(Some(name)) => name,
             Ok(None) => return Err(Failure::other(&unnamed(&holder), "no path leads to it")),
-            // Deleted, perhaps still open somewhere. It cannot be opened, and
-            // its extents are freed once it is closed.
+            // Deleted, perhaps still open somewhere. A handle could still open
+            // it, but its extents are freed once it is closed: rewriting it
+            // would only spend copies on data about to go.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Err(LeftAlone::Deleted)),
             Err(e) => return Err(Failure::new(&unnamed(&holder), e)),
         };
         let path = fs.display_path(&name);
-        let holder = Located {
-            name,
-            path,
-            holder,
-            fs,
-        };
+        let holder = Located { path, holder, fs };
         let file = holder.open()?;
         let error = |e| Failure::new(&holder.path, e);
         // A nodatacow file is overwritten in place and cannot be deduped.

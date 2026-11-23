@@ -18,19 +18,21 @@ use linux_raw_sys::btrfs::{
     BTRFS_EXTENT_DATA_REF_KEY, BTRFS_EXTENT_FLAG_DATA, BTRFS_EXTENT_ITEM_KEY,
     BTRFS_EXTENT_OWNER_REF_KEY, BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FILE_EXTENT_INLINE,
     BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_INFO_FLAG_GENERATION, BTRFS_FS_TREE_OBJECTID,
-    BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET, BTRFS_ROOT_BACKREF_KEY, BTRFS_ROOT_ITEM_KEY,
-    BTRFS_ROOT_TREE_OBJECTID, BTRFS_SHARED_DATA_REF_KEY, btrfs_extent_data_ref, btrfs_extent_item,
-    btrfs_extent_owner_ref, btrfs_file_extent_item, btrfs_ioctl_fs_info_args,
-    btrfs_ioctl_ino_lookup_args, btrfs_ioctl_ino_path_args, btrfs_ioctl_logical_ino_args,
-    btrfs_ioctl_search_header, btrfs_ioctl_search_key, btrfs_ioctl_space_args,
-    btrfs_ioctl_space_info, btrfs_root_item, btrfs_root_ref,
+    BTRFS_INODE_ITEM_KEY, BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET, BTRFS_ROOT_BACKREF_KEY,
+    BTRFS_ROOT_ITEM_KEY, BTRFS_ROOT_TREE_OBJECTID, BTRFS_SHARED_DATA_REF_KEY,
+    btrfs_extent_data_ref, btrfs_extent_item, btrfs_extent_owner_ref, btrfs_file_extent_item,
+    btrfs_inode_item, btrfs_ioctl_fs_info_args, btrfs_ioctl_ino_lookup_args,
+    btrfs_ioctl_ino_path_args, btrfs_ioctl_logical_ino_args, btrfs_ioctl_search_header,
+    btrfs_ioctl_search_key, btrfs_ioctl_space_args, btrfs_ioctl_space_info, btrfs_root_item,
+    btrfs_root_ref,
 };
-use linux_raw_sys::errno::{EDQUOT, EIO, ENOSPC, EROFS, EUCLEAN};
+use linux_raw_sys::errno::{EDQUOT, EIO, ENOSPC, EROFS, ESTALE, EUCLEAN};
 use linux_raw_sys::general::{
-    __IncompleteArrayField, __NR_open_tree, __NR_openat2, AT_EMPTY_PATH, BTRFS_SUPER_MAGIC,
-    FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_NOATIME, O_RDONLY, O_RDWR,
-    O_TMPFILE, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS,
-    RESOLVE_NO_XDEV, file_dedupe_range, file_dedupe_range_info, open_how, statfs, winsize,
+    __IncompleteArrayField, __NR_open_by_handle_at, __NR_open_tree, __NR_openat2, AT_EMPTY_PATH,
+    BTRFS_SUPER_MAGIC, FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_NOATIME,
+    O_RDONLY, O_RDWR, O_TMPFILE, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, RESOLVE_BENEATH,
+    RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV, file_dedupe_range, file_dedupe_range_info, open_how,
+    statfs, winsize,
 };
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
@@ -123,6 +125,57 @@ fn open_beneath(dir: c_int, path: &Path, flags: u32) -> io::Result<File> {
             path.as_ptr(),
             &raw mut how,
             size_of::<open_how>(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(rc as c_int) })
+}
+
+/// `FILEID_BTRFS_WITHOUT_PARENT`, from `include/linux/exportfs.h`: a btrfs
+/// file handle naming an inode alone, with nothing about its parent directory.
+const FILEID_BTRFS_WITHOUT_PARENT: c_int = 0x4d;
+
+/// `struct file_handle` holding a [`FILEID_BTRFS_WITHOUT_PARENT`] handle: the
+/// first three fields of btrfs's `struct btrfs_fid`, packed, which are the
+/// inode number, its subvolume's tree id and the inode's generation. This is
+/// exactly what `name_to_handle_at` gives for a file on btrfs.
+#[repr(C)]
+struct FileHandle {
+    handle_bytes: u32,
+    handle_type: c_int,
+    f_handle: [u8; 20],
+}
+
+/// Opens inode `inode` of subvolume `root`, created in `generation`, by file
+/// handle, through `mount`: any descriptor on the filesystem will do, whatever
+/// subvolume it is in. Needs `CAP_DAC_READ_SEARCH`.
+///
+/// btrfs only checks the generation when it is not zero, so the real one has
+/// to be passed for an inode number reused since to be refused, with `ESTALE`.
+fn open_by_handle(
+    mount: c_int,
+    root: u64,
+    inode: u64,
+    generation: u64,
+    flags: u32,
+) -> io::Result<File> {
+    let mut handle = FileHandle {
+        handle_bytes: 20,
+        handle_type: FILEID_BTRFS_WITHOUT_PARENT,
+        f_handle: [0; 20],
+    };
+    handle.f_handle[0..8].copy_from_slice(&inode.to_le_bytes());
+    handle.f_handle[8..16].copy_from_slice(&root.to_le_bytes());
+    // btrfs keeps the generation in 32 bits here, as the inode's i_generation.
+    handle.f_handle[16..20].copy_from_slice(&(generation as u32).to_le_bytes());
+    let rc = unsafe {
+        syscall(
+            __NR_open_by_handle_at as c_long,
+            mount,
+            &raw mut handle,
+            (flags | O_CLOEXEC) as c_int,
         )
     };
     if rc < 0 {
@@ -1139,20 +1192,55 @@ impl Filesystem {
         self.mount.join(path)
     }
 
-    /// Opens the file at `path`, relative to the top-level subvolume, read-only,
-    /// making sure it is still inode `inode` of subvolume `root`. A path is only
-    /// ever a way to reach an inode: one renamed or replaced since it was found
-    /// leads somewhere else.
+    /// Opens inode `inode` of subvolume `root` read-only, by file handle rather
+    /// than by path: a handle names the inode itself, so it reaches a file in
+    /// any subvolume, a read-only snapshot's included, and nothing renamed or
+    /// mounted over on the way can lead it somewhere else.
+    ///
+    /// The handle carries the inode's generation, which btrfs checks: an inode
+    /// number freed and handed to a new file since it was read is refused
+    /// rather than opened. The file opened is still checked to be the inode
+    /// asked for.
     ///
     /// Opened `O_NOATIME`, which root may use on any file: the copy reads every
     /// live byte through it, and without the flag those reads move the file's
     /// atime on any mount without `noatime`.
-    pub fn open_inode(&self, path: &Path, root: u64, inode: u64) -> io::Result<File> {
-        let file = open_beneath(self.file.as_raw_fd(), path, O_RDONLY | O_NOATIME)?;
+    pub fn open_inode(&self, root: u64, inode: u64) -> io::Result<File> {
+        let replaced = || io::Error::other("no longer the file the extent tree names");
+        let generation = self.inode_generation(root, inode)?.ok_or_else(replaced)?;
+        let file = match open_by_handle(
+            self.file.as_raw_fd(),
+            root,
+            inode,
+            generation,
+            O_RDONLY | O_NOATIME,
+        ) {
+            Ok(file) => file,
+            Err(e) if e.raw_os_error() == Some(ESTALE as i32) => return Err(replaced()),
+            Err(e) => return Err(e),
+        };
         if file.metadata()?.ino() != inode || own_root_id(file.as_raw_fd())? != root {
-            return Err(io::Error::other("no longer the file the extent tree names"));
+            return Err(replaced());
         }
         Ok(file)
+    }
+
+    /// The generation inode `inode` of subvolume `root` was created in, from
+    /// its inode item, or `None` if it has none: it was deleted.
+    fn inode_generation(&self, root: u64, inode: u64) -> io::Result<Option<u64>> {
+        const AT: usize = std::mem::offset_of!(btrfs_inode_item, generation);
+        let mut args = self.searchargs();
+        args.key.tree_id = root;
+        args.set_range(
+            (inode, BTRFS_INODE_ITEM_KEY, 0),
+            (inode, BTRFS_INODE_ITEM_KEY, u64::MAX),
+        );
+        let mut found = None;
+        args.search_all(self.file.as_raw_fd(), |_, item| {
+            found = read_struct::<u64>(item, AT);
+            Ok(())
+        })?;
+        Ok(found)
     }
 
     /// An unnamed file in the top-level subvolume's root directory, for holding

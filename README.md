@@ -111,7 +111,7 @@ unreachable:        2.45 GiB
 
 - Extents which are selected to be applied are now processed to attempt to reclaim unreachable space. The process:
   - Look up every file holding the extent again, with the kernel's backreference walk, since earlier rewrites can have changed it
-  - Find each file by its subvolume and inode number, and check the file opened is still that inode
+  - Open each file by its subvolume and inode number, with a file handle (`open_by_handle_at`) rather than a path, and check the file opened is still that inode
   - Iterate over all referenced ranges in the extent, finding "live ranges" of referenced bytes
   - For each live range an anonymous temp file is created with `O_TMPFILE` at the top of the mount and it is copied there
   - For each file which holds the original extent, call `FIDEDUPERANGE` to point its chunks from the old extent into the new extents. This operation is what actually modifies the file. The kernel guarantees that:
