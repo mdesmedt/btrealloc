@@ -18,8 +18,13 @@ use scan::{ScanStats, Scanner};
 
 #[derive(Clone)]
 pub struct Options {
-    /// Where the filesystem's top-level subvolume is mounted.
+    /// Where a subvolume of the filesystem is mounted: the top-level one, or
+    /// with `whole_filesystem` any other.
     pub path: PathBuf,
+    /// Scan the whole filesystem through `path` even though it is a subvolume
+    /// other than the top-level one. Asked for explicitly, because anywhere
+    /// else a subvolume could be taken to mean only that subvolume.
+    pub whole_filesystem: bool,
     pub apply: bool,
     /// Which cost heuristics leave extents alone.
     pub worth_checks: WorthChecks,
@@ -28,10 +33,24 @@ pub struct Options {
 /// Main entry point. Scans the filesystem and performs the reallocation operation.
 pub fn run(options: &Options, console: &Rc<Console>) -> io::Result<(ScanStats, Report)> {
     let fs = Arc::new(Filesystem::open(&options.path)?);
+    if fs.root != kernel::TOP_LEVEL && !options.whole_filesystem {
+        return Err(io::Error::other(format!(
+            "subvolume {}, not the top-level subvolume: pass --whole-filesystem to scan \
+             the whole filesystem through it, every other subvolume and snapshot included",
+            fs.root
+        )));
+    }
     if options.apply && fs.read_only {
         return Err(io::Error::other(
             "mounted read-only: --apply needs the filesystem mounted read-write",
         ));
+    }
+    if options.apply && fs.subvolume_read_only {
+        return Err(io::Error::other(format!(
+            "subvolume {} is read-only: --apply makes its copies in the subvolume it is \
+             pointed at, so it needs a writable one",
+            fs.root
+        )));
     }
     let mut scanner = Scanner::new(&fs, console)?;
     let mut runner = Runner::new(options.clone(), &fs, console);

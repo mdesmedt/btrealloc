@@ -17,10 +17,16 @@ unsafe extern "C" {
 #[derive(Parser)]
 #[command(about = "Reclaim unreachable space on btrfs by rewriting live data into compact extents")]
 struct Args {
-    /// Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`).
-    /// Every subvolume and snapshot on it is scanned from there.
+    /// Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`),
+    /// or with --whole-filesystem where any other subvolume is. Every subvolume and
+    /// snapshot on the filesystem is scanned from there.
     #[arg(value_name = "MOUNT")]
     path: PathBuf,
+    /// Scan the whole filesystem through MOUNT when it is a subvolume other than the top-level one,
+    /// as on a system that only mounts its subvolumes. Every other subvolume and snapshot is scanned,
+    /// and reallocated when --apply is passed.
+    #[arg(long)]
+    whole_filesystem: bool,
     /// Actually perform the extent reallocation operation, writing changes to the filesystem.
     #[arg(long)]
     apply: bool,
@@ -53,6 +59,7 @@ fn parse_options() -> (Options, Console) {
     let options = Options {
         apply: args.apply,
         path: args.path,
+        whole_filesystem: args.whole_filesystem,
         worth_checks: WorthChecks {
             min_free: !args.no_min_free,
             copy_ratio: !args.no_copy_limit,

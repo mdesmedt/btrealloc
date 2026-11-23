@@ -19,7 +19,7 @@ use linux_raw_sys::btrfs::{
     BTRFS_EXTENT_OWNER_REF_KEY, BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FILE_EXTENT_INLINE,
     BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_INFO_FLAG_GENERATION, BTRFS_FS_TREE_OBJECTID,
     BTRFS_INODE_ITEM_KEY, BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET, BTRFS_ROOT_BACKREF_KEY,
-    BTRFS_ROOT_ITEM_KEY, BTRFS_ROOT_TREE_OBJECTID, BTRFS_SHARED_DATA_REF_KEY,
+    BTRFS_ROOT_ITEM_KEY, BTRFS_ROOT_TREE_OBJECTID, BTRFS_SHARED_DATA_REF_KEY, BTRFS_SUBVOL_RDONLY,
     btrfs_extent_data_ref, btrfs_extent_item, btrfs_extent_owner_ref, btrfs_file_extent_item,
     btrfs_inode_item, btrfs_ioctl_fs_info_args, btrfs_ioctl_ino_lookup_args,
     btrfs_ioctl_ino_path_args, btrfs_ioctl_logical_ino_args, btrfs_ioctl_search_header,
@@ -36,8 +36,8 @@ use linux_raw_sys::general::{
 };
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
-    BTRFS_IOC_SPACE_INFO, BTRFS_IOC_TREE_SEARCH_V2, FIDEDUPERANGE, FS_IOC_GETFLAGS,
-    FS_IOC_SETFLAGS, TIOCGWINSZ,
+    BTRFS_IOC_SPACE_INFO, BTRFS_IOC_SUBVOL_GETFLAGS, BTRFS_IOC_TREE_SEARCH_V2, FIDEDUPERANGE,
+    FS_IOC_GETFLAGS, FS_IOC_SETFLAGS, TIOCGWINSZ,
 };
 
 use rayon::prelude::*;
@@ -452,46 +452,41 @@ enum RefOffsets {
     Between(u64, u64),
 }
 
-/// One subvolume, found by path from the top-level one.
-///
-/// Only the path is kept, relative to the top-level subvolume. Its root
-/// directory is opened again wherever it is needed: a descriptor held for
-/// every subvolume is what runs into `RLIMIT_NOFILE` on a filesystem with
-/// thousands of snapshots.
+/// One subvolume, by its path from the top-level one, as `btrfs subvolume
+/// list` gives it. The path is only for naming the files in it: they are
+/// opened by handle, which needs no path.
 struct Subvolume {
     path: PathBuf,
 }
 
-/// Opens `path`, below the top-level subvolume's root directory `top`, as the
-/// root directory of subvolume `root`, or `None` if there is nothing there, or
-/// it is something else: a directory, or another subvolume.
-fn open_subvolume(top: c_int, path: &Path, root: u64) -> io::Result<Option<File>> {
-    let file = match open_beneath(top, path, O_RDONLY | O_DIRECTORY) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if own_root_id(file.as_raw_fd())? != root
-        || file.metadata()?.ino() != BTRFS_FIRST_FREE_OBJECTID as u64
-    {
-        return Ok(None);
-    }
-    Ok(Some(file))
-}
+/// What a file outside the subvolume the tool was pointed at is named under,
+/// in front of its path from the top-level subvolume: the name `btrfs
+/// subvolume list -a` gives the top-level subvolume.
+const FS_TREE: &str = "<FS_TREE>";
 
-/// A handle on the whole filesystem, through the root directory of its
-/// top-level subvolume. From there every other subvolume, and every inode in
-/// it, can be reached.
+/// The tree id of the top-level subvolume, the one `subvolid=5` mounts.
+pub const TOP_LEVEL: u64 = BTRFS_FS_TREE_OBJECTID as u64;
+
+/// A handle on the whole filesystem, through the root directory of one of its
+/// subvolumes: the top-level one, or any other. Every subvolume, and every
+/// inode in it, is reached from there by file handle, wherever it is.
 ///
 /// Everything is reached through a private copy of the mount, not through the
-/// mount itself: see [`clone_mount`]. Paths are only ever relative to its root.
+/// mount itself: see [`clone_mount`].
 pub struct Filesystem {
-    /// The top-level subvolume's root directory, in the private mount.
+    /// The root directory of the subvolume opened through, in the private
+    /// mount. The temporary copies are made in it.
     file: File,
     /// The private mount, kept for as long as this is.
     _private: OwnedFd,
-    /// Where the top-level subvolume is mounted, which paths are shown under.
+    /// Where the subvolume opened through is mounted, which the paths of files
+    /// in it are shown under.
     pub mount: PathBuf,
+    /// The tree id of the subvolume opened through: 5 for the top-level one.
+    pub root: u64,
+    /// Whether that subvolume is read-only, as a snapshot made with `-r` is,
+    /// which leaves nowhere to make the copies in.
+    pub subvolume_read_only: bool,
     /// The sector size: a file extent reference covers whole sectors, never
     /// part of one. It is the page size at mkfs time, typically 4096 bytes.
     pub sectorsize: u64,
@@ -539,9 +534,10 @@ impl Drop for SearchArgsGuard<'_> {
 }
 
 impl Filesystem {
-    /// Opens the filesystem through `path`, which has to be where its
-    /// top-level subvolume (subvolid=5) is mounted: only from there can every
-    /// subvolume be reached. Anything else is refused with what to do instead.
+    /// Opens the filesystem through `path`, which has to be the root directory
+    /// of one of its subvolumes: where the top-level subvolume (subvolid=5) is
+    /// mounted, or where any other is. Anything else is refused with what to
+    /// do instead.
     pub fn open(path: &Path) -> io::Result<Filesystem> {
         let file = File::open(path)?;
 
@@ -565,23 +561,20 @@ impl Filesystem {
         let meta = file.metadata()?;
         if !meta.is_dir() {
             return Err(io::Error::other(
-                "not a directory: pass the mount point of the filesystem's top-level \
-                 subvolume, mounted with -o subvolid=5",
+                "not a directory: pass the mount point of a subvolume, the top-level \
+                 one (-o subvolid=5) or with --whole-filesystem any other",
             ));
         }
         let root = own_root_id(file.as_raw_fd())?;
-        if root != BTRFS_FS_TREE_OBJECTID as u64 {
+        if meta.ino() != BTRFS_FIRST_FREE_OBJECTID as u64 {
             return Err(io::Error::other(format!(
-                "in subvolume {root}, not the top-level subvolume: mount the filesystem \
-                 with -o subvolid=5 and pass that mount point"
+                "a directory inside subvolume {root}, not its root: pass the mount point \
+                 of a subvolume, the top-level one (-o subvolid=5) or with \
+                 --whole-filesystem any other",
             )));
         }
-        if meta.ino() != BTRFS_FIRST_FREE_OBJECTID as u64 {
-            return Err(io::Error::other(
-                "a directory inside the top-level subvolume, not its root: pass the \
-                 mount point itself",
-            ));
-        }
+        let subvolume_read_only =
+            subvolume_flags(file.as_raw_fd())? & BTRFS_SUBVOL_RDONLY as u64 != 0;
 
         let private = clone_mount(file.as_raw_fd()).map_err(|e| {
             io::Error::new(
@@ -595,6 +588,8 @@ impl Filesystem {
             file,
             _private: private,
             mount: path.to_path_buf(),
+            root,
+            subvolume_read_only,
             sectorsize,
             read_only: buf.f_flags as u64 & ST_RDONLY != 0,
             searchargs: Mutex::new(Vec::new()),
@@ -1076,8 +1071,7 @@ impl Filesystem {
     /// Finds the path to subvolume `root` the way `btrfs subvolume list` does:
     /// its root backreference names the subvolume it sits in, the directory
     /// there, and its own name in that directory. `None` for a subvolume with
-    /// no backreference, which is one being deleted, or one whose path leads
-    /// somewhere else.
+    /// no backreference, which is one being deleted.
     fn find_subvolume(&self, root: u64) -> io::Result<Option<Subvolume>> {
         let path = if root == BTRFS_FS_TREE_OBJECTID as u64 {
             PathBuf::new()
@@ -1091,16 +1085,7 @@ impl Filesystem {
             let dir = ino_lookup(self.file.as_raw_fd(), parent, dirid)?;
             parent_subvolume.path.join(dir).join(name)
         };
-
-        if self.open_subvolume(&path, root)?.is_none() {
-            return Ok(None);
-        }
         Ok(Some(Subvolume { path }))
-    }
-
-    /// See [`open_subvolume`].
-    fn open_subvolume(&self, path: &Path, root: u64) -> io::Result<Option<File>> {
-        open_subvolume(self.file.as_raw_fd(), path, root)
     }
 
     /// Where subvolume `root` sits: the subvolume holding it, the directory
@@ -1144,7 +1129,12 @@ impl Filesystem {
         let Some(subvolume) = self.subvolume(root)? else {
             return Ok(None);
         };
-        let Some(subvolume_root) = self.open_subvolume(&subvolume.path, root)? else {
+        let Some(subvolume_root) = self.open_handle(
+            root,
+            BTRFS_FIRST_FREE_OBJECTID as u64,
+            O_RDONLY | O_DIRECTORY,
+        )?
+        else {
             return Ok(None);
         };
         let mut buf = Box::new(InoPathBuf {
@@ -1186,10 +1176,17 @@ impl Filesystem {
         Ok(Some(subvolume.path.join(cstr_bytes(name))))
     }
 
-    /// Where `path`, relative to the top-level subvolume, is to be found
-    /// through the mount the filesystem was opened through, for naming it.
+    /// What to call the file at `path`, relative to the top-level subvolume:
+    /// where it is under the mount the filesystem was opened through, if it is
+    /// in that subvolume or one below it, or else its path from the top-level
+    /// subvolume, under [`FS_TREE`].
     pub fn display_path(&self, path: &Path) -> PathBuf {
-        self.mount.join(path)
+        if let Ok(Some(here)) = self.subvolume(self.root)
+            && let Ok(rest) = path.strip_prefix(&here.path)
+        {
+            return self.mount.join(rest);
+        }
+        Path::new(FS_TREE).join(path)
     }
 
     /// Opens inode `inode` of subvolume `root` read-only, by file handle rather
@@ -1206,23 +1203,26 @@ impl Filesystem {
     /// live byte through it, and without the flag those reads move the file's
     /// atime on any mount without `noatime`.
     pub fn open_inode(&self, root: u64, inode: u64) -> io::Result<File> {
-        let replaced = || io::Error::other("no longer the file the extent tree names");
-        let generation = self.inode_generation(root, inode)?.ok_or_else(replaced)?;
-        let file = match open_by_handle(
-            self.file.as_raw_fd(),
-            root,
-            inode,
-            generation,
-            O_RDONLY | O_NOATIME,
-        ) {
+        self.open_handle(root, inode, O_RDONLY | O_NOATIME)?
+            .ok_or_else(|| io::Error::other("no longer the file the extent tree names"))
+    }
+
+    /// Opens inode `inode` of subvolume `root` by handle with `flags`, or
+    /// `None` if there is no such inode any more: it was deleted, or its
+    /// number now belongs to another.
+    fn open_handle(&self, root: u64, inode: u64, flags: u32) -> io::Result<Option<File>> {
+        let Some(generation) = self.inode_generation(root, inode)? else {
+            return Ok(None);
+        };
+        let file = match open_by_handle(self.file.as_raw_fd(), root, inode, generation, flags) {
             Ok(file) => file,
-            Err(e) if e.raw_os_error() == Some(ESTALE as i32) => return Err(replaced()),
+            Err(e) if e.raw_os_error() == Some(ESTALE as i32) => return Ok(None),
             Err(e) => return Err(e),
         };
         if file.metadata()?.ino() != inode || own_root_id(file.as_raw_fd())? != root {
-            return Err(replaced());
+            return Ok(None);
         }
-        Ok(file)
+        Ok(Some(file))
     }
 
     /// The generation inode `inode` of subvolume `root` was created in, from
@@ -1243,8 +1243,8 @@ impl Filesystem {
         Ok(found)
     }
 
-    /// An unnamed file in the top-level subvolume's root directory, for holding
-    /// a copy while files are rewritten. It has no link from the moment it
+    /// An unnamed file in the root directory of the subvolume opened through,
+    /// for holding a copy while files are rewritten. It has no link from the moment it
     /// exists, so the kernel frees it when the last descriptor closes however
     /// the process ends, a kill included: there is no window in which a crash
     /// could strand it.
@@ -1420,6 +1420,23 @@ fn ino_lookup_args(
         return Err(io::Error::last_os_error());
     }
     Ok(args)
+}
+
+/// The flags of the subvolume whose root directory `fd` is, which say whether
+/// it is read-only.
+fn subvolume_flags(fd: c_int) -> io::Result<u64> {
+    let mut flags: u64 = 0;
+    let rc = unsafe {
+        ioctl(
+            fd,
+            BTRFS_IOC_SUBVOL_GETFLAGS as c_ulong,
+            (&raw mut flags).cast(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags)
 }
 
 /// The subvolume tree id `fd` itself belongs to.

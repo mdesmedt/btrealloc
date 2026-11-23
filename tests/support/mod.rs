@@ -303,6 +303,19 @@ impl Fs {
         Mount { path }
     }
 
+    /// Runs `f` with the top-level subvolume unmounted, as on a system that only
+    /// mounts its subvolumes, and mounts it again afterwards. Something has to
+    /// keep the filesystem mounted meanwhile, such as a
+    /// [`Fs::mount_subvolume`]: the loop device goes with its last mount.
+    pub fn without_top_level<T>(&self, f: impl FnOnce() -> T) -> T {
+        let device = self.device();
+        let mnt = self.mnt.to_str().unwrap();
+        must("umount", &[mnt]);
+        let result = f();
+        must("mount", &["-o", "subvolid=5", &device, mnt]);
+        result
+    }
+
     /// The top-level subvolume mounted again, read-only.
     pub fn mount_readonly(&self) -> Mount {
         let path = self.base.join("readonly");
@@ -842,6 +855,7 @@ pub fn console() -> Rc<Console> {
 pub fn options(path: &Path, apply: bool) -> Options {
     Options {
         path: path.to_path_buf(),
+        whole_filesystem: false,
         apply,
         worth_checks: WorthChecks::default(),
     }

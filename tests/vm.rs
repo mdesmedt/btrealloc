@@ -642,57 +642,100 @@ fn extents_rewritten_mid_walk_are_not_revisited() {
     );
 }
 
-/// Anything other than where the top-level subvolume is mounted is refused
-/// before anything is read, with what to do instead. So is rewriting through a
-/// read-only mount of it, though reading through one is fine.
+/// The options for a run through `path`, with or without --whole-filesystem.
+fn options_through(path: &Path, whole_filesystem: bool, apply: bool) -> btrealloc::Options {
+    btrealloc::Options {
+        whole_filesystem,
+        ..support::options(path, apply)
+    }
+}
+
+/// Only the root of a subvolume is accepted: the top-level one as it is, any
+/// other with --whole-filesystem, which says the whole filesystem is meant and
+/// not only that subvolume. Anything else is refused before anything is read,
+/// with what to do instead. So is rewriting through a read-only mount, or from
+/// a read-only subvolume, which leaves nowhere to make the copies, though
+/// reading through either is fine.
 #[test]
-fn only_the_top_level_subvolume_is_accepted() {
+fn only_a_subvolume_root_is_accepted() {
     let fs = Fs::new();
     fs.dir("data");
     let file = fs.path("data/bookend");
     support::bookend(&file, FILE_MIB);
     fs.subvolume("live");
     let inside = fs.dir("live/dir");
+    fs.snapshot("live", "snapshot");
     let mounted = fs.mount_subvolume("live");
+    let mounted_snapshot = fs.mount_subvolume("snapshot");
     let readonly = fs.mount_readonly();
 
     let before = support::checksums(fs.root());
     let extents = support::physical_extents(&file);
 
-    let refused: [(PathBuf, &str); 6] = [
-        (fs.path("data"), "inside the top-level subvolume"),
-        (file.clone(), "not a directory"),
-        (fs.path("live"), "subvolid=5"),
-        (inside, "subvolid=5"),
-        (mounted.path.clone(), "subvolid=5"),
-        (fs.tmpfs(), "not on a btrfs filesystem"),
+    let refused: [(PathBuf, bool, &str); 10] = [
+        (fs.path("data"), false, "not its root"),
+        (fs.path("data"), true, "not its root"),
+        (file.clone(), false, "not a directory"),
+        (file.clone(), true, "not a directory"),
+        (fs.path("live"), false, "--whole-filesystem"),
+        (inside.clone(), false, "not its root"),
+        (inside, true, "not its root"),
+        (mounted.path.clone(), false, "--whole-filesystem"),
+        (fs.tmpfs(), false, "not on a btrfs filesystem"),
+        (fs.tmpfs(), true, "not on a btrfs filesystem"),
     ];
-    for (path, expected) in &refused {
+    for (path, whole_filesystem, expected) in &refused {
         for apply in [false, true] {
-            let error = btrealloc::run(&support::options(path, apply), &support::console())
+            let options = options_through(path, *whole_filesystem, apply);
+            let error = btrealloc::run(&options, &support::console())
                 .err()
                 .unwrap_or_else(|| panic!("{} was accepted", path.display()));
             assert!(
                 error.to_string().contains(expected),
-                "{}: said {error:?}, which should mention {expected:?}",
+                "{} (--whole-filesystem {whole_filesystem}): said {error:?}, which should \
+                 mention {expected:?}",
                 path.display()
             );
         }
     }
 
-    let error = btrealloc::run(&support::options(&readonly.path, true), &support::console())
+    let read_only: [(&Path, bool, &str); 2] = [
+        (&readonly.path, false, "mounted read-only"),
+        (&mounted_snapshot.path, true, "is read-only"),
+    ];
+    for (path, whole_filesystem, expected) in read_only {
+        let error = btrealloc::run(
+            &options_through(path, whole_filesystem, true),
+            &support::console(),
+        )
         .err()
-        .expect("--apply through a read-only mount was accepted");
-    assert!(
-        error.to_string().contains("read-only"),
-        "said {error:?}, which should mention the mount is read-only"
-    );
-    let (_, report) = btrealloc::run(
-        &support::options(&readonly.path, false),
-        &support::console(),
-    )
-    .expect("a dry run through a read-only mount");
-    assert!(!report.rewritten.is_empty(), "the dry run should find work");
+        .unwrap_or_else(|| panic!("--apply through {} was accepted", path.display()));
+        assert!(
+            error.to_string().contains(expected),
+            "{}: said {error:?}, which should mention {expected:?}",
+            path.display()
+        );
+    }
+
+    // A dry run through each finds the bookend, which is in the top-level
+    // subvolume: outside every one of them but the first.
+    for (path, whole_filesystem) in [
+        (&readonly.path, false),
+        (&mounted.path, true),
+        (&mounted_snapshot.path, true),
+        (&fs.path("live"), true),
+    ] {
+        let (_, report) = btrealloc::run(
+            &options_through(path, whole_filesystem, false),
+            &support::console(),
+        )
+        .unwrap_or_else(|e| panic!("a dry run through {}: {e}", path.display()));
+        assert!(
+            !report.rewritten.is_empty(),
+            "the dry run through {} should find work",
+            path.display()
+        );
+    }
 
     assert_eq!(before, support::checksums(fs.root()), "contents changed");
     assert_eq!(
@@ -700,6 +743,72 @@ fn only_the_top_level_subvolume_is_accepted() {
         support::physical_extents(&file),
         "the file's extents moved"
     );
+}
+
+/// On a system that only mounts its subvolumes, --whole-filesystem through one
+/// of them reclaims the whole filesystem: the mounted subvolume's file, the
+/// read-only snapshot sharing its extent, which no path through that mount
+/// reaches, and a file in another subvolume altogether. The top-level
+/// subvolume is not mounted anywhere while it runs.
+#[test]
+fn the_whole_filesystem_is_reclaimed_through_a_subvolume_mount() {
+    let fs = Fs::with_options(2048, "noatime");
+    fs.subvolume("live");
+    let live = fs.path("live/file");
+    wasteful_file(&live);
+    fs.snapshot("live", "snapshot");
+    let snapshotted = fs.path("snapshot/file");
+    fs.subvolume("other");
+    let other = fs.path("other/file");
+    wasteful_file(&other);
+
+    let shared = support::single_extent(&live);
+    assert_eq!(
+        support::single_extent(&snapshotted),
+        shared,
+        "fixture: the snapshot should hold the live file's extent"
+    );
+    let alone = support::single_extent(&other);
+    let before = support::checksums(fs.root());
+
+    let mounted = fs.mount_subvolume("live");
+    let report = fs.without_top_level(|| {
+        assert!(
+            !snapshotted.exists(),
+            "fixture: the snapshot should be out of reach by path"
+        );
+        let options = options_through(&mounted.path, true, true);
+        let (_, report) =
+            btrealloc::run(&options, &support::console()).expect("run through the subvolume mount");
+        support::sync_fs();
+        report
+    });
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    for extent in [shared, alone] {
+        assert!(
+            report.rewritten.contains(&extent),
+            "extent {extent:#x} was not rewritten"
+        );
+    }
+
+    for (file, extent) in [(&live, shared), (&snapshotted, shared), (&other, alone)] {
+        assert!(
+            !support::physical_extents(file).contains(&extent),
+            "{} still references its old extent",
+            file.display()
+        );
+    }
+    assert_eq!(
+        support::physical_extents(&live),
+        support::physical_extents(&snapshotted),
+        "the snapshot no longer shares one copy with the live file"
+    );
+    assert!(
+        fs.is_readonly("snapshot"),
+        "the snapshot is no longer read-only"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 
 /// A read-only mount over part of the filesystem, as NixOS puts over
