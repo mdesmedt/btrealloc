@@ -744,23 +744,33 @@ impl Filesystem {
     /// the rest, and wherever the extent tree's account does not add up, the
     /// kernel's backreference walk follows the shared blocks to every tree
     /// reaching the extent.
+    ///
+    /// The backreference walk is skipped too for an extent the references the
+    /// extent tree names already cover whole. Every other holder can only cover
+    /// more of it, so it is fully used whoever they are, and with nothing to
+    /// free nothing acts on it. Its references are then not every one there is,
+    /// only enough to show it is fully used. On a filesystem with snapshots,
+    /// that is most extents, each spared a backreference walk.
     fn resolve(
         &self,
         disk_address: u64,
         item: &ExtentItem,
         backrefs: Backrefs,
-    ) -> io::Result<Vec<ExtentRef>> {
+    ) -> io::Result<Extent> {
         if let Backrefs::Files(data_refs) = backrefs
             && let Ok(refs) = self.collect(disk_address, item.disk_bytes, &data_refs)
-            && !self.may_be_shared(&refs)?
         {
-            return Ok(refs);
+            let extent = Extent::from_refs(refs);
+            if extent.disk_free_bytes() == 0 || !self.may_be_shared(&extent.refs)? {
+                return Ok(extent);
+            }
         }
-        self.collect(
+        let refs = self.collect(
             disk_address,
             item.disk_bytes,
             &self.logical_ino(disk_address)?,
-        )
+        )?;
+        Ok(Extent::from_refs(refs))
     }
 
     /// The extent at `extent.disk_address` again, resolved afresh by the
@@ -1216,6 +1226,7 @@ pub fn fatal(error: &io::Error) -> Option<&'static str> {
 /// One extent, as [`ExtentWalk`] resolves it.
 pub enum Resolved {
     /// The extent, with every reference to it, wherever on the filesystem.
+    /// Unless it is fully used: then perhaps only those that show it is.
     Extent(Extent),
     /// Nothing safe can be said about the extent at this address, for the
     /// reason `error` gives: it changed while it was being read, or looking it
@@ -1227,7 +1238,8 @@ pub enum Resolved {
 /// extent tree a batch at a time as they are asked for.
 ///
 /// Each extent is met once, however many files and snapshots reference it,
-/// and is handed over with every one of those references. Nothing is kept
+/// and is handed over with every one of those references, or for a fully used
+/// extent perhaps only enough of them to show it is. Nothing is kept
 /// about it afterwards. An extent can be dealt with, rewritten even, before
 /// the next batch is read.
 ///
@@ -1276,7 +1288,7 @@ impl Iterator for ExtentWalk {
                     let resolved: Vec<Resolved> = batch
                         .into_par_iter()
                         .map(|u| match fs.resolve(u.disk_address, &u.item, u.backrefs) {
-                            Ok(refs) => Resolved::Extent(Extent::from_refs(refs)),
+                            Ok(extent) => Resolved::Extent(extent),
                             Err(error) => Resolved::LeftAlone {
                                 disk_address: u.disk_address,
                                 error,

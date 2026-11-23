@@ -43,7 +43,9 @@ pub struct Extent {
     pub disk_bytes: u64,
     /// Bytes after decompression
     pub uncompressed_bytes: u64,
-    /// Every reference to this extent, anywhere on the filesystem.
+    /// Every reference to this extent, anywhere on the filesystem. For a fully
+    /// used extent from the walk, perhaps only enough of them to show it is:
+    /// see [`ExtentWalk`](crate::kernel::ExtentWalk).
     pub refs: Vec<ExtentRef>,
     /// The live (actively referenced) ranges of this extent, merged, in order.
     /// Worked out once, here, from `refs`: nothing discovers a reference to an
