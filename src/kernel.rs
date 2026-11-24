@@ -11,7 +11,6 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{Arc, Mutex};
-use std::vec;
 
 use linux_raw_sys::btrfs::{
     BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_METADATA, BTRFS_EXTENT_DATA_KEY,
@@ -30,17 +29,15 @@ use linux_raw_sys::errno::{EDQUOT, EIO, ENOSPC, EROFS, ESTALE, EUCLEAN};
 use linux_raw_sys::general::{
     __IncompleteArrayField, __NR_open_by_handle_at, __NR_open_tree, __NR_openat2, AT_EMPTY_PATH,
     BTRFS_SUPER_MAGIC, FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_NOATIME,
-    O_RDONLY, O_RDWR, O_TMPFILE, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, RESOLVE_BENEATH,
-    RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV, file_dedupe_range, file_dedupe_range_info, open_how,
-    statfs, winsize,
+    O_NOFOLLOW, O_PATH, O_RDONLY, O_RDWR, O_TMPFILE, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE,
+    RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV, file_dedupe_range,
+    file_dedupe_range_info, open_how, statfs, winsize,
 };
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
     BTRFS_IOC_SPACE_INFO, BTRFS_IOC_SUBVOL_GETFLAGS, BTRFS_IOC_TREE_SEARCH_V2, FIDEDUPERANGE,
     FS_IOC_GETFLAGS, FS_IOC_SETFLAGS, TIOCGWINSZ,
 };
-
-use rayon::prelude::*;
 
 use crate::extent::{Extent, ExtentRef};
 
@@ -425,12 +422,18 @@ impl Tally {
     }
 }
 
-/// A data extent as a batch reads it from the extent tree, before it is
-/// resolved to the file extent items pointing into it.
-struct Unresolved {
+/// A data extent as it is read from the extent tree, before it is resolved to
+/// the file extent items pointing into it: see [`Filesystem::resolve`].
+pub struct Unresolved {
     disk_address: u64,
     item: ExtentItem,
     backrefs: Backrefs,
+}
+
+impl Unresolved {
+    pub fn disk_address(&self) -> u64 {
+        self.disk_address
+    }
 }
 
 /// `count` file extent items of `inode` in subvolume `root` point into the
@@ -467,23 +470,35 @@ const FS_TREE: &str = "<FS_TREE>";
 /// The tree id of the top-level subvolume, the one `subvolid=5` mounts.
 pub const TOP_LEVEL: u64 = BTRFS_FS_TREE_OBJECTID as u64;
 
-/// A handle on the whole filesystem, through the root directory of one of its
-/// subvolumes: the top-level one, or any other. Every subvolume, and every
-/// inode in it, is reached from there by file handle, wherever it is.
+/// A handle on the whole filesystem, through a directory on it: the root of
+/// one of its subvolumes, or any directory inside one. Every subvolume, and
+/// every inode in it, is reached from there by file handle, wherever it is.
 ///
 /// Everything is reached through a private copy of the mount, not through the
 /// mount itself: see [`clone_mount`].
 pub struct Filesystem {
-    /// The root directory of the subvolume opened through, in the private
-    /// mount. The temporary copies are made in it.
-    file: File,
+    /// The directory the filesystem was opened through, in the private mount.
+    dir: File,
+    /// The root directory of the subvolume that directory is in, opened by
+    /// handle through the private mount. The temporary copies are made in it.
+    subvolume_root: File,
     /// The private mount, kept for as long as this is.
     _private: OwnedFd,
-    /// Where the subvolume opened through is mounted, which the paths of files
-    /// in it are shown under.
-    pub mount: PathBuf,
-    /// The tree id of the subvolume opened through: 5 for the top-level one.
+    /// The path of that directory, which the paths of files below it are
+    /// shown under.
+    dir_path: PathBuf,
+    /// The same directory's path from the root of its subvolume.
+    within: PathBuf,
+    /// The device that directory is on, as `stat` gives it: btrfs gives every
+    /// subvolume a device of its own, so everything on the same one is in the
+    /// same subvolume.
+    pub device: u64,
+    /// The tree id of the subvolume that directory is in: 5 for the top-level
+    /// one.
     pub root: u64,
+    /// Whether that directory is its subvolume's root, as where a subvolume is
+    /// mounted is.
+    pub at_subvolume_root: bool,
     /// Whether that subvolume is read-only, as a snapshot made with `-r` is,
     /// which leaves nowhere to make the copies in.
     pub subvolume_read_only: bool,
@@ -534,10 +549,9 @@ impl Drop for SearchArgsGuard<'_> {
 }
 
 impl Filesystem {
-    /// Opens the filesystem through `path`, which has to be the root directory
-    /// of one of its subvolumes: where the top-level subvolume (subvolid=5) is
-    /// mounted, or where any other is. Anything else is refused with what to
-    /// do instead.
+    /// Opens the filesystem through the directory `path`, any directory on it:
+    /// the root of a subvolume, where one is mounted, or one inside it. Every
+    /// subvolume is reached from there all the same. Anything else is refused.
     pub fn open(path: &Path) -> io::Result<Filesystem> {
         let file = File::open(path)?;
 
@@ -560,21 +574,15 @@ impl Filesystem {
 
         let meta = file.metadata()?;
         if !meta.is_dir() {
-            return Err(io::Error::other(
-                "not a directory: pass the mount point of a subvolume, the top-level \
-                 one (-o subvolid=5) or with --whole-filesystem any other",
-            ));
+            return Err(io::Error::other("not a directory"));
         }
         let root = own_root_id(file.as_raw_fd())?;
-        if meta.ino() != BTRFS_FIRST_FREE_OBJECTID as u64 {
-            return Err(io::Error::other(format!(
-                "a directory inside subvolume {root}, not its root: pass the mount point \
-                 of a subvolume, the top-level one (-o subvolid=5) or with \
-                 --whole-filesystem any other",
-            )));
-        }
-        let subvolume_read_only =
-            subvolume_flags(file.as_raw_fd())? & BTRFS_SUBVOL_RDONLY as u64 != 0;
+        let at_subvolume_root = meta.ino() == BTRFS_FIRST_FREE_OBJECTID as u64;
+        let within = if at_subvolume_root {
+            PathBuf::new()
+        } else {
+            ino_lookup(file.as_raw_fd(), root, meta.ino())?
+        };
 
         let private = clone_mount(file.as_raw_fd()).map_err(|e| {
             io::Error::new(
@@ -582,19 +590,87 @@ impl Filesystem {
                 format!("making a private mount to work through: {e}"),
             )
         })?;
-        let file = open_beneath(private.as_raw_fd(), Path::new(""), O_RDONLY | O_DIRECTORY)?;
+        let dir = open_beneath(private.as_raw_fd(), Path::new(""), O_RDONLY | O_DIRECTORY)?;
 
-        Ok(Filesystem {
-            file,
+        // Opened properly once `fs` can open it by handle, just below.
+        let placeholder = dir.try_clone()?;
+        let mut fs = Filesystem {
+            dir,
+            subvolume_root: placeholder,
             _private: private,
-            mount: path.to_path_buf(),
+            dir_path: path.to_path_buf(),
+            within,
+            device: meta.dev(),
             root,
-            subvolume_read_only,
+            at_subvolume_root,
+            subvolume_read_only: false,
             sectorsize,
             read_only: buf.f_flags as u64 & ST_RDONLY != 0,
             searchargs: Mutex::new(Vec::new()),
             subvolumes: Mutex::new(HashMap::new()),
             last_snapshots: Mutex::new(HashMap::new()),
+        };
+        // The subvolume's root directory, which `path` need not be, reached by
+        // handle through the private mount whether or not that mount shows it.
+        fs.subvolume_root = fs
+            .open_handle(
+                root,
+                BTRFS_FIRST_FREE_OBJECTID as u64,
+                O_RDONLY | O_DIRECTORY,
+            )?
+            .ok_or_else(|| io::Error::other(format!("subvolume {root} has no root directory")))?;
+        fs.subvolume_read_only =
+            subvolume_flags(fs.subvolume_root.as_raw_fd())? & BTRFS_SUBVOL_RDONLY as u64 != 0;
+        Ok(fs)
+    }
+
+    /// A path to the directory the filesystem was opened through, as the
+    /// private mount shows it: with nothing mounted anywhere below it, so a
+    /// walk from here sees only what is really in the directory, and nothing
+    /// a mount there hides or brings in from elsewhere.
+    pub fn private_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.dir.as_raw_fd()))
+    }
+
+    /// The entry `name` in the directory the filesystem was opened through,
+    /// as the private mount shows it, without following it if it is a
+    /// symbolic link: opened only to look at, with `O_PATH`.
+    pub fn entry(&self, name: &Path) -> io::Result<File> {
+        open_beneath(self.dir.as_raw_fd(), name, O_PATH | O_NOFOLLOW)
+    }
+
+    /// Hands `each` the address of every extent inode `inode` points into, of
+    /// the subvolume the filesystem was opened in, a page at a time: for the
+    /// file extent items from file offset `from` on, as many as one search
+    /// returns. Returns the file offset the next page starts at, or `None`
+    /// after the last page.
+    ///
+    /// An extent comes up once for each item pointing into it, so more than
+    /// once if part of it was overwritten. Holes and inline extents are left
+    /// out.
+    pub fn inode_extent_page(
+        &self,
+        inode: u64,
+        from: u64,
+        mut each: impl FnMut(u64),
+    ) -> io::Result<Option<u64>> {
+        let root = self.root;
+        let mut args = self.searchargs();
+        args.key.tree_id = root;
+        args.set_range(
+            (inode, BTRFS_EXTENT_DATA_KEY, from),
+            (inode, BTRFS_EXTENT_DATA_KEY, u64::MAX),
+        );
+        args.search(self.dir.as_raw_fd())?;
+        let (last, complete) = args.items(|header, item| {
+            if let Some(r) = extent_ref(root, inode, header, item) {
+                each(r.disk_address);
+            }
+            Ok(())
+        })?;
+        Ok(match last {
+            Some(last) if !complete => last.offset.checked_add(1),
+            _ => None,
         })
     }
 
@@ -609,25 +685,24 @@ impl Filesystem {
         }
     }
 
-    /// Every data extent on the filesystem, in address order, each with every
-    /// reference to it, resolved on rayon's global thread pool. See
-    /// [`ExtentWalk`].
-    pub fn walk(self: &Arc<Self>) -> io::Result<ExtentWalk> {
-        // Commit what is pending first, so that everything allocated from here
-        // on, our own copies included, is newer than the generation read next.
-        self.sync()?;
-        Ok(ExtentWalk {
-            fs: Arc::clone(self),
-            next: Some(0),
-            generation: self.generation()?,
-            batch: Vec::new().into_iter(),
-        })
+    /// The data extent at `address`, read from the extent tree on its own
+    /// rather than in a batch with its neighbours, or `None` if there is no
+    /// data extent there any more, or only one allocated after `generation`.
+    pub fn extent_at(&self, address: u64, generation: u64) -> io::Result<Option<Unresolved>> {
+        let Some((item, backrefs)) = self.tally(address)?.finish() else {
+            return Ok(None);
+        };
+        Ok((item.generation <= generation).then_some(Unresolved {
+            disk_address: address,
+            item,
+            backrefs,
+        }))
     }
 
     /// Writes out everything pending and commits the running transaction, as
     /// `syncfs` does on btrfs.
     pub fn sync(&self) -> io::Result<()> {
-        if unsafe { syncfs(self.file.as_raw_fd()) } < 0 {
+        if unsafe { syncfs(self.dir.as_raw_fd()) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -635,12 +710,12 @@ impl Filesystem {
 
     /// The filesystem's current generation: the transaction last committed,
     /// or the one running.
-    fn generation(&self) -> io::Result<u64> {
+    pub fn generation(&self) -> io::Result<u64> {
         let mut args: btrfs_ioctl_fs_info_args = unsafe { std::mem::zeroed() };
         args.flags = BTRFS_FS_INFO_FLAG_GENERATION as u64;
         let rc = unsafe {
             ioctl(
-                self.file.as_raw_fd(),
+                self.dir.as_raw_fd(),
                 BTRFS_IOC_FS_INFO as c_ulong,
                 (&raw mut args).cast(),
             )
@@ -669,7 +744,7 @@ impl Filesystem {
         args.args.space_slots = args.spaces.len() as u64;
         let rc = unsafe {
             ioctl(
-                self.file.as_raw_fd(),
+                self.dir.as_raw_fd(),
                 BTRFS_IOC_SPACE_INFO as c_ulong,
                 (&raw mut args).cast(),
             )
@@ -702,7 +777,7 @@ impl Filesystem {
     /// with the address the next batch starts from, or `None` once the extent
     /// tree is read to its end. Extents allocated after `generation` are left
     /// out.
-    fn extent_batch(
+    pub fn extent_batch(
         &self,
         from: u64,
         generation: u64,
@@ -715,7 +790,7 @@ impl Filesystem {
             (from, BTRFS_EXTENT_ITEM_KEY, 0),
             (u64::MAX, BTRFS_SHARED_DATA_REF_KEY, u64::MAX),
         );
-        args.search(self.file.as_raw_fd())?;
+        args.search(self.dir.as_raw_fd())?;
         let mut tallies: Vec<(u64, Tally)> = Vec::new();
         let (last, complete) = args.items(|header, item| {
             if !is_extent_key(header.type_) {
@@ -773,7 +848,7 @@ impl Filesystem {
             (address, BTRFS_SHARED_DATA_REF_KEY, u64::MAX),
         );
         let mut tally = Tally::default();
-        args.search_all(self.file.as_raw_fd(), |header, item| {
+        args.search_all(self.dir.as_raw_fd(), |header, item| {
             if is_extent_key(header.type_) {
                 tally.add_item(header.type_, header.offset, item);
             }
@@ -799,12 +874,12 @@ impl Filesystem {
     /// free nothing acts on it. Its references are then not every one there is,
     /// only enough to show it is fully used. On a filesystem with snapshots,
     /// that is most extents, each spared a backreference walk.
-    fn resolve(
-        &self,
-        disk_address: u64,
-        item: &ExtentItem,
-        backrefs: Backrefs,
-    ) -> io::Result<Extent> {
+    pub fn resolve(&self, extent: Unresolved) -> io::Result<Extent> {
+        let Unresolved {
+            disk_address,
+            item,
+            backrefs,
+        } = extent;
         if let Backrefs::Files(data_refs) = backrefs
             && let Ok(refs) = self.collect(disk_address, item.disk_bytes, &data_refs)
         {
@@ -904,7 +979,7 @@ impl Filesystem {
 
         search_extent_refs(
             &mut args,
-            self.file.as_raw_fd(),
+            self.dir.as_raw_fd(),
             data_ref.root,
             data_ref.inode,
             |r| {
@@ -936,7 +1011,7 @@ impl Filesystem {
             (inode, BTRFS_EXTENT_DATA_KEY, to),
         );
         let mut found = false;
-        search_extent_refs(&mut args, self.file.as_raw_fd(), root, inode, |r| {
+        search_extent_refs(&mut args, self.dir.as_raw_fd(), root, inode, |r| {
             found |= r.disk_address == disk_address;
         })?;
         Ok(found)
@@ -957,7 +1032,7 @@ impl Filesystem {
             (root, BTRFS_ROOT_ITEM_KEY, u64::MAX),
         );
         let mut found = None;
-        args.search_all(self.file.as_raw_fd(), |_, item| {
+        args.search_all(self.dir.as_raw_fd(), |_, item| {
             found = read_struct::<u64>(item, AT);
             Ok(())
         })?;
@@ -992,7 +1067,7 @@ impl Filesystem {
             };
             let rc = unsafe {
                 ioctl(
-                    self.file.as_raw_fd(),
+                    self.dir.as_raw_fd(),
                     BTRFS_IOC_LOGICAL_INO_V2 as c_ulong,
                     (&raw mut args).cast(),
                 )
@@ -1082,7 +1157,7 @@ impl Filesystem {
             let Some(parent_subvolume) = self.subvolume(parent)? else {
                 return Ok(None);
             };
-            let dir = ino_lookup(self.file.as_raw_fd(), parent, dirid)?;
+            let dir = ino_lookup(self.dir.as_raw_fd(), parent, dirid)?;
             parent_subvolume.path.join(dir).join(name)
         };
         Ok(Some(Subvolume { path }))
@@ -1098,7 +1173,7 @@ impl Filesystem {
             (root, BTRFS_ROOT_BACKREF_KEY, u64::MAX),
         );
         let mut found = None;
-        args.search_all(self.file.as_raw_fd(), |header, item| {
+        args.search_all(self.dir.as_raw_fd(), |header, item| {
             if found.is_none()
                 && let Some(r) = read_struct::<btrfs_root_ref>(item, 0)
                 && let Some(name) = item
@@ -1177,14 +1252,14 @@ impl Filesystem {
     }
 
     /// What to call the file at `path`, relative to the top-level subvolume:
-    /// where it is under the mount the filesystem was opened through, if it is
-    /// in that subvolume or one below it, or else its path from the top-level
-    /// subvolume, under [`FS_TREE`].
+    /// where it is under the directory the filesystem was opened through, if it
+    /// is below it, or else its path from the top-level subvolume, under
+    /// [`FS_TREE`].
     pub fn display_path(&self, path: &Path) -> PathBuf {
         if let Ok(Some(here)) = self.subvolume(self.root)
-            && let Ok(rest) = path.strip_prefix(&here.path)
+            && let Ok(rest) = path.strip_prefix(here.path.join(&self.within))
         {
-            return self.mount.join(rest);
+            return self.dir_path.join(rest);
         }
         Path::new(FS_TREE).join(path)
     }
@@ -1214,7 +1289,7 @@ impl Filesystem {
         let Some(generation) = self.inode_generation(root, inode)? else {
             return Ok(None);
         };
-        let file = match open_by_handle(self.file.as_raw_fd(), root, inode, generation, flags) {
+        let file = match open_by_handle(self.dir.as_raw_fd(), root, inode, generation, flags) {
             Ok(file) => file,
             Err(e) if e.raw_os_error() == Some(ESTALE as i32) => return Ok(None),
             Err(e) => return Err(e),
@@ -1236,18 +1311,18 @@ impl Filesystem {
             (inode, BTRFS_INODE_ITEM_KEY, u64::MAX),
         );
         let mut found = None;
-        args.search_all(self.file.as_raw_fd(), |_, item| {
+        args.search_all(self.dir.as_raw_fd(), |_, item| {
             found = read_struct::<u64>(item, AT);
             Ok(())
         })?;
         Ok(found)
     }
 
-    /// An unnamed file in the root directory of the subvolume opened through,
-    /// for holding a copy while files are rewritten. It has no link from the moment it
-    /// exists, so the kernel frees it when the last descriptor closes however
-    /// the process ends, a kill included: there is no window in which a crash
-    /// could strand it.
+    /// An unnamed file in the root directory of the subvolume the filesystem
+    /// was opened through, for holding a copy while files are rewritten. It has
+    /// no link from the moment it exists, so the kernel frees it when the last
+    /// descriptor closes however the process ends, a kill included: there is
+    /// no window in which a crash could strand it.
     ///
     /// The directory itself is not modified. No directory entry is ever made,
     /// so not even its mtime moves.
@@ -1257,7 +1332,11 @@ impl Filesystem {
     /// checksums. The flag can still be cleared while the file is empty, so it
     /// is.
     pub fn temp_file(&self) -> io::Result<File> {
-        let file = open_beneath(self.file.as_raw_fd(), Path::new(""), O_RDWR | O_TMPFILE)?;
+        let file = open_beneath(
+            self.subvolume_root.as_raw_fd(),
+            Path::new(""),
+            O_RDWR | O_TMPFILE,
+        )?;
         let flags = get_flags(&file)?;
         if flags & FS_NOCOW_FL != 0 {
             set_flags(&file, flags & !FS_NOCOW_FL)?;
@@ -1308,90 +1387,6 @@ pub fn fatal(error: &io::Error) -> Option<&'static str> {
         EROFS => Some("the filesystem went read-only, see the kernel log"),
         EIO | EUCLEAN => Some("the filesystem is failing, see the kernel log and run a scrub"),
         _ => None,
-    }
-}
-
-/// One extent, as [`ExtentWalk`] resolves it.
-pub enum Resolved {
-    /// The extent, with every reference to it, wherever on the filesystem.
-    /// Unless it is fully used: then perhaps only those that show it is.
-    Extent(Extent),
-    /// Nothing safe can be said about the extent at this address, for the
-    /// reason `error` gives: it changed while it was being read, or looking it
-    /// up failed.
-    LeftAlone { disk_address: u64, error: io::Error },
-}
-
-/// Every data extent on the filesystem, in address order, read from the
-/// extent tree a batch at a time as they are asked for.
-///
-/// Each extent is met once, however many files and snapshots reference it,
-/// and is handed over with every one of those references, or for a fully used
-/// extent perhaps only enough of them to show it is. Nothing is kept
-/// about it afterwards. An extent can be dealt with, rewritten even, before
-/// the next batch is read.
-///
-/// A batch's extents are resolved all at once, in parallel, and handed over
-/// only when every one of them is. Nothing is resolved while a batch is being
-/// handed over, so whatever is done with an extent, a rewrite included, never
-/// runs alongside a backreference walk. The kernel can hang when a dedupe and
-/// a backreference walk meet on the same inode or extent, and which inodes a
-/// walk will reach is not known ahead of it. The hang is unfixed on every
-/// kernel so far: see "Hangs with concurrent `LOGICAL_INO` and dedupe/clone"
-/// in <https://github.com/Zygo/bees/blob/master/docs/btrfs-kernel.md>.
-///
-/// The walk runs over a tree that changes under it, our own rewrites
-/// included. It resumes from an address rather than a place in the tree, so
-/// extents freed or allocated behind it make no difference. Extents allocated
-/// ahead of it after it started, our own copies among them, are passed over:
-/// they are fully referenced when they are made, and counting them would count
-/// the same data twice.
-///
-/// An `Err` is a search over the extent tree that failed outright. It ends the
-/// walk.
-pub struct ExtentWalk {
-    fs: Arc<Filesystem>,
-    /// The address the next batch starts from, or `None` once the extent tree
-    /// is read to its end.
-    next: Option<u64>,
-    /// Extents allocated after this generation are passed over.
-    generation: u64,
-    /// The batch resolved last, less the extents already handed over.
-    batch: vec::IntoIter<Resolved>,
-}
-
-impl Iterator for ExtentWalk {
-    type Item = io::Result<Resolved>;
-
-    fn next(&mut self) -> Option<io::Result<Resolved>> {
-        loop {
-            if let Some(resolved) = self.batch.next() {
-                return Some(Ok(resolved));
-            }
-
-            match self.fs.extent_batch(self.next?, self.generation) {
-                Ok((batch, next)) => {
-                    let fs = &self.fs;
-                    // Collected in the order read, which is address order.
-                    let resolved: Vec<Resolved> = batch
-                        .into_par_iter()
-                        .map(|u| match fs.resolve(u.disk_address, &u.item, u.backrefs) {
-                            Ok(extent) => Resolved::Extent(extent),
-                            Err(error) => Resolved::LeftAlone {
-                                disk_address: u.disk_address,
-                                error,
-                            },
-                        })
-                        .collect();
-                    self.batch = resolved.into_iter();
-                    self.next = next;
-                }
-                Err(e) => {
-                    self.next = None;
-                    return Some(Err(e));
-                }
-            }
-        }
     }
 }
 
@@ -1501,30 +1496,39 @@ fn search_extent_refs(
     mut each: impl FnMut(ExtentRef),
 ) -> io::Result<()> {
     args.search_all(fd, |header, item| {
-        // An item too short for `btrfs_file_extent_item` is a shape we do
-        // not understand; skipping it loses one reference, not the file.
-        let Some(fe) = read_struct::<btrfs_file_extent_item>(item, 0) else {
-            return Ok(());
-        };
-        if fe.type_ as u32 == BTRFS_FILE_EXTENT_INLINE as u32 {
-            return Ok(());
+        if let Some(r) = extent_ref(root, inode, header, item) {
+            each(r);
         }
-        if fe.disk_bytenr == 0 {
-            return Ok(()); // hole
-        }
-        each(ExtentRef {
-            root,
-            inode,
-            file_offset: header.offset,
-            disk_address: fe.disk_bytenr,
-            disk_bytes: fe.disk_num_bytes,
-            uncompressed_bytes: fe.ram_bytes,
-            extent_offset: fe.offset,
-            num_bytes: fe.num_bytes,
-            // The search reports the generation of the leaf each item is in.
-            leaf_generation: header.transid,
-        });
         Ok(())
+    })
+}
+
+/// The reference to an extent that file extent item `item` of inode `inode`
+/// in subvolume `root` is, found with `header`. `None` for a hole or an inline
+/// extent, which occupy no extent of their own.
+fn extent_ref(
+    root: u64,
+    inode: u64,
+    header: &btrfs_ioctl_search_header,
+    item: &[u8],
+) -> Option<ExtentRef> {
+    // An item too short for `btrfs_file_extent_item` is a shape we do not
+    // understand; skipping it loses one reference, not the file.
+    let fe = read_struct::<btrfs_file_extent_item>(item, 0)?;
+    if fe.type_ as u32 == BTRFS_FILE_EXTENT_INLINE as u32 || fe.disk_bytenr == 0 {
+        return None;
+    }
+    Some(ExtentRef {
+        root,
+        inode,
+        file_offset: header.offset,
+        disk_address: fe.disk_bytenr,
+        disk_bytes: fe.disk_num_bytes,
+        uncompressed_bytes: fe.ram_bytes,
+        extent_offset: fe.offset,
+        num_bytes: fe.num_bytes,
+        // The search reports the generation of the leaf each item is in.
+        leaf_generation: header.transid,
     })
 }
 

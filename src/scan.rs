@@ -1,11 +1,19 @@
+use std::fs;
 use std::io;
+use std::iter;
+use std::os::unix::fs::{DirEntryExt, MetadataExt};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::vec;
+
+use rayon::prelude::*;
+use roaring::RoaringTreemap;
 
 use crate::console::Console;
 use crate::extent::{Extent, LeftAlone};
 use crate::format::human;
-use crate::kernel::{self, ExtentWalk, Filesystem, Resolved};
+use crate::kernel::{self, Filesystem, Unresolved};
 use crate::run::Report;
 
 /// Extents of one size class, the class being a power of two: everything from
@@ -204,23 +212,109 @@ impl ScanStats {
     }
 }
 
-/// Every data extent on the filesystem, fully resolved, counted into the stats
-/// as it is handed over and then forgotten. See [`ExtentWalk`].
+/// The data extents a run covers, fully resolved, counted into the stats as
+/// they are handed over and then forgotten: every one on the filesystem, or
+/// those of one file or of every file in a directory tree. See `ExtentWalk`.
 pub struct Scanner {
     fs: Arc<Filesystem>,
     console: Rc<Console>,
     walk: ExtentWalk,
+    /// How many bytes of extents there are to scan, for the progress line, if
+    /// that is known up front.
+    pub total: Option<u64>,
     pub stats: ScanStats,
     /// Why the walk ended early, if it did.
     pub error: Option<io::Error>,
 }
 
 impl Scanner {
-    pub fn new(fs: &Arc<Filesystem>, console: &Rc<Console>) -> io::Result<Scanner> {
+    /// Over every data extent on the filesystem, which is shown as `path`.
+    pub fn whole_filesystem(
+        fs: &Arc<Filesystem>,
+        path: &Path,
+        console: &Rc<Console>,
+    ) -> io::Result<Scanner> {
+        console.print(format!("Scanning whole filesystem: {}", path.display()));
+        // The total is only for the progress line, and the run goes on
+        // without it.
+        let total = if console.interactive() {
+            fs.data_used().unwrap_or_else(|e| {
+                console.info(format_args!("no total for the progress line: {e}"));
+                None
+            })
+        } else {
+            None
+        };
         Ok(Scanner {
             fs: Arc::clone(fs),
             console: Rc::clone(console),
-            walk: fs.walk()?,
+            walk: ExtentWalk::whole_filesystem(fs)?,
+            total,
+            stats: ScanStats::ZERO,
+            error: None,
+        })
+    }
+
+    /// Over the extents of the regular file `name` in the directory `fs` was
+    /// opened through, which is shown as `path`, read a page of extent items
+    /// at a time.
+    ///
+    /// Only the file is chosen. Who else holds each of its extents is found
+    /// the same way as on a scan of the whole filesystem, and a rewrite moves
+    /// every holder, wherever it is: a file elsewhere sharing an extent with
+    /// this one, a snapshot's included, is rewritten along with it.
+    ///
+    /// The file is looked up through the private mount, which has nothing
+    /// mounted in it: a file mounted over this one is not what is scanned.
+    pub fn file(
+        fs: &Arc<Filesystem>,
+        name: &Path,
+        path: &Path,
+        console: &Rc<Console>,
+    ) -> io::Result<Scanner> {
+        console.print(format!("Scanning file: {}", path.display()));
+        let meta = fs.entry(name)?.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::other(
+                "not a regular file, under what is mounted over it",
+            ));
+        }
+        let extents = file_extents(Arc::clone(fs), Rc::clone(console), meta.ino(), path.into());
+        Ok(Scanner {
+            fs: Arc::clone(fs),
+            console: Rc::clone(console),
+            walk: ExtentWalk::addresses(fs, extents)?,
+            total: None,
+            stats: ScanStats::ZERO,
+            error: None,
+        })
+    }
+
+    /// Over the extents of every regular file in the directory tree `fs` was
+    /// opened through, which is shown as `dir`: what [`Scanner::file`] does
+    /// for one file, done for every file the walk comes across. The walk
+    /// stays in the subvolume the tree is in, sees past anything mounted
+    /// inside it, and does not follow symbolic links.
+    ///
+    /// The walk reads a directory entry at a time, and a file a page of extent
+    /// items at a time. An extent several files in the tree point into, or one
+    /// file from many places, is met once: the walk keeps the address of every
+    /// extent it has met, in a compressed bitmap of a few bytes each, and
+    /// nothing else that grows with the tree. See `ExtentWalk`.
+    pub fn tree(fs: &Arc<Filesystem>, dir: &Path, console: &Rc<Console>) -> io::Result<Scanner> {
+        console.print(format!("Recursively scanning: {}", dir.display()));
+        let files = Files::new(fs, dir, console)?;
+        let extents = {
+            let (fs, console) = (Arc::clone(fs), Rc::clone(console));
+            files.flat_map(move |(inode, path)| {
+                file_extents(Arc::clone(&fs), Rc::clone(&console), inode, path)
+            })
+        };
+        Ok(Scanner {
+            fs: Arc::clone(fs),
+            console: Rc::clone(console),
+            walk: ExtentWalk::addresses(fs, extents)?,
+            total: None,
             stats: ScanStats::ZERO,
             error: None,
         })
@@ -294,6 +388,313 @@ impl Iterator for Scanner {
                     self.error = Some(e);
                     return None;
                 }
+            }
+        }
+    }
+}
+
+/// One extent, as [`ExtentWalk`] resolves it.
+enum Resolved {
+    /// The extent, with every reference to it, wherever on the filesystem.
+    /// Unless it is fully used: then perhaps only those that show it is.
+    Extent(Extent),
+    /// Nothing safe can be said about the extent at this address, for the
+    /// reason `error` gives: it changed while it was being read, or looking it
+    /// up failed.
+    LeftAlone { disk_address: u64, error: io::Error },
+}
+
+impl Resolved {
+    fn from(fs: &Filesystem, extent: Unresolved) -> Resolved {
+        let disk_address = extent.disk_address();
+        match fs.resolve(extent) {
+            Ok(extent) => Resolved::Extent(extent),
+            Err(error) => Resolved::LeftAlone {
+                disk_address,
+                error,
+            },
+        }
+    }
+}
+
+/// Data extents read from the extent tree a batch at a time as they are asked
+/// for, each resolved on rayon's global thread pool: every one on the
+/// filesystem in address order, or the ones at the addresses an iterator
+/// hands over (see [`Source`]).
+///
+/// Each extent is met once, however many files and snapshots reference it,
+/// and is handed over with every one of those references, or for a fully used
+/// extent perhaps only enough of them to show it is. A walk of the whole tree
+/// meets each extent once by reading the tree in order, and keeps nothing about
+/// it afterwards. A walk over addresses, which can name an extent any number
+/// of times, keeps the address of every extent it has met, and nothing else.
+/// An extent can be dealt with, rewritten even, before the next batch is read.
+///
+/// A batch's extents are resolved all at once, in parallel, and handed over
+/// only when every one of them is. Nothing is resolved while a batch is being
+/// handed over, so whatever is done with an extent, a rewrite included, never
+/// runs alongside a backreference walk. The kernel can hang when a dedupe and
+/// a backreference walk meet on the same inode or extent, and which inodes a
+/// walk will reach is not known ahead of it. The hang is unfixed on every
+/// kernel so far: see "Hangs with concurrent `LOGICAL_INO` and dedupe/clone"
+/// in <https://github.com/Zygo/bees/blob/master/docs/btrfs-kernel.md>.
+///
+/// The walk runs over a tree that changes under it, our own rewrites
+/// included. It resumes from an address rather than a place in the tree, so
+/// extents freed or allocated behind it make no difference. Extents allocated
+/// ahead of it after it started, our own copies among them, are passed over:
+/// they are fully referenced when they are made, and counting them would count
+/// the same data twice.
+///
+/// An `Err` is a search over the extent tree that failed outright. It ends the
+/// walk.
+struct ExtentWalk {
+    fs: Arc<Filesystem>,
+    /// Where the extents still to come are found.
+    source: Source,
+    /// Extents allocated after this generation are passed over.
+    generation: u64,
+    /// The batch resolved last, less the extents already handed over.
+    batch: vec::IntoIter<Resolved>,
+}
+
+/// Where an [`ExtentWalk`] finds its extents.
+enum Source {
+    /// The whole extent tree, from this address on, or nothing more once it
+    /// is read to its end (`None`).
+    ExtentTree(Option<u64>),
+    /// The addresses `addresses` hands over, each looked up in the extent tree
+    /// on its own.
+    Addresses {
+        addresses: Box<dyn Iterator<Item = u64>>,
+        /// Every address met so far, each divided by the sector size: an
+        /// extent is named again every time another file extent item points
+        /// into it, as a file partly overwritten again and again does from all
+        /// over, and is to be met only once.
+        ///
+        /// Extents start a sector apart at the closest, and are seldom that
+        /// close, so numbered by sector they are sparse but in clusters, which
+        /// is what a compressed bitmap keeps in a few bytes each.
+        seen: RoaringTreemap,
+    },
+}
+
+/// How many addresses not met before are resolved at once, as one batch. About
+/// as many as one search of the extent tree reads.
+const ADDRESS_BATCH: usize = 1024;
+
+impl ExtentWalk {
+    /// Every data extent on the filesystem, in address order.
+    fn whole_filesystem(fs: &Arc<Filesystem>) -> io::Result<ExtentWalk> {
+        ExtentWalk::new(fs, Source::ExtentTree(Some(0)))
+    }
+
+    /// The data extents at the addresses `addresses` hands over, as it hands
+    /// them over, each once however many times it is named. An address with
+    /// no data extent at it any more is passed over.
+    ///
+    /// `addresses` is only read from once the filesystem is synced, so what it
+    /// reads from the trees includes everything written before the walk.
+    fn addresses(
+        fs: &Arc<Filesystem>,
+        addresses: impl Iterator<Item = u64> + 'static,
+    ) -> io::Result<ExtentWalk> {
+        let source = Source::Addresses {
+            addresses: Box::new(addresses),
+            seen: RoaringTreemap::new(),
+        };
+        ExtentWalk::new(fs, source)
+    }
+
+    fn new(fs: &Arc<Filesystem>, source: Source) -> io::Result<ExtentWalk> {
+        // Commit what is pending first, so that everything allocated from here
+        // on, our own copies included, is newer than the generation read next.
+        fs.sync()?;
+        Ok(ExtentWalk {
+            fs: Arc::clone(fs),
+            source,
+            generation: fs.generation()?,
+            batch: Vec::new().into_iter(),
+        })
+    }
+}
+
+impl Iterator for ExtentWalk {
+    type Item = io::Result<Resolved>;
+
+    fn next(&mut self) -> Option<io::Result<Resolved>> {
+        loop {
+            if let Some(resolved) = self.batch.next() {
+                return Some(Ok(resolved));
+            }
+
+            let fs = &self.fs;
+            let generation = self.generation;
+            let resolved: Vec<Resolved> = match &mut self.source {
+                Source::ExtentTree(next) => match fs.extent_batch((*next)?, generation) {
+                    Ok((batch, after)) => {
+                        *next = after;
+                        // Collected in the order read, which is address order.
+                        batch
+                            .into_par_iter()
+                            .map(|extent| Resolved::from(fs, extent))
+                            .collect()
+                    }
+                    Err(e) => {
+                        *next = None;
+                        return Some(Err(e));
+                    }
+                },
+                Source::Addresses { addresses, seen } => {
+                    let sectorsize = fs.sectorsize;
+                    let mut batch = Vec::with_capacity(ADDRESS_BATCH);
+                    for address in addresses.by_ref() {
+                        if seen.insert(address / sectorsize) {
+                            batch.push(address);
+                            if batch.len() == ADDRESS_BATCH {
+                                break;
+                            }
+                        }
+                    }
+                    if batch.is_empty() {
+                        return None;
+                    }
+                    // In address order within the batch.
+                    batch.sort_unstable();
+                    // A lookup that fails outright ends the walk, as it does a
+                    // walk of the whole tree.
+                    let resolved: io::Result<Vec<Option<Resolved>>> = batch
+                        .into_par_iter()
+                        .map(|address| {
+                            let extent = fs.extent_at(address, generation)?;
+                            Ok(extent.map(|extent| Resolved::from(fs, extent)))
+                        })
+                        .collect();
+                    match resolved {
+                        Ok(resolved) => resolved.into_iter().flatten().collect(),
+                        Err(e) => {
+                            *addresses = Box::new(iter::empty());
+                            return Some(Err(e));
+                        }
+                    }
+                }
+            };
+            self.batch = resolved.into_iter();
+        }
+    }
+}
+
+/// The extents of inode `inode` of the subvolume `fs` was opened in, shown as
+/// `path`, read a page of extent items at a time.
+///
+/// A file that cannot be read is warned about and left where it failed. What
+/// came before is kept: each extent is resolved again before anything is done
+/// with it, so a file read only in part is no different from one shrunk since.
+fn file_extents(
+    fs: Arc<Filesystem>,
+    console: Rc<Console>,
+    inode: u64,
+    path: PathBuf,
+) -> impl Iterator<Item = u64> {
+    let mut from = Some(0);
+    iter::from_fn(move || {
+        let mut page = Vec::new();
+        match fs.inode_extent_page(inode, from?, |address| page.push(address)) {
+            Ok(next) => from = next,
+            Err(e) => {
+                console.warn(format!("skipping the rest of {}: {e}", path.display()));
+                from = None;
+            }
+        }
+        Some(page)
+    })
+    .flatten()
+}
+
+/// The regular files in a directory tree, depth first, each as its inode
+/// number and the path it is shown by. A file with more than one name in the
+/// tree, a hardlink, comes up once for each.
+///
+/// The tree is read through the private mount, which has nothing mounted in
+/// it: what is mounted inside the tree, a bind mount of somewhere else on the
+/// same subvolume included, is neither entered nor in the way of what it
+/// hides. The walk stays in the subvolume the tree is in: a directory that is
+/// the root of another subvolume nested inside this one, as snapper keeps its
+/// snapshots, shows as another device and is not entered. Symbolic links are
+/// not followed.
+struct Files {
+    fs: Arc<Filesystem>,
+    console: Rc<Console>,
+    /// The tree's root, as shown.
+    dir: PathBuf,
+    /// The directories being read, the tree's root first and the one being
+    /// read now last, each by its path from the tree's root.
+    open: Vec<(PathBuf, fs::ReadDir)>,
+}
+
+impl Files {
+    fn new(fs: &Arc<Filesystem>, dir: &Path, console: &Rc<Console>) -> io::Result<Files> {
+        Ok(Files {
+            fs: Arc::clone(fs),
+            console: Rc::clone(console),
+            dir: dir.into(),
+            open: vec![(PathBuf::new(), fs::read_dir(fs.private_path())?)],
+        })
+    }
+}
+
+impl Iterator for Files {
+    type Item = (u64, PathBuf);
+
+    fn next(&mut self) -> Option<(u64, PathBuf)> {
+        loop {
+            let (rel, entries) = self.open.last_mut()?;
+            let entry = match entries.next() {
+                Some(Ok(entry)) => entry,
+                Some(Err(e)) => {
+                    let shown = self.dir.join(rel);
+                    self.console
+                        .warn(format!("skipping the rest of {}: {e}", shown.display()));
+                    self.open.pop();
+                    continue;
+                }
+                None => {
+                    self.open.pop();
+                    continue;
+                }
+            };
+            let rel = rel.join(entry.file_name());
+            let shown = self.dir.join(&rel);
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(e) => {
+                    self.console
+                        .warn(format!("skipping {}: {e}", shown.display()));
+                    continue;
+                }
+            };
+            if file_type.is_file() {
+                // The directory entry names the inode: no need to stat it.
+                return Some((entry.ino(), shown));
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+            let entered = entry.metadata().and_then(|meta| {
+                if meta.dev() != self.fs.device {
+                    return Ok(None);
+                }
+                fs::read_dir(self.fs.private_path().join(&rel)).map(Some)
+            });
+            match entered {
+                Ok(Some(entries)) => self.open.push((rel, entries)),
+                Ok(None) => self.console.info(format_args!(
+                    "not entering {}: another subvolume",
+                    shown.display()
+                )),
+                Err(e) => self
+                    .console
+                    .warn(format!("skipping {}: {e}", shown.display())),
             }
         }
     }

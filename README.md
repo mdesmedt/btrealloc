@@ -13,25 +13,29 @@ There are some ways to attempt to reclaim unreachable space:
 
 This tool is specifically designed to give the filesystem an opportunity to reallocate extents with unreachable data, in-place, without modifying the original file's contents or metadata, and preserving existing deduplication.
 
-Btrealloc works on a whole filesystem at once, every subvolume and snapshot included, read-only snapshots too.
-
 # Usage
 
-Btrealloc scans the whole filesystem, every subvolume and snapshot, and is given the mount point of one of its subvolumes to work through:
+Btrealloc is given a path. The type of path the determines the scan algorithm:
 
-- Where the top-level subvolume (`subvolid=5`) is mounted.
-- Where any other subvolume is mounted, such as `/home` on a system that only mounts its subvolumes, with `--whole-filesystem`. The flag is there to say that the whole filesystem is meant, not only that subvolume: files in every other subvolume and snapshot are scanned, and rewritten with `--apply`, too.
+- A top-level subvolume (`subvolid=5`) mount: the whole filesystem, every subvolume and snapshot.
+- A subvolume mount, such as `/home` with `--whole-filesystem`: also the whole filesystem.
+- A directory: every file in its tree recursively. The walk stays in the subvolume the directory is in: nested subvolumes, such as snapper's `.snapshots`, are not entered, and symbolic links are not followed.
+- A file: only that file.
+
+A symbolic link given as the path is followed to the file or directory it leads to.
+
+Whatever was scanned, an extent is rewritten in every file holding it, wherever on the filesystem that file is. A file outside the path sharing an extent with one inside it, a snapshot's included, is rewritten along with it, since only then is the extent freed.
 
 By default the tool generates a report only and does not make any changes:
 
 ```
-Usage: btrealloc [OPTIONS] <MOUNT>
+Usage: btrealloc [OPTIONS] <PATH>
 
 Arguments:
-  <MOUNT>  Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`), or with --whole-filesystem where any other subvolume is. Every subvolume and snapshot on the filesystem is scanned from there
+  <PATH>  What to scan. Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`) scans the whole filesystem. A directory scans every file in its tree, staying in the subvolume it is in. A file scans only that file. Files elsewhere sharing an extent with the ones scanned, snapshots included, are rewritten along with them
 
 Options:
-      --whole-filesystem  Scan the whole filesystem through MOUNT when it is a subvolume other than the top-level one, as on a system that only mounts its subvolumes. Every other subvolume and snapshot is scanned, and reallocated when --apply is passed.
+      --whole-filesystem  Scan the whole filesystem through PATH when it is where a subvolume other than the top-level one is mounted. Every subvolume and snapshot is scanned, and reallocated when --apply is passed
       --apply             Actually perform the extent reallocation operation, writing changes to the filesystem
   -v, --verbose           Prints information about each extent during the scan or apply
   -j, --jobs <N>          Threads to resolve extents on. Defaults to one per CPU
@@ -40,7 +44,7 @@ Options:
   -h, --help              Print help
 ```
 
-Files outside the subvolume the tool was pointed at are named by their path from the top-level subvolume, under `<FS_TREE>`, as `btrfs subvolume list -a` names them.
+Files outside the directory the tool was pointed at are named by their path from the top-level subvolume, under `<FS_TREE>`, as `btrfs subvolume list -a` names them.
 
 A run that finishes exits 0 even when some extents were left alone, including ones whose rewrite failed: on a filesystem in use files change or get deleted, and each one is reported as it happens and in the table at the end. It exits 1 when it cannot finish, including when it stops because the filesystem is out of space, over a quota, read-only or failing.
 
@@ -95,7 +99,8 @@ The tool works through a private, detached copy of the mount it is given (`open_
 
 ## Scanning
 
-- The tool walks the filesystem's extent tree in address order. Every extent is iterated over exactly once.
+- For the whole filesystem, the tool walks the filesystem's extent tree in address order. Every extent is iterated over exactly once.
+- For a directory or a file, it reads the file extent items of every regular file there instead, one file after another, and handles the extents they point into as it goes. Each extent is handled once, however many times the files point into it: through a hardlink or a reflinked copy, or from all over one file that was partly overwritten again and again. For that it keeps the address of every extent met so far, in a compressed bitmap of a few bytes per extent.
 - For each extent, it finds every file extent item referencing it, in any subvolume. The extent tree names most of them directly. Where it cannot, because the references go through tree blocks shared with a snapshot, the kernel's backreference walk (`LOGICAL_INO`) finds them.
 - For each extent, it calculates how much of the extent is being actively used. The extent's data is split into:
   - Allocated: The total size of the extent
@@ -116,7 +121,7 @@ The tool works through a private, detached copy of the mount it is given (`open_
   - Look up every file holding the extent again, with the kernel's backreference walk, since earlier rewrites can have changed it
   - Open each file by its subvolume and inode number, with a file handle (`open_by_handle_at`) rather than a path, and check the file opened is still that inode. Files in subvolumes and snapshots that no path through the given mount reaches are opened all the same
   - Iterate over all referenced ranges in the extent, finding "live ranges" of referenced bytes
-  - For each live range an anonymous temp file is created with `O_TMPFILE` in the root directory of the subvolume the tool was pointed at, and it is copied there. This is why `--apply` needs that mount and subvolume writable
+  - For each live range an anonymous temp file is created with `O_TMPFILE` in the root directory of the subvolume the tool was pointed at, and it is copied there. No directory entry is ever made. This is why `--apply` needs that mount and subvolume writable
   - For each file which holds the original extent, call `FIDEDUPERANGE` to point its chunks from the old extent into the new extents. This operation is what actually modifies the file. The kernel guarantees that:
     - The operation is atomic
     - The bytes in the source range and the destination range are identical

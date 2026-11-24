@@ -650,14 +650,13 @@ fn options_through(path: &Path, whole_filesystem: bool, apply: bool) -> btreallo
     }
 }
 
-/// Only the root of a subvolume is accepted: the top-level one as it is, any
-/// other with --whole-filesystem, which says the whole filesystem is meant and
-/// not only that subvolume. Anything else is refused before anything is read,
-/// with what to do instead. So is rewriting through a read-only mount, or from
-/// a read-only subvolume, which leaves nowhere to make the copies, though
-/// reading through either is fine.
+/// --whole-filesystem only takes the root of a subvolume, where one is
+/// mounted: through anything else it is refused before anything is read, with
+/// what to do instead, as is anything not on btrfs. So is rewriting through a
+/// read-only mount, or from a read-only subvolume, which leaves nowhere to make
+/// the copies, though reading through either is fine.
 #[test]
-fn only_a_subvolume_root_is_accepted() {
+fn whole_filesystem_takes_only_a_subvolume_root() {
     let fs = Fs::new();
     fs.dir("data");
     let file = fs.path("data/bookend");
@@ -672,15 +671,10 @@ fn only_a_subvolume_root_is_accepted() {
     let before = support::checksums(fs.root());
     let extents = support::physical_extents(&file);
 
-    let refused: [(PathBuf, bool, &str); 10] = [
-        (fs.path("data"), false, "not its root"),
+    let refused: [(PathBuf, bool, &str); 5] = [
         (fs.path("data"), true, "not its root"),
-        (file.clone(), false, "not a directory"),
         (file.clone(), true, "not a directory"),
-        (fs.path("live"), false, "--whole-filesystem"),
-        (inside.clone(), false, "not its root"),
         (inside, true, "not its root"),
-        (mounted.path.clone(), false, "--whole-filesystem"),
         (fs.tmpfs(), false, "not on a btrfs filesystem"),
         (fs.tmpfs(), true, "not on a btrfs filesystem"),
     ];
@@ -808,6 +802,335 @@ fn the_whole_filesystem_is_reclaimed_through_a_subvolume_mount() {
         fs.is_readonly("snapshot"),
         "the snapshot is no longer read-only"
     );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// Given a file, only that file's extents are scanned and rewritten. A file
+/// beside it, just as wasteful, is left as it was.
+#[test]
+fn a_single_file_is_reclaimed_and_nothing_else() {
+    let fs = Fs::new();
+    fs.dir("data");
+    let (chosen, beside) = (fs.path("data/chosen"), fs.path("data/beside"));
+    support::bookend(&chosen, FILE_MIB);
+    support::bookend(&beside, FILE_MIB);
+    let chosen_extents = support::physical_extents(&chosen);
+    let beside_extents = support::physical_extents(&beside);
+    let before = support::checksums(fs.root());
+
+    let (_, stats, report) = support::apply_to(&fs, &chosen);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(
+        stats.extents,
+        chosen_extents.len() as u64,
+        "the run should count the chosen file's extents only"
+    );
+    assert!(!report.rewritten.is_empty(), "the file should be rewritten");
+    for extent in &report.rewritten {
+        assert!(
+            chosen_extents.contains(extent),
+            "extent {extent:#x} is not the chosen file's"
+        );
+    }
+
+    let after = support::scan(&fs);
+    let (allocated, used) = support::file_totals(&after, &chosen);
+    assert_eq!(allocated, used, "the chosen file still wastes space");
+    assert_eq!(
+        support::physical_extents(&beside),
+        beside_extents,
+        "the file beside it was rewritten"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// An extent a file points into from all over, as a file partly overwritten
+/// again and again leaves it, is counted once on a scan of that file: its
+/// file extent items span many batches of the walk, and every batch names it.
+#[test]
+fn an_extent_named_all_over_a_file_is_counted_once() {
+    use std::os::unix::fs::FileExt;
+
+    let fs = Fs::new();
+    let path = fs.path("image");
+    support::write_random_one_extent(&path, 16);
+    // Every other sector overwritten: the original extent is named between
+    // each pair of new ones, once a sector over the whole file.
+    let sector = fs.sectorsize();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open the file");
+    let mut rng = support::Rng::new(1);
+    let mut data = vec![0u8; sector as usize];
+    for offset in (0..16 * MIB).step_by(2 * sector as usize) {
+        rng.fill(&mut data);
+        file.write_all_at(&data, offset)
+            .expect("overwrite a sector");
+    }
+    file.sync_all().expect("sync the file");
+    support::sync_fs();
+    let items = support::file_extents(&path).len();
+    assert!(
+        items > 2 * 1024,
+        "fixture: the file should have extent items for several batches, it has {items}"
+    );
+
+    let options = support::options(&path, false);
+    let (stats, _) = btrealloc::run(&options, &support::console()).expect("scan the file");
+    assert_eq!(
+        stats.extents,
+        support::physical_extents(&path).len() as u64,
+        "each of the file's extents should be counted once"
+    );
+    let (allocated, used) = support::file_totals(&support::scan(&fs), &path);
+    assert_eq!(stats.totals.allocated_bytes, allocated);
+    assert_eq!(stats.totals.used_bytes, used);
+}
+
+/// Given a directory, every file in its tree is scanned, an extent two of them
+/// share counted once. The walk stays in the directory's subvolume: a nested
+/// subvolume is not entered, nor is a symbolic link out of the tree followed.
+#[test]
+fn a_directory_tree_is_walked_within_its_subvolume() {
+    let fs = Fs::new();
+    fs.dir("data/sub/deeper");
+    fs.dir("outside");
+    let shallow = fs.path("data/shallow");
+    let deep = fs.path("data/sub/deeper/deep");
+    let copy = fs.path("data/sub/copy");
+    support::bookend(&shallow, FILE_MIB);
+    support::bookend(&deep, FILE_MIB);
+    support::reflink(&shallow, &copy);
+    fs.subvolume("data/nested");
+    let nested = fs.path("data/nested/file");
+    support::bookend(&nested, FILE_MIB);
+    let outside = fs.path("outside/file");
+    support::bookend(&outside, FILE_MIB);
+    std::os::unix::fs::symlink(fs.path("outside"), fs.path("data/link"))
+        .expect("make the symbolic link");
+
+    let mut walked: Vec<u64> = [&shallow, &deep, &copy]
+        .iter()
+        .flat_map(|file| support::physical_extents(file))
+        .collect();
+    walked.sort_unstable();
+    walked.dedup();
+    let untouched = [&nested, &outside].map(|file| support::physical_extents(file));
+    let before = support::checksums(fs.root());
+
+    let (_, stats, report) = support::apply_to(&fs, &fs.path("data"));
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(
+        stats.extents,
+        walked.len() as u64,
+        "the run should count each extent in the tree once"
+    );
+
+    let after = support::scan(&fs);
+    for file in [&shallow, &deep, &copy] {
+        let (allocated, used) = support::file_totals(&after, file);
+        assert_eq!(allocated, used, "{} was not rewritten", file.display());
+    }
+    assert_eq!(
+        support::physical_extents(&shallow),
+        support::physical_extents(&copy),
+        "the reflinked copy no longer shares one copy with its original"
+    );
+    for (file, extents) in [&nested, &outside].iter().zip(&untouched) {
+        assert_eq!(
+            &support::physical_extents(file),
+            extents,
+            "{} is outside the walk, and was rewritten",
+            file.display()
+        );
+    }
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// What is mounted inside the tree is not walked: a bind mount there of a
+/// directory elsewhere on the same subvolume neither brings that directory's
+/// files into the walk nor keeps the walk from the files it hides.
+#[test]
+fn a_bind_mount_inside_the_tree_is_seen_past() {
+    let fs = Fs::new();
+    fs.dir("tree/hidden");
+    fs.dir("elsewhere");
+    let hidden = fs.path("tree/hidden/file");
+    let elsewhere = fs.path("elsewhere/file");
+    support::bookend(&hidden, FILE_MIB);
+    support::bookend(&elsewhere, FILE_MIB);
+    let hidden_extents = support::physical_extents(&hidden);
+    let elsewhere_extents = support::physical_extents(&elsewhere);
+    let before = support::checksums(fs.root());
+
+    let mount = fs.bind("elsewhere", "tree/hidden");
+    let (_, stats, report) = support::apply_to(&fs, &fs.path("tree"));
+    drop(mount);
+
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(
+        stats.extents,
+        hidden_extents.len() as u64,
+        "the run should count the hidden file's extents only"
+    );
+    assert!(
+        !report.rewritten.is_empty(),
+        "the hidden file should be rewritten"
+    );
+    for extent in &report.rewritten {
+        assert!(
+            hidden_extents.contains(extent),
+            "extent {extent:#x} is not the hidden file's"
+        );
+    }
+    let after = support::scan(&fs);
+    let (allocated, used) = support::file_totals(&after, &hidden);
+    assert_eq!(allocated, used, "the hidden file still wastes space");
+    assert_eq!(
+        support::physical_extents(&elsewhere),
+        elsewhere_extents,
+        "the bind mount's source was walked"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// A symbolic link given as the path is followed, here to a file in another
+/// subvolume, which is what is scanned.
+#[test]
+fn a_symbolic_link_given_as_the_path_is_followed() {
+    let fs = Fs::new();
+    fs.subvolume("live");
+    let target = fs.path("live/file");
+    support::bookend(&target, FILE_MIB);
+    fs.dir("links");
+    let link = fs.path("links/file");
+    std::os::unix::fs::symlink(&target, &link).expect("make the symbolic link");
+    let extents = support::physical_extents(&target);
+
+    let (_, stats, report) = support::apply_to(&fs, &link);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(stats.extents, extents.len() as u64);
+    assert!(!report.rewritten.is_empty(), "the file should be rewritten");
+    for extent in &report.rewritten {
+        assert!(
+            extents.contains(extent),
+            "extent {extent:#x} is not the linked file's"
+        );
+    }
+}
+
+/// A directory nothing can be created in, as `chattr +i` makes one, is
+/// reclaimed all the same: the copies are made in its subvolume's root
+/// directory, not in it.
+#[test]
+fn an_immutable_directory_is_still_reclaimed() {
+    let fs = Fs::new();
+    fs.dir("frozen");
+    let file = fs.path("frozen/file");
+    support::bookend(&file, FILE_MIB);
+    support::set_immutable(&fs.path("frozen"));
+    let before = support::checksums(fs.root());
+
+    let (_, _, report) = support::apply_to(&fs, &fs.path("frozen"));
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(!report.rewritten.is_empty(), "the file should be rewritten");
+    let after = support::scan(&fs);
+    let (allocated, used) = support::file_totals(&after, &file);
+    assert_eq!(allocated, used, "the file still wastes space");
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// A file's extent shared with a read-only snapshot is rewritten in the
+/// snapshot too, though the snapshot was not given: rewriting only the file
+/// would leave the snapshot holding the old extent, and free nothing.
+#[test]
+fn an_extent_found_through_a_file_is_reclaimed_from_a_snapshot_too() {
+    let fs = Fs::new();
+    fs.subvolume("live");
+    let live = fs.path("live/file");
+    wasteful_file(&live);
+    fs.snapshot("live", "snapshot");
+    let snapshotted = fs.path("snapshot/file");
+    let extent = support::single_extent(&live);
+    assert_eq!(
+        support::single_extent(&snapshotted),
+        extent,
+        "fixture: the snapshot should hold the file's extent"
+    );
+    let before = support::checksums(fs.root());
+
+    let (_, _, report) = support::apply_to(&fs, &live);
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(report.rewritten, [extent]);
+    for file in [&live, &snapshotted] {
+        assert!(
+            !support::physical_extents(file).contains(&extent),
+            "{} still references the extent",
+            file.display()
+        );
+    }
+    assert_eq!(
+        support::physical_extents(&live),
+        support::physical_extents(&snapshotted),
+        "the snapshot no longer shares one copy with the file"
+    );
+    assert!(
+        fs.is_readonly("snapshot"),
+        "the snapshot is no longer read-only"
+    );
+    assert_eq!(before, support::checksums(fs.root()), "contents changed");
+}
+
+/// Without --whole-filesystem, where a subvolume is mounted means only that
+/// subvolume: its files are rewritten, and another subvolume's and the
+/// top-level one's are left as they were. The top-level subvolume need not be
+/// mounted for it.
+#[test]
+fn a_subvolume_mount_without_the_flag_reclaims_only_that_subvolume() {
+    let fs = Fs::new();
+    fs.subvolume("live");
+    let live = fs.path("live/file");
+    wasteful_file(&live);
+    fs.subvolume("other");
+    let other = fs.path("other/file");
+    wasteful_file(&other);
+    fs.dir("data");
+    let top = fs.path("data/file");
+    wasteful_file(&top);
+
+    let extent = support::single_extent(&live);
+    let untouched = [&other, &top].map(|file| support::physical_extents(file));
+    let before = support::checksums(fs.root());
+
+    let mounted = fs.mount_subvolume("live");
+    let report = fs.without_top_level(|| {
+        let (_, report) =
+            btrealloc::run(&support::options(&mounted.path, true), &support::console())
+                .expect("run on the subvolume mount");
+        support::sync_fs();
+        report
+    });
+    assert!(report.modified.is_empty(), "{:?}", report.modified);
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert_eq!(report.rewritten, [extent]);
+
+    assert!(
+        !support::physical_extents(&live).contains(&extent),
+        "the subvolume's file still references its old extent"
+    );
+    for (file, extents) in [&other, &top].iter().zip(&untouched) {
+        assert_eq!(
+            &support::physical_extents(file),
+            extents,
+            "{} is outside the subvolume, and was rewritten",
+            file.display()
+        );
+    }
     assert_eq!(before, support::checksums(fs.root()), "contents changed");
 }
 

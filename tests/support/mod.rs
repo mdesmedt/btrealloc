@@ -33,7 +33,8 @@ use linux_raw_sys::btrfs::{
     btrfs_ioctl_search_key,
 };
 use linux_raw_sys::general::{
-    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FS_NOCOW_FL, RLIMIT_NOFILE, rlimit, statfs,
+    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FS_IMMUTABLE_FL, FS_NOCOW_FL, RLIMIT_NOFILE, rlimit,
+    statfs,
 };
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_TREE_SEARCH_V2, FICLONE, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS,
@@ -332,6 +333,21 @@ impl Fs {
         mount
     }
 
+    /// The directory at `from` bound over the one at `over`, both in this
+    /// filesystem, hiding what `over` holds until it is unmounted.
+    pub fn bind(&self, from: &str, over: &str) -> Mount {
+        let path = self.path(over);
+        must(
+            "mount",
+            &[
+                "--bind",
+                self.path(from).to_str().unwrap(),
+                path.to_str().unwrap(),
+            ],
+        );
+        Mount { path }
+    }
+
     /// The directory at `rel` bound over itself, read-only, as NixOS does with
     /// `/nix/store`.
     pub fn mount_readonly_over(&self, rel: &str) -> Mount {
@@ -541,7 +557,18 @@ pub fn reflink(src: &Path, dest: &Path) {
 /// applies to whatever is created in it afterwards, which is how a datacow file
 /// ends up in a nodatacow directory.
 pub fn set_nocow(path: &Path) {
-    let file = File::open(path).expect("open the file to mark nodatacow");
+    add_inode_flag(path, FS_NOCOW_FL);
+}
+
+/// Marks a file or directory immutable, as `chattr +i` does: nothing can be
+/// created in an immutable directory, an unnamed `O_TMPFILE` included.
+pub fn set_immutable(path: &Path) {
+    add_inode_flag(path, FS_IMMUTABLE_FL);
+}
+
+/// Adds `flag` to the inode flags of the file or directory at `path`.
+fn add_inode_flag(path: &Path, flag: u32) {
+    let file = File::open(path).expect("open the file to set a flag on");
     let mut flags: c_int = 0;
     let rc = unsafe {
         ioctl(
@@ -552,7 +579,7 @@ pub fn set_nocow(path: &Path) {
     };
     assert!(rc == 0, "get flags: {}", std::io::Error::last_os_error());
 
-    flags |= FS_NOCOW_FL as c_int;
+    flags |= flag as c_int;
     let rc = unsafe {
         ioctl(
             file.as_raw_fd(),
@@ -881,7 +908,8 @@ impl Scan {
 pub fn scan(fs: &Fs) -> Scan {
     let filesystem =
         Arc::new(kernel::Filesystem::open(fs.root()).expect("open the fixture's filesystem"));
-    let mut scanner = Scanner::new(&filesystem, &console()).expect("start the walk");
+    let mut scanner =
+        Scanner::whole_filesystem(&filesystem, fs.root(), &console()).expect("start the walk");
     let extents = scanner
         .by_ref()
         .map(|extent| (extent.disk_address, extent))
@@ -900,14 +928,22 @@ pub fn scan(fs: &Fs) -> Scan {
 /// Scans, rewrites, and syncs, then returns the scan it worked from and what it
 /// did. Assert on the report; the same lines were printed as it went.
 pub fn apply(fs: &Fs) -> (Scan, Report) {
-    let options = options(fs.root(), true);
+    let (scan, _, report) = apply_to(fs, fs.root());
+    (scan, report)
+}
+
+/// The same for a run given `path`, a file or a directory tree rather than the
+/// whole filesystem. Also returns the run's own stats, which count only the
+/// extents it was given.
+pub fn apply_to(fs: &Fs, path: &Path) -> (Scan, ScanStats, Report) {
+    let options = options(path, true);
     // Scanned beforehand, so the check below knows which holders each
     // rewritten extent had.
     let scan = scan(fs);
-    let (_, report) = btrealloc::run(&options, &console()).expect("run over the fixture");
+    let (stats, report) = btrealloc::run(&options, &console()).expect("run over the fixture");
     sync_fs();
     assert_released(fs, &scan, &report);
-    (scan, report)
+    (scan, stats, report)
 }
 
 /// Every extent the run says it rewrote must be one no holder points at any

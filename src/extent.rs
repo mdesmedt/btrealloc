@@ -45,7 +45,7 @@ pub struct Extent {
     pub uncompressed_bytes: u64,
     /// Every reference to this extent, anywhere on the filesystem. For a fully
     /// used extent from the walk, perhaps only enough of them to show it is:
-    /// see [`ExtentWalk`](crate::kernel::ExtentWalk).
+    /// see [`Filesystem::resolve`](crate::kernel::Filesystem::resolve).
     pub refs: Vec<ExtentRef>,
     /// The live (actively referenced) ranges of this extent, merged, in order.
     /// Worked out once, here, from `refs`: nothing discovers a reference to an
@@ -72,7 +72,7 @@ impl Extent {
     }
 
     /// The extent `refs` point into, from every reference to it there is, as
-    /// [`ExtentWalk`](crate::kernel::ExtentWalk) finds them. `refs` must not be
+    /// [`Filesystem::resolve`](crate::kernel::Filesystem::resolve) finds them. `refs` must not be
     /// empty.
     pub fn from_refs(refs: Vec<ExtentRef>) -> Extent {
         let first = &refs[0];

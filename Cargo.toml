@@ -8,6 +8,7 @@ license = "MIT"
 clap = { version = "4.6.9", features = ["derive"] }
 linux-raw-sys = { version = "0.12.1", default-features = false, features = ["btrfs", "errno", "ioctl", "general", "std"] }
 rayon = "1.12.0"
+roaring = "0.12.0"
 
 [dev-dependencies]
 # The end to end suite checksums every file before and after a run.

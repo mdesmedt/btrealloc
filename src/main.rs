@@ -17,14 +17,15 @@ unsafe extern "C" {
 #[derive(Parser)]
 #[command(about = "Reclaim unreachable space on btrfs by rewriting live data into compact extents")]
 struct Args {
-    /// Where the filesystem's top-level subvolume is mounted (`mount -o subvolid=5`),
-    /// or with --whole-filesystem where any other subvolume is. Every subvolume and
-    /// snapshot on the filesystem is scanned from there.
-    #[arg(value_name = "MOUNT")]
+    /// What to scan. Where the filesystem's top-level subvolume is mounted (`mount -o
+    /// subvolid=5`) scans the whole filesystem. A directory scans every file in its tree,
+    /// staying in the subvolume it is in. A file scans only that file. Files elsewhere
+    /// sharing an extent with the ones scanned, snapshots included, are rewritten along
+    /// with them.
+    #[arg(value_name = "PATH")]
     path: PathBuf,
-    /// Scan the whole filesystem through MOUNT when it is a subvolume other than the top-level one,
-    /// as on a system that only mounts its subvolumes. Every other subvolume and snapshot is scanned,
-    /// and reallocated when --apply is passed.
+    /// Scan the whole filesystem through PATH when it is where a subvolume other than the
+    /// top-level one is mounted. Every subvolume and snapshot is scanned, and reallocated when --apply is passed.
     #[arg(long)]
     whole_filesystem: bool,
     /// Actually perform the extent reallocation operation, writing changes to the filesystem.
@@ -81,8 +82,6 @@ fn main() -> ExitCode {
     }
 
     // Scan, and rewrite along the way if asked to
-
-    console.print(format!("Scanning: {}", options.path.display()));
     let (stats, report) = match btrealloc::run(&options, &console) {
         Ok(result) => result,
         Err(e) => {
