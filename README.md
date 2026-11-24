@@ -153,6 +153,10 @@ Because actually scanning a filesystem with this tool or doing actual work with 
 ./runvm.sh
 ```
 
+# Minimum required Kernel version
+
+The minimum required kernel version (as determined by the system calls used) should be Linux 5.12. **However, using a more up to date LTS kernel, for example 6.12 or 6.18, is strongly recommended**. Please see the `bees` documentation for more details about btrfs regression on specific kernel versions: https://github.com/Zygo/bees/blob/master/docs/btrfs-kernel.md
+
 # License
 
 [MIT License](LICENSE)

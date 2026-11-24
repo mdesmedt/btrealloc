@@ -27,11 +27,12 @@ use linux_raw_sys::btrfs::{
 };
 use linux_raw_sys::errno::{EDQUOT, EIO, ENOSPC, EROFS, ESTALE, EUCLEAN};
 use linux_raw_sys::general::{
-    __IncompleteArrayField, __NR_open_by_handle_at, __NR_open_tree, __NR_openat2, AT_EMPTY_PATH,
-    BTRFS_SUPER_MAGIC, FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL, O_CLOEXEC, O_DIRECTORY, O_NOATIME,
-    O_NOFOLLOW, O_PATH, O_RDONLY, O_RDWR, O_TMPFILE, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE,
-    RESOLVE_BENEATH, RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV, file_dedupe_range,
-    file_dedupe_range_info, open_how, statfs, winsize,
+    __IncompleteArrayField, __NR_mount_setattr, __NR_open_by_handle_at, __NR_open_tree,
+    __NR_openat2, AT_EMPTY_PATH, BTRFS_SUPER_MAGIC, FILE_DEDUPE_RANGE_SAME, FS_NOCOW_FL,
+    MOUNT_ATTR__ATIME, MOUNT_ATTR_NOATIME, O_CLOEXEC, O_DIRECTORY, O_NOATIME, O_NOFOLLOW, O_PATH,
+    O_RDONLY, O_RDWR, O_TMPFILE, OPEN_TREE_CLOEXEC, OPEN_TREE_CLONE, RESOLVE_BENEATH,
+    RESOLVE_NO_SYMLINKS, RESOLVE_NO_XDEV, file_dedupe_range, file_dedupe_range_info, mount_attr,
+    open_how, statfs, winsize,
 };
 use linux_raw_sys::ioctl::{
     BTRFS_IOC_FS_INFO, BTRFS_IOC_INO_LOOKUP, BTRFS_IOC_INO_PATHS, BTRFS_IOC_LOGICAL_INO_V2,
@@ -85,6 +86,10 @@ unsafe extern "C" {
 /// It lives only as long as the descriptor returned, and whatever is opened
 /// through it: the kernel unmounts it once those close, however the process
 /// ends, a kill included. Nothing is ever left in the mount table.
+///
+/// The copy is `noatime`, whatever the original is: reading through it, a
+/// directory walk included, never moves an access time. Files are opened
+/// `O_NOATIME` as well, but nothing like that exists for reading a directory.
 fn clone_mount(fd: c_int) -> io::Result<OwnedFd> {
     let rc = unsafe {
         syscall(
@@ -97,7 +102,30 @@ fn clone_mount(fd: c_int) -> io::Result<OwnedFd> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(rc as c_int) })
+    let mount = unsafe { OwnedFd::from_raw_fd(rc as c_int) };
+
+    // The atime mode is one setting of several bits: the old one is cleared
+    // as the new one is set.
+    let mut attr = mount_attr {
+        attr_set: MOUNT_ATTR_NOATIME as u64,
+        attr_clr: MOUNT_ATTR__ATIME as u64,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let rc = unsafe {
+        syscall(
+            __NR_mount_setattr as c_long,
+            mount.as_raw_fd(),
+            c"".as_ptr(),
+            AT_EMPTY_PATH as c_ulong,
+            &raw mut attr,
+            size_of::<mount_attr>(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(mount)
 }
 
 /// Opens `path` below the directory `dir`, never leaving it: not through `..`,
