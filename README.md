@@ -15,7 +15,7 @@ This tool is specifically designed to give the filesystem an opportunity to real
 
 # Usage
 
-Btrealloc is given a path. The type of path the determines the scan algorithm:
+Btrealloc is given a path. The type of path determines the scan algorithm:
 
 - A top-level subvolume (`subvolid=5`) mount: the whole filesystem, every subvolume and snapshot.
 - A subvolume mount, such as `/home` with `--whole-filesystem`: also the whole filesystem.
@@ -136,7 +136,7 @@ The tool works through a private, detached copy of the mount it is given (`open_
 - The files touched should only have had their extents reallocated. Their contents and metadata should remain untouched.
 - Files in read-only snapshots are rewritten too. The snapshot stays read-only and its contents and times do not change, but its extents do. If a `btrfs send` of a snapshot is running the kernel refuses to dedupe into it and those extents are skipped for that run.
 - Rewriting an extent that many snapshots share writes to the metadata of every one of them, and unshares metadata the snapshots shared until then. With many snapshots, the metadata this costs can outweigh the data freed.
-- Compressed extents are read, decompressed and written back, where btrfs may compress the data again. Existing deduplication between files is preserved. However wshich on-disk bytes of a compressed extent belong to which part of its data cannot be known, so for compressed extents "used" and "unreachable" are estimated in proportion to the data still referenced. A live range compressed on its own may also compress worse than it did as part of the whole extent so the space actually freed can be less than reported.
+- Compressed extents are read, decompressed and written back, where btrfs may compress the data again. Existing deduplication between files is preserved. However, which on-disk bytes of a compressed extent belong to which part of its data cannot be known, so for compressed extents "used" and "unreachable" are estimated in proportion to the data still referenced. A live range compressed on its own may also compress worse than it did as part of the whole extent so the space actually freed can be less than reported.
 - Currently each live range gets allocated a new extent. This can create more extents and more metadata. Coalescing live ranges into a single extent could be a future improvement.
 
 # Test infrastructure
